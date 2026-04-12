@@ -128,6 +128,11 @@ install.bat
 - `@github/copilot`
 
 `AGENTS.md`、`prompts/`、`skills/`、`examples/`、`scripts/` はイメージ build 時に `/opt/kelpie` へコピーされます。`scripts/` 配下は実行権限を付けたうえで `/usr/local/bin` からも呼べるようにしています。`/workspace` に別の対象リポジトリを bind mount しても、テンプレート一式は `/opt/kelpie` から参照できます。
+また entrypoint は `/opt/kelpie/skills` を次の想定ディレクトリへ symlink し、CLI がネイティブに skill を見に行く場合にも参照しやすくしています。
+
+- `~/.codex/skills`
+- `~/.gemini/skills`
+- `~/.config/github-copilot/skills`
 
 ### build
 
@@ -279,7 +284,7 @@ python scripts/run_issue_workflow.py \
 
 ## instruction file staging
 
-CLI ごとに自動で読む instruction file 名が異なることと、対象リポジトリに既存の instruction file があることを前提に、`run_issue_workflow.py` は instruction staging を行います。
+CLI ごとに自動で読む instruction file 名が異なることと、対象リポジトリに既存の instruction file があることを前提に、`run_issue_workflow.py` は instruction staging を行います。`SKILL.md` については prompt へ埋め込むのが基本で、加えてコンテナ entrypoint が上記の CLI 想定 skill ディレクトリへ symlink を張ります。
 
 デフォルト設定は `examples/instruction_staging.json` にあります。
 
