@@ -37,7 +37,8 @@ copy_dir "$SCRIPT_DIR/scripts" "$KELPIE_HOME/scripts"
 chmod +x \
   "$KELPIE_HOME/llm-entrypoint.sh" \
   "$KELPIE_HOME/scripts/run_issue_workflow.py" \
-  "$KELPIE_HOME/scripts/run_issue_workflow_in_container.sh"
+  "$KELPIE_HOME/scripts/run_issue_workflow_in_container.sh" \
+  "$KELPIE_HOME/scripts/open_llm_shell_in_container.sh"
 
 if [ ! -f "$KELPIE_CONFIG_HOME/runner_config.json" ]; then
   copy_file "$SCRIPT_DIR/examples/runner_config.json" "$KELPIE_CONFIG_HOME/runner_config.json"
@@ -48,10 +49,6 @@ fi
 if [ ! -f "$KELPIE_CONFIG_HOME/compose.local.yaml" ]; then
   copy_file "$SCRIPT_DIR/compose.local.yaml" "$KELPIE_CONFIG_HOME/compose.local.yaml"
 fi
-if [ ! -f "$KELPIE_CONFIG_HOME/runner.env" ]; then
-  copy_file "$SCRIPT_DIR/examples/runner.env.example" "$KELPIE_CONFIG_HOME/runner.env"
-fi
-
 cat >"$KELPIE_BIN_DIR/kelpie" <<EOF
 #!/bin/sh
 set -eu
@@ -60,6 +57,15 @@ export KELPIE_CONFIG_HOME="${KELPIE_CONFIG_HOME}"
 exec "${KELPIE_HOME}/scripts/run_issue_workflow_in_container.sh" "\$@"
 EOF
 chmod +x "$KELPIE_BIN_DIR/kelpie"
+
+cat >"$KELPIE_BIN_DIR/kelpie-shell" <<EOF
+#!/bin/sh
+set -eu
+export KELPIE_HOME="${KELPIE_HOME}"
+export KELPIE_CONFIG_HOME="${KELPIE_CONFIG_HOME}"
+exec "${KELPIE_HOME}/scripts/open_llm_shell_in_container.sh" "\$@"
+EOF
+chmod +x "$KELPIE_BIN_DIR/kelpie-shell"
 
 printf 'Installed kelpie to:\n'
 printf '  home:   %s\n' "$KELPIE_HOME"

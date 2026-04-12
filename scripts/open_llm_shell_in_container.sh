@@ -4,7 +4,7 @@ set -eu
 usage() {
   cat <<'EOF'
 Usage:
-  run_issue_workflow_in_container.sh [options] -- --issue 12 --runner codex [run_issue_workflow args...]
+  open_llm_shell_in_container.sh [options] [-- shell args...]
 
 Options:
   --kelpie-home PATH      Template/install directory. Default: $KELPIE_HOME or inferred from script location
@@ -14,17 +14,7 @@ Options:
   --no-build              Skip docker compose build
   -h, --help              Show this help
 
-Everything after `--` is passed to run_issue_workflow.py.
-
-Example:
-  run_issue_workflow_in_container.sh \
-    --target-workdir /path/to/target-repo \
-    -- \
-    --issue 12 \
-    --issue-source github \
-    --github-repo owner/repo \
-    --include-issue-comments \
-    --runner codex
+Everything after `--` is passed to the container shell.
 EOF
 }
 
@@ -74,12 +64,6 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ "$#" -eq 0 ]; then
-  echo "Missing run_issue_workflow.py arguments." >&2
-  usage >&2
-  exit 1
-fi
-
 KELPIE_HOME=$(cd "$KELPIE_HOME" && pwd)
 if [ -d "$KELPIE_CONFIG_HOME" ]; then
   KELPIE_CONFIG_HOME=$(cd "$KELPIE_CONFIG_HOME" && pwd)
@@ -103,13 +87,9 @@ if [ -f "$KELPIE_CONFIG_HOME/compose.local.yaml" ]; then
 elif [ -f "$KELPIE_HOME/compose.local.yaml" ]; then
   COMPOSE_FILE_2="$KELPIE_HOME/compose.local.yaml"
 fi
-RUNNER_CONFIG_PATH="/opt/kelpie/examples/runner_config.json"
-if [ -f "$KELPIE_CONFIG_HOME/runner_config.json" ]; then
-  RUNNER_CONFIG_PATH="/kelpie-config/runner_config.json"
-fi
-INSTRUCTION_STAGING_PATH="/opt/kelpie/examples/instruction_staging.json"
-if [ -f "$KELPIE_CONFIG_HOME/instruction_staging.json" ]; then
-  INSTRUCTION_STAGING_PATH="/kelpie-config/instruction_staging.json"
+
+if [ "$#" -eq 0 ]; then
+  set -- bash
 fi
 
 if [ "$DO_BUILD" -eq 1 ]; then
@@ -126,22 +106,14 @@ if [ -n "$COMPOSE_FILE_2" ]; then
   env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$TARGET_WORKDIR" LLM_DATA_DIR="$DATA_DIR" \
     docker compose -f "$COMPOSE_FILE_1" -f "$COMPOSE_FILE_2" run --rm \
       -v "$KELPIE_CONFIG_HOME:/kelpie-config:ro" \
+      -w /workspace \
       llm \
-      run_issue_workflow.py \
-      --repo-root /opt/kelpie \
-      --workdir /workspace \
-      --runner-config "$RUNNER_CONFIG_PATH" \
-      --instruction-staging-config "$INSTRUCTION_STAGING_PATH" \
       "$@"
 else
   env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$TARGET_WORKDIR" LLM_DATA_DIR="$DATA_DIR" \
     docker compose -f "$COMPOSE_FILE_1" run --rm \
       -v "$KELPIE_CONFIG_HOME:/kelpie-config:ro" \
+      -w /workspace \
       llm \
-      run_issue_workflow.py \
-      --repo-root /opt/kelpie \
-      --workdir /workspace \
-      --runner-config "$RUNNER_CONFIG_PATH" \
-      --instruction-staging-config "$INSTRUCTION_STAGING_PATH" \
       "$@"
 fi

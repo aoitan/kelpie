@@ -25,13 +25,18 @@ call :copy_dir "%SCRIPT_DIR%\scripts" "%KELPIE_HOME%\scripts"
 if not exist "%KELPIE_CONFIG_HOME%\runner_config.json" call :copy_file "%SCRIPT_DIR%\examples\runner_config.json" "%KELPIE_CONFIG_HOME%\runner_config.json"
 if not exist "%KELPIE_CONFIG_HOME%\instruction_staging.json" call :copy_file "%SCRIPT_DIR%\examples\instruction_staging.json" "%KELPIE_CONFIG_HOME%\instruction_staging.json"
 if not exist "%KELPIE_CONFIG_HOME%\compose.local.yaml" call :copy_file "%SCRIPT_DIR%\compose.local.yaml" "%KELPIE_CONFIG_HOME%\compose.local.yaml"
-if not exist "%KELPIE_CONFIG_HOME%\runner.env" call :copy_file "%SCRIPT_DIR%\examples\runner.env.example" "%KELPIE_CONFIG_HOME%\runner.env"
-
 > "%KELPIE_BIN_DIR%\kelpie.cmd" (
   echo @echo off
   echo set "KELPIE_HOME=%KELPIE_HOME%"
   echo set "KELPIE_CONFIG_HOME=%KELPIE_CONFIG_HOME%"
   echo sh "%KELPIE_HOME%\scripts\run_issue_workflow_in_container.sh" %%*
+)
+
+> "%KELPIE_BIN_DIR%\kelpie-shell.cmd" (
+  echo @echo off
+  echo set "KELPIE_HOME=%KELPIE_HOME%"
+  echo set "KELPIE_CONFIG_HOME=%KELPIE_CONFIG_HOME%"
+  echo sh "%KELPIE_HOME%\scripts\open_llm_shell_in_container.sh" %%*
 )
 
 echo Installed kelpie to:
