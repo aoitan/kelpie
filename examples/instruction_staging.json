@@ -1,0 +1,23 @@
+{
+  "defaults": {
+    "source": "AGENTS.md",
+    "staging_dir": ".kelpie/instructions",
+    "precedence": [
+      "user-directives",
+      "repository-existing-instructions",
+      "kelpie-staged-instructions",
+      "phase-prompt-and-skill"
+    ]
+  },
+  "runners": {
+    "gemini": {
+      "preferred_names": ["AGENTS.md"]
+    },
+    "codex": {
+      "preferred_names": ["AGENTS.md"]
+    },
+    "copilot": {
+      "preferred_names": ["AGENTS.md", ".github/copilot-instructions.md"]
+    }
+  }
+}

@@ -1,0 +1,26 @@
+services:
+  llm:
+    build:
+      context: ${LLM_BUILD_CONTEXT:-.}
+      dockerfile: ${LLM_DOCKERFILE:-Dockerfile.llm-base}
+    working_dir: /workspace
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      HOME: /home/dev
+      UV_CACHE_DIR: /var/cache/uv
+      UV_LINK_MODE: copy
+      UV_PROJECT_ENVIRONMENT: /var/cache/uv/project-env
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      TERM: xterm-256color
+    volumes:
+      - ${LLM_WORKSPACE:-.}:/workspace
+      - ${LLM_DATA_DIR:-./.data}:/workspace/.data
+      - llm-home:/home/dev
+      - uv-cache:/var/cache/uv
+    entrypoint: ["/usr/local/bin/llm-entrypoint.sh"]
+    command: ["sh"]
+
+volumes:
+  llm-home:
+  uv-cache:

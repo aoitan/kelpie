@@ -1,0 +1,20 @@
+{
+  "runners": {
+    "gemini": {
+      "command_template": ["gemini"],
+      "prompt_mode": "stdin"
+    },
+    "codex": {
+      "command_template": ["codex"],
+      "prompt_mode": "stdin"
+    },
+    "copilot": {
+      "command_template": ["copilot"],
+      "prompt_mode": "stdin"
+    },
+    "custom_file_prompt": {
+      "command_template": ["bash", "-lc", "my-agent --prompt-file {prompt_file}"],
+      "prompt_mode": "file"
+    }
+  }
+}
