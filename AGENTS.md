@@ -21,7 +21,7 @@
 - Issue の主ソースは **GitHub Issues** を優先する。
 - 必要に応じて Issue コメントも入力に含める。
 - 1回の工程では **その工程の責務だけ** を実施する。
-- 次工程に必要な情報は、必ず成果物として `artifacts/` に残す。
+- 次工程に必要な情報は、必ず成果物として `.kelpie/artifacts/` に残す。
 - 不明点があっても作業停止を最小化し、妥当な仮定を明示して前進する。
 - 破壊的変更・依存追加・権限変更・外部送信を伴う場合は理由を成果物に記録する。
 - 実装より前に、少なくとも一度は失敗条件・非目標・既知リスクを書く。
@@ -37,23 +37,29 @@
 ## ディレクトリ規約
 
 ```text
-artifacts/
-  issue-xx/
-    01-prototype-planning.md
-    02-prototype-summary.md
-    03-red-team-review.md
-    04-plan.md
-    05-implementation-notes.md
-    06-review-fix-loop.md
-    07-pr-draft.md
-    .issue-cache/
-      issue.json
-      issue_comments.json
-    intent-records/
-    checks/
+.kelpie/
+  .gitignore
+  instructions/
+  artifacts/
+    github/
+      owner/
+        repo/
+          issue-xx/
+            01-prototype-planning.md
+            02-prototype-summary.md
+            03-red-team-review.md
+            04-plan.md
+            05-implementation-notes.md
+            06-review-fix-loop.md
+            07-pr-draft.md
+            .issue-cache/
+              issue.json
+              issue_comments.json
+            intent-records/
+            checks/
 ```
 
-`artifacts/issue-xx/` 配下に工程ごとの成果物を残す。
+`.kelpie/artifacts/.../issue-xx/` 配下に工程ごとの成果物を残す。
 
 ---
 
@@ -176,7 +182,7 @@ artifacts/
 - `AGENTS.md`
 - 対応工程の `skills/<phase>/SKILL.md`
 - 対応工程の `prompts/*.md`
-- それ以前の工程で生成された `artifacts/issue-xx/*`
+- それ以前の工程で生成された `.kelpie/artifacts/.../issue-xx/*`
 
 ---
 

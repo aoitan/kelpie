@@ -10,7 +10,7 @@
 - この工程では設計の完成度より学習を優先する
 - 捨ててもよいコードであることを前提にしてよい
 - わかったこと / わからなかったことを明確に残す
-- 最後に成果物 `artifacts/issue-{{ISSUE_NUMBER}}/02-prototype-summary.md` を更新する
+- 最後に成果物 `.kelpie/artifacts/.../issue-{{ISSUE_NUMBER}}/02-prototype-summary.md` を更新する
 
 出力に必ず含める項目:
 
@@ -21,4 +21,3 @@
 5. 捨てる方針
 6. 本実装へ持ち込むべき知見
 7. 未解決事項
-

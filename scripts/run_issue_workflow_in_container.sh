@@ -124,8 +124,9 @@ fi
 
 if [ -n "$COMPOSE_FILE_2" ]; then
   env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$TARGET_WORKDIR" LLM_DATA_DIR="$DATA_DIR" \
-    docker compose -f "$COMPOSE_FILE_1" -f "$COMPOSE_FILE_2" run --rm llm \
+    docker compose -f "$COMPOSE_FILE_1" -f "$COMPOSE_FILE_2" run --rm \
       -v "$KELPIE_CONFIG_HOME:/kelpie-config:ro" \
+      llm \
       run_issue_workflow.py \
       --repo-root /opt/kelpie \
       --workdir /workspace \
@@ -134,8 +135,9 @@ if [ -n "$COMPOSE_FILE_2" ]; then
       "$@"
 else
   env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$TARGET_WORKDIR" LLM_DATA_DIR="$DATA_DIR" \
-    docker compose -f "$COMPOSE_FILE_1" run --rm llm \
+    docker compose -f "$COMPOSE_FILE_1" run --rm \
       -v "$KELPIE_CONFIG_HOME:/kelpie-config:ro" \
+      llm \
       run_issue_workflow.py \
       --repo-root /opt/kelpie \
       --workdir /workspace \

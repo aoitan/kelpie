@@ -8,7 +8,7 @@
 - `AGENTS.md` と `skills/pull-request/SKILL.md` に従う
 - 人間レビューしやすさを最優先にする
 - 実装全体を要約し、どこを重点的に見ればよいか示す
-- 最後に成果物 `artifacts/issue-{{ISSUE_NUMBER}}/07-pr-draft.md` を更新する
+- 最後に成果物 `.kelpie/artifacts/.../issue-{{ISSUE_NUMBER}}/07-pr-draft.md` を更新する
 
 出力に必ず含める項目:
 
@@ -20,4 +20,3 @@
 6. 既知の制約
 7. レビューポイント
 8. ロールバック観点
-

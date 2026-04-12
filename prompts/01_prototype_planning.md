@@ -10,7 +10,7 @@
 - 目的は「最小の学習ループ」を設計すること
 - 選択肢を広げすぎず、最初の一歩を明確にする
 - 曖昧さは仮定として明示する
-- 最後に成果物 `artifacts/issue-{{ISSUE_NUMBER}}/01-prototype-planning.md` を更新する
+- 最後に成果物 `.kelpie/artifacts/.../issue-{{ISSUE_NUMBER}}/01-prototype-planning.md` を更新する
 
 出力に必ず含める項目:
 
@@ -23,4 +23,3 @@
 7. 採用する案と理由
 8. 成否判定
 9. 次工程への入力
-

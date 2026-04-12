@@ -141,12 +141,14 @@ class WorkflowRunner:
         self.include_issue_comments = include_issue_comments
         self.dry_run = dry_run
 
-        self.artifact_dir = self.workdir / "artifacts" / f"issue-{issue_number}"
+        self.kelpie_dir = self.workdir / ".kelpie"
+        self.ensure_kelpie_dir()
+        self.artifact_dir = self.compute_artifact_dir()
         self.intent_dir = self.artifact_dir / "intent-records"
         self.checks_dir = self.artifact_dir / "checks"
         self.prompt_cache_dir = self.artifact_dir / ".generated-prompts"
         self.issue_cache_dir = self.artifact_dir / ".issue-cache"
-        for d in [self.artifact_dir, self.intent_dir, self.checks_dir, self.prompt_cache_dir, self.issue_cache_dir]:
+        for d in [self.kelpie_dir, self.artifact_dir, self.intent_dir, self.checks_dir, self.prompt_cache_dir, self.issue_cache_dir]:
             d.mkdir(parents=True, exist_ok=True)
         self.instruction_targets = self.stage_instruction_files()
 
@@ -244,6 +246,21 @@ Current Phase: {phase}
 - Read and follow any instruction files listed above before making changes.
 """.strip() + "\n"
 
+    def ensure_kelpie_dir(self) -> None:
+        self.kelpie_dir.mkdir(parents=True, exist_ok=True)
+        gitignore_path = self.kelpie_dir / ".gitignore"
+        gitignore_path.write_text("*\n!.gitignore\n", encoding="utf-8")
+
+    def compute_artifact_dir(self) -> Path:
+        issue_leaf = f"issue-{self.issue_number}"
+        artifact_root = self.kelpie_dir / "artifacts"
+        if self.issue_source == "github" and self.github_repo:
+            owner, repo = self.github_repo.split("/", 1)
+            return artifact_root / "github" / owner / repo / issue_leaf
+        if self.issue_source == "file":
+            return artifact_root / "file" / "local" / issue_leaf
+        return artifact_root / "unknown" / issue_leaf
+
     def stage_instruction_files(self) -> list[InstructionTarget]:
         source_path = self.repo_root / self.instruction_staging_config.source
         if not source_path.exists():
@@ -335,6 +352,8 @@ Current Phase: {phase}
     def read_github_issue_text(self) -> str:
         if not self.github_repo:
             raise SystemExit("--github-repo is required when --issue-source github")
+        if "/" not in self.github_repo:
+            raise SystemExit("--github-repo must be in owner/name format")
 
         issue_path = self.issue_cache_dir / "issue.json"
         comments_path = self.issue_cache_dir / "issue_comments.json"
