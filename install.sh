@@ -48,6 +48,9 @@ fi
 if [ ! -f "$KELPIE_CONFIG_HOME/compose.local.yaml" ]; then
   copy_file "$SCRIPT_DIR/compose.local.yaml" "$KELPIE_CONFIG_HOME/compose.local.yaml"
 fi
+if [ ! -f "$KELPIE_CONFIG_HOME/runner.env" ]; then
+  copy_file "$SCRIPT_DIR/examples/runner.env.example" "$KELPIE_CONFIG_HOME/runner.env"
+fi
 
 cat >"$KELPIE_BIN_DIR/kelpie" <<EOF
 #!/bin/sh

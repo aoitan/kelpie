@@ -11,6 +11,7 @@ Options:
   --config-home PATH      Config directory. Default: $KELPIE_CONFIG_HOME or ~/.config/kelpie
   --target-workdir PATH   Host path of the repository to operate on. Default: current directory
   --data-dir PATH         Host path to mount as /workspace/.data. Default: <target-workdir>/.data
+  --git-mount-strategy S  auto | worktree-only | repo-root. Default: auto
   --no-build              Skip docker compose build
   -h, --help              Show this help
 
@@ -35,6 +36,12 @@ KELPIE_CONFIG_HOME=${KELPIE_CONFIG_HOME:-"$HOME/.config/kelpie"}
 TARGET_WORKDIR=$(pwd)
 DATA_DIR=""
 DO_BUILD=1
+GIT_MOUNT_STRATEGY=${GIT_MOUNT_STRATEGY:-auto}
+
+if [ -f "$KELPIE_CONFIG_HOME/runner.env" ]; then
+  # shellcheck disable=SC1090
+  . "$KELPIE_CONFIG_HOME/runner.env"
+fi
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -52,6 +59,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --data-dir)
       DATA_DIR=$2
+      shift 2
+      ;;
+    --git-mount-strategy)
+      GIT_MOUNT_STRATEGY=$2
       shift 2
       ;;
     --no-build)
@@ -94,6 +105,51 @@ fi
 mkdir -p "$DATA_DIR"
 DATA_DIR=$(cd "$DATA_DIR" && pwd)
 
+TARGET_GIT_TOPLEVEL=""
+TARGET_GIT_COMMON_DIR=""
+if git -C "$TARGET_WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  TARGET_GIT_TOPLEVEL=$(git -C "$TARGET_WORKDIR" rev-parse --show-toplevel)
+  TARGET_GIT_COMMON_DIR=$(git -C "$TARGET_WORKDIR" rev-parse --path-format=absolute --git-common-dir)
+fi
+
+MOUNT_HOST_PATH="$TARGET_WORKDIR"
+CONTAINER_WORKDIR="/workspace"
+EXTRA_DOCKER_RUN_ARGS=""
+
+case "$GIT_MOUNT_STRATEGY" in
+  auto)
+    if [ -n "$TARGET_GIT_TOPLEVEL" ] && [ "$TARGET_GIT_TOPLEVEL" != "$TARGET_WORKDIR" ]; then
+      MOUNT_HOST_PATH="$TARGET_GIT_TOPLEVEL"
+      rel_path=${TARGET_WORKDIR#"$TARGET_GIT_TOPLEVEL"/}
+      if [ "$rel_path" = "$TARGET_WORKDIR" ]; then
+        rel_path=""
+      fi
+      if [ -n "$rel_path" ]; then
+        CONTAINER_WORKDIR="/workspace/$rel_path"
+      fi
+    fi
+    ;;
+  worktree-only)
+    ;;
+  repo-root)
+    if [ -z "$TARGET_GIT_TOPLEVEL" ]; then
+      echo "git-mount-strategy=repo-root requires TARGET_WORKDIR to be inside a git work tree" >&2
+      exit 1
+    fi
+    MOUNT_HOST_PATH="$TARGET_GIT_TOPLEVEL"
+    if [ "$TARGET_GIT_TOPLEVEL" != "$TARGET_WORKDIR" ]; then
+      rel_path=${TARGET_WORKDIR#"$TARGET_GIT_TOPLEVEL"/}
+      if [ "$rel_path" != "$TARGET_WORKDIR" ] && [ -n "$rel_path" ]; then
+        CONTAINER_WORKDIR="/workspace/$rel_path"
+      fi
+    fi
+    ;;
+  *)
+    echo "Unsupported --git-mount-strategy: $GIT_MOUNT_STRATEGY" >&2
+    exit 1
+    ;;
+esac
+
 cd "$KELPIE_HOME"
 
 COMPOSE_FILE_1="$KELPIE_HOME/compose.llm.yaml"
@@ -114,33 +170,33 @@ fi
 
 if [ "$DO_BUILD" -eq 1 ]; then
   if [ -n "$COMPOSE_FILE_2" ]; then
-    env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$TARGET_WORKDIR" LLM_DATA_DIR="$DATA_DIR" \
+    env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$MOUNT_HOST_PATH" LLM_DATA_DIR="$DATA_DIR" \
       docker compose -f "$COMPOSE_FILE_1" -f "$COMPOSE_FILE_2" build llm
   else
-    env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$TARGET_WORKDIR" LLM_DATA_DIR="$DATA_DIR" \
+    env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$MOUNT_HOST_PATH" LLM_DATA_DIR="$DATA_DIR" \
       docker compose -f "$COMPOSE_FILE_1" build llm
   fi
 fi
 
 if [ -n "$COMPOSE_FILE_2" ]; then
-  env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$TARGET_WORKDIR" LLM_DATA_DIR="$DATA_DIR" \
+  env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$MOUNT_HOST_PATH" LLM_DATA_DIR="$DATA_DIR" \
     docker compose -f "$COMPOSE_FILE_1" -f "$COMPOSE_FILE_2" run --rm \
       -v "$KELPIE_CONFIG_HOME:/kelpie-config:ro" \
       llm \
       run_issue_workflow.py \
       --repo-root /opt/kelpie \
-      --workdir /workspace \
+      --workdir "$CONTAINER_WORKDIR" \
       --runner-config "$RUNNER_CONFIG_PATH" \
       --instruction-staging-config "$INSTRUCTION_STAGING_PATH" \
       "$@"
 else
-  env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$TARGET_WORKDIR" LLM_DATA_DIR="$DATA_DIR" \
+  env LLM_BUILD_CONTEXT="$KELPIE_HOME" LLM_WORKSPACE="$MOUNT_HOST_PATH" LLM_DATA_DIR="$DATA_DIR" \
     docker compose -f "$COMPOSE_FILE_1" run --rm \
       -v "$KELPIE_CONFIG_HOME:/kelpie-config:ro" \
       llm \
       run_issue_workflow.py \
       --repo-root /opt/kelpie \
-      --workdir /workspace \
+      --workdir "$CONTAINER_WORKDIR" \
       --runner-config "$RUNNER_CONFIG_PATH" \
       --instruction-staging-config "$INSTRUCTION_STAGING_PATH" \
       "$@"
