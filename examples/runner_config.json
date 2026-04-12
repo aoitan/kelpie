@@ -1,15 +1,15 @@
 {
   "runners": {
     "gemini": {
-      "command_template": ["gemini"],
+      "command_template": ["gemini", "--yolo", "-p", ""],
       "prompt_mode": "stdin"
     },
     "codex": {
-      "command_template": ["codex"],
+      "command_template": ["codex", "exec", "--full-auto", "-"],
       "prompt_mode": "stdin"
     },
     "copilot": {
-      "command_template": ["copilot"],
+      "command_template": ["copilot", "--allow-all-tools", "--silent"],
       "prompt_mode": "stdin"
     },
     "custom_file_prompt": {

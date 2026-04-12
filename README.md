@@ -255,16 +255,29 @@ python scripts/run_issue_workflow.py \
 {
   "runners": {
     "gemini": {
-      "command_template": ["gemini"],
+      "command_template": ["gemini", "--yolo", "-p", ""],
       "prompt_mode": "stdin"
     },
     "codex": {
-      "command_template": ["codex"],
+      "command_template": ["codex", "exec", "--full-auto", "-"],
+      "prompt_mode": "stdin"
+    },
+    "copilot": {
+      "command_template": ["copilot", "--allow-all-tools", "--silent"],
       "prompt_mode": "stdin"
     }
   }
 }
 ```
+
+長い prompt が切れにくいよう、デフォルト例は `stdin` を優先しています。現在の確認結果は次です。
+
+- `codex exec`
+  prompt 省略または `-` 指定で stdin を読める
+- `gemini`
+  `-p` を付けた非対話モードで stdin を追記入力として読める
+- `copilot`
+  非対話分岐で stdin を読める実装を確認済み。`--allow-all-tools` を付ける
 
 `prompt_mode` は次をサポートします。
 
