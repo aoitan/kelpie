@@ -1,0 +1,19 @@
+version: 1
+
+defaults:
+  on_error: stop
+  timeout_seconds: 300
+
+phases:
+  implementation:
+    pre:
+      - run: ["bash", "-lc", "scripts/kelpie-hooks/check_clean_worktree.sh"]
+      - run: ["bash", "-lc", "scripts/kelpie-hooks/check_branch_name.sh"]
+    post:
+      - run: ["bash", "-lc", "npm test -- --runInBand"]
+      - run: ["bash", "-lc", "scripts/kelpie-hooks/check_no_forbidden_files.sh"]
+
+  review-fix-loop:
+    post:
+      - run: ["bash", "-lc", "npm run lint"]
+      - run: ["bash", "-lc", "npm test"]

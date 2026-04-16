@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import os
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -39,6 +41,143 @@ PHASE_TO_SKILL = {
     "review_fix_loop": "skills/review-fix-loop/SKILL.md",
     "pull_request": "skills/pull-request/SKILL.md",
 }
+
+
+def normalize_phase_name(name: str) -> str:
+    return name.replace("-", "_")
+
+
+def parse_yaml_like_file(path: Path) -> object:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    parser = YamlLikeParser(lines, path)
+    return parser.parse()
+
+
+class YamlLikeParser:
+    def __init__(self, lines: list[str], source_path: Path) -> None:
+        self.source_path = source_path
+        self.lines = []
+        for lineno, raw_line in enumerate(lines, start=1):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(raw_line) - len(raw_line.lstrip(" "))
+            if indent % 2 != 0:
+                raise ValueError(f"{source_path}:{lineno}: indentation must use multiples of two spaces")
+            self.lines.append((lineno, indent, raw_line[indent:]))
+
+    def parse(self) -> object:
+        if not self.lines:
+            return {}
+        value, index = self.parse_block(0, self.lines[0][1])
+        if index != len(self.lines):
+            lineno, _, _ = self.lines[index]
+            raise ValueError(f"{self.source_path}:{lineno}: unexpected trailing content")
+        return value
+
+    def parse_block(self, index: int, indent: int) -> tuple[object, int]:
+        if index >= len(self.lines):
+            raise ValueError(f"{self.source_path}: unexpected end of file")
+        _, line_indent, text = self.lines[index]
+        if line_indent != indent:
+            raise ValueError(f"{self.source_path}:{self.lines[index][0]}: invalid indentation")
+        if text.startswith("- "):
+            return self.parse_sequence(index, indent)
+        return self.parse_mapping(index, indent)
+
+    def parse_mapping(self, index: int, indent: int) -> tuple[dict[str, object], int]:
+        result: dict[str, object] = {}
+        while index < len(self.lines):
+            lineno, line_indent, text = self.lines[index]
+            if line_indent < indent:
+                break
+            if line_indent != indent:
+                raise ValueError(f"{self.source_path}:{lineno}: invalid indentation")
+            if text.startswith("- "):
+                break
+
+            key, sep, remainder = text.partition(":")
+            if not sep or not key:
+                raise ValueError(f"{self.source_path}:{lineno}: expected key: value")
+
+            key = key.strip()
+            remainder = remainder.lstrip()
+            index += 1
+            if remainder:
+                result[key] = self.parse_scalar(remainder, lineno)
+                continue
+
+            if index >= len(self.lines) or self.lines[index][1] <= indent:
+                result[key] = {}
+                continue
+
+            child, index = self.parse_block(index, indent + 2)
+            result[key] = child
+        return result, index
+
+    def parse_sequence(self, index: int, indent: int) -> tuple[list[object], int]:
+        result: list[object] = []
+        while index < len(self.lines):
+            lineno, line_indent, text = self.lines[index]
+            if line_indent < indent:
+                break
+            if line_indent != indent:
+                raise ValueError(f"{self.source_path}:{lineno}: invalid indentation")
+            if not text.startswith("- "):
+                break
+
+            body = text[2:].strip()
+            index += 1
+            if not body:
+                if index >= len(self.lines) or self.lines[index][1] <= indent:
+                    result.append(None)
+                    continue
+                child, index = self.parse_block(index, indent + 2)
+                result.append(child)
+                continue
+
+            if ":" in body and not body.startswith(("[", "{", '"', "'")):
+                key, sep, remainder = body.partition(":")
+                if not sep or not key.strip():
+                    raise ValueError(f"{self.source_path}:{lineno}: expected list item mapping")
+                item: dict[str, object] = {}
+                key = key.strip()
+                remainder = remainder.lstrip()
+                if remainder:
+                    item[key] = self.parse_scalar(remainder, lineno)
+                elif index < len(self.lines) and self.lines[index][1] > indent:
+                    child, index = self.parse_block(index, indent + 2)
+                    item[key] = child
+                else:
+                    item[key] = {}
+
+                if index < len(self.lines) and self.lines[index][1] > indent:
+                    extra, index = self.parse_mapping(index, indent + 2)
+                    item.update(extra)
+                result.append(item)
+                continue
+
+            result.append(self.parse_scalar(body, lineno))
+        return result, index
+
+    def parse_scalar(self, text: str, lineno: int) -> object:
+        if text in {"true", "false"}:
+            return text == "true"
+        if text in {"null", "~"}:
+            return None
+        if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+            return int(text)
+        if text.startswith(("[", "{")):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                try:
+                    return ast.literal_eval(text)
+                except (SyntaxError, ValueError) as exc:
+                    raise ValueError(f"{self.source_path}:{lineno}: invalid inline collection") from exc
+        if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+            return ast.literal_eval(text)
+        return text
 
 
 @dataclass
@@ -111,11 +250,122 @@ class InstructionStagingConfig:
         )
 
     def preferred_names_for(self, runner_name: str) -> list[str]:
-        assert self.runners is not None
-        preferred = self.runners.get(runner_name)
+        preferred = (self.runners or {}).get(runner_name)
         if preferred:
             return preferred
         return [self.source]
+
+
+@dataclass
+class HookCommand:
+    run: list[str]
+    on_error: str
+    timeout_seconds: int
+
+
+@dataclass
+class HookPhaseConfig:
+    pre: list[HookCommand]
+    post: list[HookCommand]
+
+
+@dataclass
+class HookConfig:
+    defaults: dict[str, object]
+    phases: dict[str, HookPhaseConfig]
+
+    @staticmethod
+    def load(repo_hook_path: Path, user_hook_path: Path) -> "HookConfig":
+        merged: dict[str, object] = {"defaults": {}, "phases": {}}
+        for path in [user_hook_path, repo_hook_path]:
+            if not path.exists():
+                continue
+            raw = parse_yaml_like_file(path)
+            if not isinstance(raw, dict):
+                raise ValueError(f"{path}: top-level value must be a mapping")
+            merged = merge_hook_dicts(merged, raw)
+        return HookConfig.from_mapping(merged)
+
+    @staticmethod
+    def from_mapping(raw: dict[str, object]) -> "HookConfig":
+        defaults = raw.get("defaults") or {}
+        if not isinstance(defaults, dict):
+            raise ValueError("hooks.defaults must be a mapping")
+
+        parsed_defaults = {
+            "on_error": defaults.get("on_error", "stop"),
+            "timeout_seconds": defaults.get("timeout_seconds", 300),
+        }
+        validate_on_error(parsed_defaults["on_error"], "hooks.defaults.on_error")
+        validate_timeout(parsed_defaults["timeout_seconds"], "hooks.defaults.timeout_seconds")
+
+        phases_raw = raw.get("phases") or {}
+        if not isinstance(phases_raw, dict):
+            raise ValueError("hooks.phases must be a mapping")
+
+        phases: dict[str, HookPhaseConfig] = {}
+        for raw_phase_name, phase_value in phases_raw.items():
+            if not isinstance(raw_phase_name, str):
+                raise ValueError("hook phase names must be strings")
+            phase_name = normalize_phase_name(raw_phase_name)
+            if phase_name not in PHASES:
+                raise ValueError(f"unsupported hook phase: {raw_phase_name}")
+            if not isinstance(phase_value, dict):
+                raise ValueError(f"hooks.phases.{raw_phase_name} must be a mapping")
+            phases[phase_name] = HookPhaseConfig(
+                pre=parse_hook_commands(phase_value.get("pre"), parsed_defaults, f"hooks.phases.{raw_phase_name}.pre"),
+                post=parse_hook_commands(phase_value.get("post"), parsed_defaults, f"hooks.phases.{raw_phase_name}.post"),
+            )
+        return HookConfig(defaults=parsed_defaults, phases=phases)
+
+    def commands_for(self, phase: str, stage: str) -> list[HookCommand]:
+        phase_config = self.phases.get(phase)
+        if phase_config is None:
+            return []
+        return phase_config.pre if stage == "pre" else phase_config.post
+
+
+def merge_hook_dicts(base: dict[str, object], override: dict[str, object]) -> dict[str, object]:
+    result = dict(base)
+    for key, value in override.items():
+        if key in {"defaults", "phases"} and isinstance(result.get(key), dict) and isinstance(value, dict):
+            result[key] = merge_hook_dicts(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def parse_hook_commands(raw: object, defaults: dict[str, object], field_name: str) -> list[HookCommand]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(f"{field_name} must be a list")
+
+    commands: list[HookCommand] = []
+    for index, item in enumerate(raw, start=1):
+        item_name = f"{field_name}[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{item_name} must be a mapping")
+        run = item.get("run")
+        if not isinstance(run, list) or not run or not all(isinstance(part, str) for part in run):
+            raise ValueError(f"{item_name}.run must be a non-empty string list")
+
+        on_error = item.get("on_error", defaults["on_error"])
+        timeout_seconds = item.get("timeout_seconds", defaults["timeout_seconds"])
+        validate_on_error(on_error, f"{item_name}.on_error")
+        validate_timeout(timeout_seconds, f"{item_name}.timeout_seconds")
+        commands.append(HookCommand(run=run, on_error=on_error, timeout_seconds=timeout_seconds))
+    return commands
+
+
+def validate_on_error(value: object, field_name: str) -> None:
+    if value not in {"stop", "continue"}:
+        raise ValueError(f"{field_name} must be 'stop' or 'continue'")
+
+
+def validate_timeout(value: object, field_name: str) -> None:
+    if not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field_name} must be a positive integer")
 
 
 class WorkflowRunner:
@@ -142,6 +392,7 @@ class WorkflowRunner:
         self.dry_run = dry_run
 
         self.kelpie_dir = self.workdir / ".kelpie"
+        self.user_config_dir = Path(os.environ.get("KELPIE_CONFIG_HOME", "~/.config/kelpie")).expanduser()
         self.ensure_kelpie_dir()
         self.artifact_dir = self.compute_artifact_dir()
         self.intent_dir = self.artifact_dir / "intent-records"
@@ -151,6 +402,13 @@ class WorkflowRunner:
         for d in [self.kelpie_dir, self.artifact_dir, self.intent_dir, self.checks_dir, self.prompt_cache_dir, self.issue_cache_dir]:
             d.mkdir(parents=True, exist_ok=True)
         self.instruction_targets = self.stage_instruction_files()
+        try:
+            self.hook_config = HookConfig.load(
+                repo_hook_path=self.kelpie_dir / "hooks.yaml",
+                user_hook_path=self.user_config_dir / "hooks.yaml",
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Invalid hooks config: {exc}") from exc
 
     def run(self, phases: Iterable[str]) -> None:
         for phase in phases:
@@ -506,18 +764,84 @@ Current Phase: {phase}
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def run_pre_checks(self, phase: str) -> None:
-        path = self.checks_dir / f"{self.phase_prefix(phase)}pre-check.txt"
-        path.write_text(
-            "placeholder: add machine checks here before CLI invocation\n",
-            encoding="utf-8",
-        )
+        self.run_hooks(phase, "pre")
 
     def run_post_checks(self, phase: str) -> None:
-        path = self.checks_dir / f"{self.phase_prefix(phase)}post-check.txt"
-        path.write_text(
-            "placeholder: add machine checks here after CLI invocation\n",
-            encoding="utf-8",
-        )
+        self.run_hooks(phase, "post")
+
+    def run_hooks(self, phase: str, stage: str) -> None:
+        summary_path = self.checks_dir / f"{self.phase_prefix(phase)}{stage}-check.txt"
+        commands = self.hook_config.commands_for(phase, stage)
+        lines = [
+            f"phase: {phase}",
+            f"stage: {stage}",
+            f"repo_config: {(self.kelpie_dir / 'hooks.yaml').relative_to(self.workdir)}",
+            f"user_config: {self.user_config_dir / 'hooks.yaml'}",
+        ]
+
+        if self.dry_run:
+            lines.append("status: skipped (dry-run)")
+            summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return
+
+        if not commands:
+            lines.append("status: no hooks configured")
+            summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return
+
+        for index, command in enumerate(commands, start=1):
+            stdout_path = self.checks_dir / f"{self.phase_prefix(phase)}{stage}-hook-{index:02d}.stdout.txt"
+            stderr_path = self.checks_dir / f"{self.phase_prefix(phase)}{stage}-hook-{index:02d}.stderr.txt"
+            print(f"Running {stage} hook {index} for {phase}: {shlex.join(command.run)}")
+            try:
+                completed = subprocess.run(
+                    command.run,
+                    cwd=str(self.workdir),
+                    text=True,
+                    capture_output=True,
+                    timeout=command.timeout_seconds,
+                )
+                stdout_path.write_text(completed.stdout, encoding="utf-8")
+                stderr_path.write_text(completed.stderr, encoding="utf-8")
+                lines.extend(
+                    [
+                        "",
+                        f"[hook {index}]",
+                        f"command: {shlex.join(command.run)}",
+                        f"timeout_seconds: {command.timeout_seconds}",
+                        f"on_error: {command.on_error}",
+                        f"exit_code: {completed.returncode}",
+                        f"stdout: {stdout_path.relative_to(self.workdir)}",
+                        f"stderr: {stderr_path.relative_to(self.workdir)}",
+                    ]
+                )
+                if completed.returncode != 0 and command.on_error == "stop":
+                    lines.append("status: failed")
+                    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    raise SystemExit(f"{stage} hook {index} for phase '{phase}' failed with exit code {completed.returncode}")
+            except subprocess.TimeoutExpired as exc:
+                stdout_path.write_text(exc.stdout or "", encoding="utf-8")
+                stderr_path.write_text(exc.stderr or "", encoding="utf-8")
+                lines.extend(
+                    [
+                        "",
+                        f"[hook {index}]",
+                        f"command: {shlex.join(command.run)}",
+                        f"timeout_seconds: {command.timeout_seconds}",
+                        f"on_error: {command.on_error}",
+                        "exit_code: timeout",
+                        f"stdout: {stdout_path.relative_to(self.workdir)}",
+                        f"stderr: {stderr_path.relative_to(self.workdir)}",
+                    ]
+                )
+                if command.on_error == "stop":
+                    lines.append("status: failed")
+                    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    raise SystemExit(f"{stage} hook {index} for phase '{phase}' timed out after {command.timeout_seconds} seconds")
+
+        lines.append("")
+        lines.append("status: completed")
+        summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def invoke_cli(self, phase: str, prompt_text: str, prompt_file: Path) -> None:
         values = {
