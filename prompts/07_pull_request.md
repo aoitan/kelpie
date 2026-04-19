@@ -4,7 +4,7 @@
 
 必ず以下を守ってください。
 
-- PR本文では GitHub Issue との対応関係が人間に伝わるようにする
+- PR本文では GitHub Issue または Manual Task Context との対応関係が人間に伝わるようにする
 - `AGENTS.md` と `skills/pull-request/SKILL.md` に従う
 - 人間レビューしやすさを最優先にする
 - 実装全体を要約し、どこを重点的に見ればよいか示す

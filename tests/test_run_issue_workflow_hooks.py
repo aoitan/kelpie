@@ -138,6 +138,46 @@ class WorkflowHookExecutionTests(unittest.TestCase):
         self.assertEqual(stdout, "hook-output")
         self.assertEqual(stderr, "")
 
+    def test_issue_optional_run_uses_manual_artifact_dir_and_prompt_context(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="Refactor Auth Flow",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            prompt = runner.compose_phase_prompt("prototype_planning")
+            runner.run_phase("prototype_planning")
+
+            artifact_dir = workdir / ".kelpie" / "artifacts" / "manual" / "local" / "task-refactor-auth-flow"
+            prompt_file = artifact_dir / ".generated-prompts" / "prototype_planning.prompt.md"
+            intent_file = artifact_dir / "intent-records" / "01-intent-record.json"
+
+            self.assertTrue(prompt_file.exists())
+            self.assertTrue(intent_file.exists())
+            self.assertIn("Issue Number: (not provided)", prompt)
+            self.assertIn("Issue Source: none", prompt)
+            self.assertIn("Task Label: refactor-auth-flow", prompt)
+            self.assertIn("No GitHub issue was provided", prompt)
+            self.assertIn(str(artifact_dir.relative_to(workdir)), prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,7 @@
 
 必ず以下を守ってください。
 
-- 入力の第一優先は GitHub Issue 本文と prototype planning の成果物
+- 入力の第一優先は GitHub Issue 本文または Manual Task Context と prototype planning の成果物
 - `AGENTS.md` と `skills/prototyping/SKILL.md` に従う
 - 目的は最速で仮説検証すること
 - この工程では設計の完成度より学習を優先する

@@ -17,9 +17,9 @@
 
 ## 基本ルール
 
-- 常に **Issue #xx** を起点に作業する。
-- Issue の主ソースは **GitHub Issues** を優先する。
-- 必要に応じて Issue コメントも入力に含める。
+- 常に **Issue** または **Manual Task** を起点に作業する。
+- Issue がある場合、主ソースは **GitHub Issues** を優先する。
+- 必要に応じて Issue コメントも入力に含める。Issue がない場合は手動タスク文脈、関連コード、既存ドキュメントを入力に含める。
 - 1回の工程では **その工程の責務だけ** を実施する。
 - 次工程に必要な情報は、必ず成果物として `.kelpie/artifacts/` に残す。
 - 不明点があっても作業停止を最小化し、妥当な仮定を明示して前進する。
@@ -57,9 +57,21 @@
               issue_comments.json
             intent-records/
             checks/
+    manual/
+      local/
+        task-xxxx/
+          01-prototype-planning.md
+          02-prototype-summary.md
+          03-red-team-review.md
+          04-plan.md
+          05-implementation-notes.md
+          06-review-fix-loop.md
+          07-pr-draft.md
+          intent-records/
+          checks/
 ```
 
-`.kelpie/artifacts/.../issue-xx/` 配下に工程ごとの成果物を残す。
+`.kelpie/artifacts/.../issue-xx/` または `.kelpie/artifacts/.../task-xxxx/` 配下に工程ごとの成果物を残す。
 
 ---
 
@@ -75,7 +87,7 @@
 - `01-prototype-planning.md`
 
 やること:
-- GitHub Issue を要約
+- GitHub Issue または Manual Task を要約
 - 要件 / 非要件 / 仮定 / リスク整理
 - 最小スパイク案を 1〜3 個提案
 - 最初に作る試作品を 1 つに絞る
@@ -168,8 +180,8 @@
 - 大きく迷ったら、抽象議論を伸ばしすぎず、現時点で妥当な選択肢を1つ採る。
 - 不確実性は消さずに記録する。
 - できるだけ小さい差分を積む。
-- GitHub Issue 本文とコメントのうち、実装判断に効く文脈を優先して使う。
-- Issue だけで足りない場合は、リポジトリ内の関連コード・既存ドキュメント・過去成果物で補完する。
+- GitHub Issue 本文とコメントがある場合は、そのうち実装判断に効く文脈を優先して使う。
+- Issue がない、または Issue だけで足りない場合は、リポジトリ内の関連コード・既存ドキュメント・過去成果物で補完する。
 - 自動チェック可能な点は常に意識する。
 - 将来 `Intent Record` と `機械チェック` が差し込まれる前提で、判断理由を工程単位で残す。
 
@@ -177,12 +189,12 @@
 
 ## 各工程で参照する入力
 
-- GitHub Issue 本文
+- GitHub Issue 本文、または Manual Task Context
 - 必要に応じて GitHub Issue コメント
 - `AGENTS.md`
 - 対応工程の `skills/<phase>/SKILL.md`
 - 対応工程の `prompts/*.md`
-- それ以前の工程で生成された `.kelpie/artifacts/.../issue-xx/*`
+- それ以前の工程で生成された `.kelpie/artifacts/.../issue-xx/*` または `.kelpie/artifacts/.../task-xxxx/*`
 
 ---
 

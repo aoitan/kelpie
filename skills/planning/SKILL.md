@@ -1,6 +1,6 @@
 ---
 name: planning
-description: Turn issue context and prior findings into an implementation plan with scoped tasks, dependencies, validation steps, and risks.
+description: Turn issue or manual task context and prior findings into an implementation plan with scoped tasks, dependencies, validation steps, and risks.
 ---
 
 # SKILL: planning
@@ -32,4 +32,3 @@ description: Turn issue context and prior findings into an implementation plan w
 - 順番の理由があるか
 - 各タスクの確認方法があるか
 - red team review の反映があるか
-

@@ -373,12 +373,13 @@ class WorkflowRunner:
         self,
         repo_root: Path,
         workdir: Path,
-        issue_number: str,
+        issue_number: str | None,
         runner_config: RunnerConfig,
         instruction_staging_config: InstructionStagingConfig,
         issue_source: str = "github",
         github_repo: str | None = None,
         include_issue_comments: bool = False,
+        task_label: str | None = None,
         dry_run: bool = False,
     ) -> None:
         self.repo_root = repo_root
@@ -389,6 +390,7 @@ class WorkflowRunner:
         self.issue_source = issue_source
         self.github_repo = github_repo
         self.include_issue_comments = include_issue_comments
+        self.task_label = self.normalize_task_label(task_label)
         self.dry_run = dry_run
 
         self.kelpie_dir = self.workdir / ".kelpie"
@@ -457,13 +459,19 @@ class WorkflowRunner:
         precedence_text = self.render_instruction_precedence()
 
         github_repo_text = self.github_repo or "(not specified)"
+        issue_number_text = self.issue_number or "(not provided)"
+        artifact_dir_text = self.artifact_dir.relative_to(self.workdir)
+        prompt_md = prompt_md.replace(".kelpie/artifacts/.../issue-{{ISSUE_NUMBER}}", str(artifact_dir_text))
+        prompt_md = prompt_md.replace("{{ISSUE_NUMBER}}", self.issue_number or self.task_label or "no-issue")
 
         return f"""
 # Context
 
-Issue Number: {self.issue_number}
+Issue Number: {issue_number_text}
 Issue Source: {self.issue_source}
 GitHub Repo: {github_repo_text}
+Task Label: {self.task_label or "(not specified)"}
+Artifact Directory: {artifact_dir_text}
 Working Directory: {self.workdir}
 Current Phase: {phase}
 
@@ -485,7 +493,7 @@ Current Phase: {phase}
 
 # Phase Prompt
 
-{prompt_md.replace('{{ISSUE_NUMBER}}', self.issue_number)}
+{prompt_md}
 
 # Phase Skill
 
@@ -510,14 +518,28 @@ Current Phase: {phase}
         gitignore_path.write_text("*\n!.gitignore\n", encoding="utf-8")
 
     def compute_artifact_dir(self) -> Path:
-        issue_leaf = f"issue-{self.issue_number}"
         artifact_root = self.kelpie_dir / "artifacts"
+        leaf = self.artifact_leaf()
         if self.issue_source == "github" and self.github_repo:
             owner, repo = self.github_repo.split("/", 1)
-            return artifact_root / "github" / owner / repo / issue_leaf
+            return artifact_root / "github" / owner / repo / leaf
         if self.issue_source == "file":
-            return artifact_root / "file" / "local" / issue_leaf
-        return artifact_root / "unknown" / issue_leaf
+            return artifact_root / "file" / "local" / leaf
+        if self.issue_source == "none":
+            return artifact_root / "manual" / "local" / leaf
+        return artifact_root / "unknown" / leaf
+
+    def artifact_leaf(self) -> str:
+        if self.issue_number:
+            return f"issue-{self.issue_number}"
+        return f"task-{self.task_label or 'no-issue'}"
+
+    def normalize_task_label(self, value: str | None) -> str | None:
+        if value is None:
+            return None
+        label = value.strip().lower().replace(" ", "-")
+        safe = "".join(ch for ch in label if ch.isalnum() or ch in {"-", "_"})
+        return safe or None
 
     def stage_instruction_files(self) -> list[InstructionTarget]:
         source_path = self.repo_root / self.instruction_staging_config.source
@@ -601,6 +623,8 @@ Current Phase: {phase}
         return "\n".join(labels.get(item, f"- {item}") for item in self.instruction_staging_config.precedence or [])
 
     def read_issue_text(self) -> str:
+        if self.issue_source == "none":
+            return self.read_manual_context_text()
         if self.issue_source == "github":
             return self.read_github_issue_text()
         if self.issue_source == "file":
@@ -608,6 +632,8 @@ Current Phase: {phase}
         raise ValueError(f"Unsupported issue_source: {self.issue_source}")
 
     def read_github_issue_text(self) -> str:
+        if not self.issue_number:
+            raise SystemExit("--issue is required when --issue-source github")
         if not self.github_repo:
             raise SystemExit("--github-repo is required when --issue-source github")
         if "/" not in self.github_repo:
@@ -707,6 +733,8 @@ Current Phase: {phase}
         return json.loads(completed.stdout)
 
     def read_issue_text_from_file(self) -> str:
+        if not self.issue_number:
+            raise SystemExit("--issue is required when --issue-source file")
         candidates = [
             self.workdir / "issues" / f"issue-{self.issue_number}.md",
             self.workdir / "issues" / f"{self.issue_number}.md",
@@ -720,6 +748,18 @@ Current Phase: {phase}
             + "\n- ".join(str(p) for p in candidates)
             + "\n\nProceed by asking the CLI agent to inspect the repository and infer context."
         )
+
+    def read_manual_context_text(self) -> str:
+        lines = [
+            "# Manual Task Context",
+            "",
+            "- No GitHub issue was provided for this workflow run.",
+            "- Inspect the repository, existing docs, and prior artifacts to infer the task context.",
+            "- Record assumptions explicitly in each phase artifact.",
+        ]
+        if self.task_label:
+            lines.insert(2, f"- Task Label: {self.task_label}")
+        return "\n".join(lines) + "\n"
 
     def collect_previous_artifacts(self, phase: str) -> str:
         phase_order = {name: i for i, name in enumerate(PHASES)}
@@ -755,6 +795,8 @@ Current Phase: {phase}
             "issue_number": self.issue_number,
             "issue_source": self.issue_source,
             "github_repo": self.github_repo,
+            "task_label": self.task_label,
+            "artifact_dir": str(self.artifact_dir.relative_to(self.workdir)),
             "phase": phase,
             "runner": self.runner_config.name,
             "prompt_file": str(prompt_file.relative_to(self.workdir)),
@@ -847,7 +889,8 @@ Current Phase: {phase}
         values = {
             "workdir": str(self.workdir),
             "phase": phase,
-            "issue_number": self.issue_number,
+            "issue_number": self.issue_number or "",
+            "task_label": self.task_label or "",
             "prompt_file": str(prompt_file),
         }
         cmd = [part.format(**values) for part in self.runner_config.command_template]
@@ -878,10 +921,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run multi-phase issue workflow through a CLI agent.")
     parser.add_argument("--repo-root", default=".", help="Template directory containing AGENTS.md, prompts, skills.")
     parser.add_argument("--workdir", required=True, help="Target repository to operate on.")
-    parser.add_argument("--issue", required=True, help="Issue number, for example 12 or 012.")
-    parser.add_argument("--issue-source", choices=["github", "file"], default="github", help="Where to load the issue from.")
+    parser.add_argument("--issue", help="Issue number, for example 12 or 012.")
+    parser.add_argument("--issue-source", choices=["github", "file", "none"], default="github", help="Where to load the issue from.")
     parser.add_argument("--github-repo", help="GitHub repository in owner/name format. Required when --issue-source github.")
     parser.add_argument("--include-issue-comments", action="store_true", help="Include GitHub issue comments in the prompt context.")
+    parser.add_argument("--task-label", help="Artifact label to use when running without an issue, for example refactor-auth-flow.")
     parser.add_argument("--runner", required=True, help="Runner key from runner config JSON.")
     parser.add_argument(
         "--runner-config",
@@ -934,12 +978,13 @@ def main() -> None:
     runner = WorkflowRunner(
         repo_root=repo_root,
         workdir=workdir,
-        issue_number=str(args.issue),
+        issue_number=str(args.issue) if args.issue is not None else None,
         runner_config=runner_config,
         instruction_staging_config=instruction_staging_config,
         issue_source=args.issue_source,
         github_repo=args.github_repo,
         include_issue_comments=args.include_issue_comments,
+        task_label=args.task_label,
         dry_run=args.dry_run,
     )
     runner.run(slice_phases(args.from_phase, args.to_phase))

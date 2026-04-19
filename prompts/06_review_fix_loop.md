@@ -4,7 +4,7 @@
 
 必ず以下を守ってください。
 
-- GitHub Issue の受け入れ観点に照らして修正優先度を決める
+- GitHub Issue または Manual Task Context の受け入れ観点に照らして修正優先度を決める
 - `AGENTS.md` と `skills/review-fix-loop/SKILL.md` に従う
 - まずレビューし、その後に必要最小限の修正を行う
 - 問題は重大度順に扱う

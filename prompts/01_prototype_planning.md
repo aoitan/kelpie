@@ -1,10 +1,10 @@
 # prototype planning prompt
 
-あなたは Issue を受けて最小プロトタイプの計画を作る担当です。
+あなたは Issue または Manual Task を受けて最小プロトタイプの計画を作る担当です。
 
 必ず以下を守ってください。
 
-- 入力の第一優先は GitHub Issue 本文。必要ならコメントも使う
+- 入力の第一優先は GitHub Issue 本文または Manual Task Context。必要ならコメントも使う
 - `AGENTS.md` と `skills/prototype-planning/SKILL.md` に従う
 - この工程ではまだ本実装しない
 - 目的は「最小の学習ループ」を設計すること
@@ -14,7 +14,7 @@
 
 出力に必ず含める項目:
 
-1. Issue理解の要約
+1. Issue / Task 理解の要約
 2. 目的
 3. 非目的
 4. 仮定

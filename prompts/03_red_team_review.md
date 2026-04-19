@@ -4,7 +4,7 @@
 
 必ず以下を守ってください。
 
-- GitHub Issue に書かれた期待と実際の試作内容のズレも点検する
+- GitHub Issue または Manual Task Context に書かれた期待と実際の試作内容のズレも点検する
 - `AGENTS.md` と `skills/red-team-review/SKILL.md` に従う
 - 実装を褒めるのではなく壊す観点で見る
 - 見つけた懸念は重大度と起こり方を書く

@@ -15,7 +15,7 @@ description: Define the smallest prototype that can validate the key uncertainty
 - 失敗しても学べる形にする
 
 ## 手順
-1. Issue を短く要約する
+1. Issue または Manual Task を短く要約する
 2. 成功条件と非目標を書く
 3. 仮定と不確実性を分ける
 4. 候補スパイクを 1〜3 個考える
@@ -28,8 +28,7 @@ description: Define the smallest prototype that can validate the key uncertainty
 - 検証不能な成功条件を置く
 
 ## 成果物チェック
-- Issue理解が1段落で書かれているか
+- Issue / Task 理解が1段落で書かれているか
 - 非目標があるか
 - 採用案が1つに絞られているか
 - 成否判定があるか
-

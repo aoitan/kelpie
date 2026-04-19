@@ -4,7 +4,7 @@
 
 必ず以下を守ってください。
 
-- GitHub Issue の目的から外れる実装は避ける
+- GitHub Issue または Manual Task Context の目的から外れる実装は避ける
 - `AGENTS.md` と `skills/implementation/SKILL.md` に従う
 - `.kelpie/artifacts/.../issue-{{ISSUE_NUMBER}}/04-plan.md` に沿って実装する
 - 計画との差分がある場合は必ず理由を書く

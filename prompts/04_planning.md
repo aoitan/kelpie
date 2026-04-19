@@ -4,7 +4,7 @@
 
 必ず以下を守ってください。
 
-- GitHub Issue の要求と red team review のガードを両方反映する
+- GitHub Issue または Manual Task Context の要求と red team review のガードを両方反映する
 - `AGENTS.md` と `skills/planning/SKILL.md` に従う
 - prototype planning / prototyping / red team review の成果物を入力として使う
 - 実装可能な粒度までタスク分解する
