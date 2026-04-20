@@ -6,7 +6,18 @@
     },
     "codex": {
       "command_template": ["codex", "exec", "--full-auto", "-"],
-      "prompt_mode": "stdin"
+      "prompt_mode": "stdin",
+      "phase_overrides": {
+        "prototype_planning": {
+          "command_template": ["codex", "exec", "--model", "gpt-5.4", "--full-auto", "-"]
+        },
+        "implementation": {
+          "command_template": ["codex", "exec", "--model", "gpt-5-codex", "--full-auto", "-"]
+        },
+        "review_fix_loop": {
+          "command_template": ["codex", "exec", "--model", "gpt-5.4", "--full-auto", "-"]
+        }
+      }
     },
     "copilot": {
       "command_template": ["copilot", "--allow-all-tools", "--silent"],

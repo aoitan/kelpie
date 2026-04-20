@@ -296,7 +296,7 @@ python3 scripts/run_issue_workflow.py \
 
 ## runner 設定
 
-`examples/runner_config.json` には最小構成の例だけ入っています。
+`examples/runner_config.json` には基本設定と、phase ごとに CLI 起動設定を切り替える例が入っています。
 
 ```json
 {
@@ -307,7 +307,15 @@ python3 scripts/run_issue_workflow.py \
     },
     "codex": {
       "command_template": ["codex", "exec", "--full-auto", "-"],
-      "prompt_mode": "stdin"
+      "prompt_mode": "stdin",
+      "phase_overrides": {
+        "prototype_planning": {
+          "command_template": ["codex", "exec", "--model", "gpt-5.4", "--full-auto", "-"]
+        },
+        "implementation": {
+          "command_template": ["codex", "exec", "--model", "gpt-5-codex", "--full-auto", "-"]
+        }
+      }
     },
     "copilot": {
       "command_template": ["copilot", "--allow-all-tools", "--silent"],
@@ -334,6 +342,14 @@ python3 scripts/run_issue_workflow.py \
   prompt 本文をコマンド引数として末尾に追加します。
 - `file`
   prompt ファイルを自前オプションで読む CLI 向けです。`{prompt_file}` を `command_template` に埋め込めます。
+
+各 runner には省略可能な `phase_overrides` を追加できます。override 対象は現在 `command_template` と `prompt_mode` のみです。
+
+- `phase_overrides` がない場合は runner 直下の設定を使います。
+- 対象 phase に override がない場合も runner 直下の設定を使います。
+- `phase_overrides.<phase>` には `command_template` と `prompt_mode` だけを書けます。その他の key は設定読み込み時にエラーになります。
+- phase key は `prototype_planning` のような underscore 形式を推奨します。`review-fix-loop` のような hyphen 形式も受け付けますが、未知 phase は設定読み込み時にエラーになります。
+- 解決順序は `command_template` と `prompt_mode` の base 値を読み、その後 `phase_overrides.<phase>.command_template` と `phase_overrides.<phase>.prompt_mode` があれば個別に上書きします。
 
 使える埋め込み値は次です。
 

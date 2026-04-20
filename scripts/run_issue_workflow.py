@@ -181,10 +181,17 @@ class YamlLikeParser:
 
 
 @dataclass
+class RunnerPhaseOverride:
+    command_template: list[str] | None = None
+    prompt_mode: str | None = None
+
+
+@dataclass
 class RunnerConfig:
     name: str
     command_template: list[str]
     prompt_mode: str = "stdin"  # stdin | arg | file
+    phase_overrides: dict[str, RunnerPhaseOverride] | None = None
 
     @staticmethod
     def from_json(path: Path, runner_name: str) -> "RunnerConfig":
@@ -193,15 +200,87 @@ class RunnerConfig:
         if runner_name not in runners:
             raise KeyError(f"runner '{runner_name}' not found in {path}")
         raw = runners[runner_name]
-        command_template = raw["command_template"]
+        if not isinstance(raw, dict):
+            raise ValueError(f"runner '{runner_name}' config must be a mapping")
+        command_template = RunnerConfig.validate_command_template(
+            raw["command_template"],
+            field_name="command_template",
+        )
         prompt_mode = raw.get("prompt_mode", "stdin")
-        if prompt_mode not in {"stdin", "arg", "file"}:
-            raise ValueError(f"Unsupported prompt_mode: {prompt_mode}")
+        RunnerConfig.validate_prompt_mode(prompt_mode, field_name="prompt_mode")
+        phase_overrides: dict[str, RunnerPhaseOverride] = {}
+        raw_phase_overrides = raw.get("phase_overrides", {})
+        if raw_phase_overrides is None:
+            raw_phase_overrides = {}
+        if not isinstance(raw_phase_overrides, dict):
+            raise ValueError("phase_overrides must be a mapping")
+        for raw_phase, override in raw_phase_overrides.items():
+            phase = normalize_phase_name(raw_phase)
+            if phase not in PHASES:
+                raise ValueError(f"Unsupported phase in phase_overrides: {raw_phase}")
+            if not isinstance(override, dict):
+                raise ValueError(f"phase_overrides.{raw_phase} must be a mapping")
+            unknown_keys = set(override) - {"command_template", "prompt_mode"}
+            if unknown_keys:
+                unknown_keys_text = ", ".join(sorted(unknown_keys))
+                raise ValueError(
+                    f"phase_overrides.{raw_phase} has unsupported keys: {unknown_keys_text}"
+                )
+            override_prompt_mode = override.get("prompt_mode")
+            if override_prompt_mode is not None:
+                RunnerConfig.validate_prompt_mode(
+                    override_prompt_mode,
+                    field_name=f"phase_overrides.{raw_phase}.prompt_mode",
+                )
+            phase_overrides[phase] = RunnerPhaseOverride(
+                command_template=RunnerConfig.validate_command_template(
+                    override.get("command_template"),
+                    field_name=f"phase_overrides.{raw_phase}.command_template",
+                    allow_none=True,
+                ),
+                prompt_mode=override_prompt_mode,
+            )
         return RunnerConfig(
             name=runner_name,
             command_template=command_template,
             prompt_mode=prompt_mode,
+            phase_overrides=phase_overrides,
         )
+
+    def resolve_for_phase(self, phase: str) -> "RunnerConfig":
+        override = (self.phase_overrides or {}).get(phase)
+        if override is None:
+            return RunnerConfig(
+                name=self.name,
+                command_template=list(self.command_template),
+                prompt_mode=self.prompt_mode,
+            )
+        return RunnerConfig(
+            name=self.name,
+            command_template=list(override.command_template or self.command_template),
+            prompt_mode=override.prompt_mode or self.prompt_mode,
+        )
+
+    @staticmethod
+    def validate_prompt_mode(prompt_mode: str, field_name: str) -> None:
+        if prompt_mode not in {"stdin", "arg", "file"}:
+            raise ValueError(f"Unsupported {field_name}: {prompt_mode}")
+
+    @staticmethod
+    def validate_command_template(
+        command_template: object,
+        field_name: str,
+        allow_none: bool = False,
+    ) -> list[str] | None:
+        if command_template is None:
+            if allow_none:
+                return None
+            raise ValueError(f"{field_name} must be a non-empty list[str]")
+        if not isinstance(command_template, list) or not command_template:
+            raise ValueError(f"{field_name} must be a non-empty list[str]")
+        if any(not isinstance(part, str) for part in command_template):
+            raise ValueError(f"{field_name} must be a non-empty list[str]")
+        return list(command_template)
 
 
 @dataclass
@@ -440,13 +519,14 @@ class WorkflowRunner:
 
     def run_phase(self, phase: str) -> None:
         print(f"\n=== Running phase: {phase} ===")
+        resolved_runner_config = self.runner_config.resolve_for_phase(phase)
         prompt_text = self.compose_phase_prompt(phase)
         prompt_file = self.prompt_cache_dir / f"{phase}.prompt.md"
         prompt_file.write_text(prompt_text, encoding="utf-8")
 
-        self.write_intent_record_stub(phase, prompt_file)
+        self.write_intent_record_stub(phase, prompt_file, resolved_runner_config)
         self.run_pre_checks(phase)
-        self.invoke_cli(phase, prompt_text, prompt_file)
+        self.invoke_cli(phase, prompt_text, prompt_file, resolved_runner_config)
         self.run_post_checks(phase)
 
     def compose_phase_prompt(self, phase: str) -> str:
@@ -789,7 +869,7 @@ Current Phase: {phase}
         }
         return mapping[phase]
 
-    def write_intent_record_stub(self, phase: str, prompt_file: Path) -> None:
+    def write_intent_record_stub(self, phase: str, prompt_file: Path, resolved_runner_config: RunnerConfig) -> None:
         path = self.intent_dir / f"{self.phase_prefix(phase)}intent-record.json"
         payload = {
             "issue_number": self.issue_number,
@@ -801,6 +881,10 @@ Current Phase: {phase}
             "runner": self.runner_config.name,
             "prompt_file": str(prompt_file.relative_to(self.workdir)),
             "instruction_targets": [target.to_payload(self.workdir) for target in self.instruction_targets],
+            "effective_runner_config": {
+                "command_template": resolved_runner_config.command_template,
+                "prompt_mode": resolved_runner_config.prompt_mode,
+            },
             "status": "prepared",
         }
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -885,7 +969,13 @@ Current Phase: {phase}
         lines.append("status: completed")
         summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    def invoke_cli(self, phase: str, prompt_text: str, prompt_file: Path) -> None:
+    def invoke_cli(
+        self,
+        phase: str,
+        prompt_text: str,
+        prompt_file: Path,
+        runner_config: RunnerConfig,
+    ) -> None:
         values = {
             "workdir": str(self.workdir),
             "phase": phase,
@@ -893,7 +983,7 @@ Current Phase: {phase}
             "task_label": self.task_label or "",
             "prompt_file": str(prompt_file),
         }
-        cmd = [part.format(**values) for part in self.runner_config.command_template]
+        cmd = [part.format(**values) for part in runner_config.command_template]
 
         print("Command:", shlex.join(cmd))
         if self.dry_run:
@@ -905,11 +995,11 @@ Current Phase: {phase}
             "text": True,
         }
 
-        if self.runner_config.prompt_mode == "stdin":
+        if runner_config.prompt_mode == "stdin":
             kwargs["input"] = prompt_text
-        elif self.runner_config.prompt_mode == "arg":
+        elif runner_config.prompt_mode == "arg":
             cmd.append(prompt_text)
-        elif self.runner_config.prompt_mode == "file":
+        elif runner_config.prompt_mode == "file":
             pass
 
         completed = subprocess.run(cmd, **kwargs)
