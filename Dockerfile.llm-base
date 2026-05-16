@@ -22,7 +22,7 @@ COPY scripts/ ${KELPIE_SCRIPT_DIR}/
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates git gh curl wget ripgrep less procps openssh-client libnss-wrapper \
+        ca-certificates git gh curl wget ripgrep less procps openssh-client libnss-wrapper bubblewrap \
     && npm install -g @google/gemini-cli @openai/codex @github/copilot \
     && chmod +x /usr/local/bin/llm-entrypoint.sh \
     && find "${KELPIE_SCRIPT_DIR}" -maxdepth 1 -type f -exec chmod 0755 {} + \
