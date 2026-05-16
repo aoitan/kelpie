@@ -379,7 +379,7 @@ class WorkflowHookExecutionTests(unittest.TestCase):
 
             artifact_dir = workdir / ".kelpie" / "artifacts" / "file" / "local" / "issue-phase-overrides-runner-config"
             intent_payload = json.loads(
-                (artifact_dir / "intent-records" / "05-intent-record.json").read_text(encoding="utf-8")
+                (artifact_dir / "intent-records" / "06-intent-record.json").read_text(encoding="utf-8")
             )
             self.assertEqual(
                 intent_payload["effective_runner_config"],
@@ -431,12 +431,12 @@ class WorkflowHookExecutionTests(unittest.TestCase):
             runner.run_pre_checks("implementation")
 
             checks_dir = workdir / ".kelpie" / "artifacts" / "file" / "local" / "issue-1" / "checks"
-            summary = (checks_dir / "05-pre-check.txt").read_text(encoding="utf-8")
-            stdout = (checks_dir / "05-pre-hook-01.stdout.txt").read_text(encoding="utf-8")
-            stderr = (checks_dir / "05-pre-hook-01.stderr.txt").read_text(encoding="utf-8")
+            summary = (checks_dir / "06-pre-check.txt").read_text(encoding="utf-8")
+            stdout = (checks_dir / "06-pre-hook-01.stdout.txt").read_text(encoding="utf-8")
+            stderr = (checks_dir / "06-pre-hook-01.stderr.txt").read_text(encoding="utf-8")
 
         self.assertIn("status: completed", summary)
-        self.assertIn("05-pre-hook-01.stdout.txt", summary)
+        self.assertIn("06-pre-hook-01.stdout.txt", summary)
         self.assertEqual(stdout, "hook-output")
         self.assertEqual(stderr, "")
 
@@ -465,7 +465,10 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 else:
                     os.environ["KELPIE_CONFIG_HOME"] = old_config_home
 
-            prompt = runner.compose_phase_prompt("prototype_planning")
+            prompt = runner.compose_phase_prompt(
+                "prototype_planning",
+                runner.runner_config.resolve_for_phase("prototype_planning"),
+            )
             runner.run_phase("prototype_planning")
 
             artifact_dir = workdir / ".kelpie" / "artifacts" / "manual" / "local" / "task-refactor-auth-flow"
@@ -502,6 +505,49 @@ class WorkflowHookExecutionTests(unittest.TestCase):
             encoding="utf-8",
         )
         return path
+
+    def test_compose_phase_prompt_uses_prompt_file_and_skill_file_overrides(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+
+            custom_prompt = Path(tmpdir) / "custom_prompt.md"
+            custom_prompt.write_text("# Custom Prompt\nMy custom task instructions.\n", encoding="utf-8")
+            custom_skill = Path(tmpdir) / "custom_skill.md"
+            custom_skill.write_text("# Custom Skill\nMy custom skill rules.\n", encoding="utf-8")
+
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner_config = RunnerConfig(
+                    name="codex",
+                    command_template=["true"],
+                    prompt_file=str(custom_prompt),
+                    skill_file=str(custom_skill),
+                )
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=runner_config,
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="Test Override",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            resolved = runner_config.resolve_for_phase("prototype_planning")
+            prompt = runner.compose_phase_prompt("prototype_planning", resolved)
+
+        self.assertIn("My custom task instructions.", prompt)
+        self.assertIn("My custom skill rules.", prompt)
+        self.assertNotIn("prototype_planning", prompt.split("# Phase Prompt")[1].split("\n")[0])
 
 
 if __name__ == "__main__":

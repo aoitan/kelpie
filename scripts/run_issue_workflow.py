@@ -16,7 +16,8 @@ PHASES = [
     "prototype_planning",
     "prototyping",
     "red_team_review",
-    "planning",
+    "solution_design",
+    "work_breakdown",
     "implementation",
     "review_fix_loop",
     "pull_request",
@@ -26,17 +27,19 @@ PHASE_TO_PROMPT = {
     "prototype_planning": "prompts/01_prototype_planning.md",
     "prototyping": "prompts/02_prototyping.md",
     "red_team_review": "prompts/03_red_team_review.md",
-    "planning": "prompts/04_planning.md",
-    "implementation": "prompts/05_implementation.md",
-    "review_fix_loop": "prompts/06_review_fix_loop.md",
-    "pull_request": "prompts/07_pull_request.md",
+    "solution_design": "prompts/04_solution_design.md",
+    "work_breakdown": "prompts/05_work_breakdown.md",
+    "implementation": "prompts/06_implementation.md",
+    "review_fix_loop": "prompts/07_review_fix_loop.md",
+    "pull_request": "prompts/08_pull_request.md",
 }
 
 PHASE_TO_SKILL = {
     "prototype_planning": "skills/prototype-planning/SKILL.md",
     "prototyping": "skills/prototyping/SKILL.md",
     "red_team_review": "skills/red-team-review/SKILL.md",
-    "planning": "skills/planning/SKILL.md",
+    "solution_design": "skills/solution-design/SKILL.md",
+    "work_breakdown": "skills/work-breakdown/SKILL.md",
     "implementation": "skills/implementation/SKILL.md",
     "review_fix_loop": "skills/review-fix-loop/SKILL.md",
     "pull_request": "skills/pull-request/SKILL.md",
@@ -184,6 +187,8 @@ class YamlLikeParser:
 class RunnerPhaseOverride:
     command_template: list[str] | None = None
     prompt_mode: str | None = None
+    prompt_file: str | None = None
+    skill_file: str | None = None
 
 
 @dataclass
@@ -191,6 +196,8 @@ class RunnerConfig:
     name: str
     command_template: list[str]
     prompt_mode: str = "stdin"  # stdin | arg | file
+    prompt_file: str | None = None
+    skill_file: str | None = None
     phase_overrides: dict[str, RunnerPhaseOverride] | None = None
 
     @staticmethod
@@ -208,6 +215,9 @@ class RunnerConfig:
         )
         prompt_mode = raw.get("prompt_mode", "stdin")
         RunnerConfig.validate_prompt_mode(prompt_mode, field_name="prompt_mode")
+        prompt_file = raw.get("prompt_file")
+        skill_file = raw.get("skill_file")
+
         phase_overrides: dict[str, RunnerPhaseOverride] = {}
         raw_phase_overrides = raw.get("phase_overrides", {})
         if raw_phase_overrides is None:
@@ -220,7 +230,7 @@ class RunnerConfig:
                 raise ValueError(f"Unsupported phase in phase_overrides: {raw_phase}")
             if not isinstance(override, dict):
                 raise ValueError(f"phase_overrides.{raw_phase} must be a mapping")
-            unknown_keys = set(override) - {"command_template", "prompt_mode"}
+            unknown_keys = set(override) - {"command_template", "prompt_mode", "prompt_file", "skill_file"}
             if unknown_keys:
                 unknown_keys_text = ", ".join(sorted(unknown_keys))
                 raise ValueError(
@@ -239,11 +249,15 @@ class RunnerConfig:
                     allow_none=True,
                 ),
                 prompt_mode=override_prompt_mode,
+                prompt_file=override.get("prompt_file"),
+                skill_file=override.get("skill_file"),
             )
         return RunnerConfig(
             name=runner_name,
             command_template=command_template,
             prompt_mode=prompt_mode,
+            prompt_file=prompt_file,
+            skill_file=skill_file,
             phase_overrides=phase_overrides,
         )
 
@@ -254,11 +268,15 @@ class RunnerConfig:
                 name=self.name,
                 command_template=list(self.command_template),
                 prompt_mode=self.prompt_mode,
+                prompt_file=self.prompt_file,
+                skill_file=self.skill_file,
             )
         return RunnerConfig(
             name=self.name,
             command_template=list(override.command_template or self.command_template),
             prompt_mode=override.prompt_mode or self.prompt_mode,
+            prompt_file=override.prompt_file or self.prompt_file,
+            skill_file=override.skill_file or self.skill_file,
         )
 
     @staticmethod
@@ -505,8 +523,11 @@ class WorkflowRunner:
     def red_team_review(self) -> None:
         self.run_phase("red_team_review")
 
-    def planning(self) -> None:
-        self.run_phase("planning")
+    def solution_design(self) -> None:
+        self.run_phase("solution_design")
+
+    def work_breakdown(self) -> None:
+        self.run_phase("work_breakdown")
 
     def implementation(self) -> None:
         self.run_phase("implementation")
@@ -520,7 +541,7 @@ class WorkflowRunner:
     def run_phase(self, phase: str) -> None:
         print(f"\n=== Running phase: {phase} ===")
         resolved_runner_config = self.runner_config.resolve_for_phase(phase)
-        prompt_text = self.compose_phase_prompt(phase)
+        prompt_text = self.compose_phase_prompt(phase, resolved_runner_config)
         prompt_file = self.prompt_cache_dir / f"{phase}.prompt.md"
         prompt_file.write_text(prompt_text, encoding="utf-8")
 
@@ -529,10 +550,15 @@ class WorkflowRunner:
         self.invoke_cli(phase, prompt_text, prompt_file, resolved_runner_config)
         self.run_post_checks(phase)
 
-    def compose_phase_prompt(self, phase: str) -> str:
+    def compose_phase_prompt(self, phase: str, runner_config: RunnerConfig) -> str:
         agents_md = (self.repo_root / "AGENTS.md").read_text(encoding="utf-8")
-        prompt_md = (self.repo_root / PHASE_TO_PROMPT[phase]).read_text(encoding="utf-8")
-        skill_md = (self.repo_root / PHASE_TO_SKILL[phase]).read_text(encoding="utf-8")
+        
+        prompt_rel_path = runner_config.prompt_file or PHASE_TO_PROMPT[phase]
+        prompt_md = (self.repo_root / prompt_rel_path).read_text(encoding="utf-8")
+        
+        skill_rel_path = runner_config.skill_file or PHASE_TO_SKILL[phase]
+        skill_md = (self.repo_root / skill_rel_path).read_text(encoding="utf-8")
+        
         issue_md = self.read_issue_text()
         previous_artifacts = self.collect_previous_artifacts(phase)
         instruction_file_text = self.render_instruction_file_notes()
@@ -571,11 +597,11 @@ Current Phase: {phase}
 
 {agents_md}
 
-# Phase Prompt
+# Phase Prompt ({prompt_rel_path})
 
 {prompt_md}
 
-# Phase Skill
+# Phase Skill ({skill_rel_path})
 
 {skill_md}
 
@@ -862,10 +888,11 @@ Current Phase: {phase}
             "prototype_planning": "01-",
             "prototyping": "02-",
             "red_team_review": "03-",
-            "planning": "04-",
-            "implementation": "05-",
-            "review_fix_loop": "06-",
-            "pull_request": "07-",
+            "solution_design": "04-",
+            "work_breakdown": "05-",
+            "implementation": "06-",
+            "review_fix_loop": "07-",
+            "pull_request": "08-",
         }
         return mapping[phase]
 
