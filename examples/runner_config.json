@@ -26,6 +26,23 @@
     "custom_file_prompt": {
       "command_template": ["bash", "-lc", "my-agent --prompt-file {prompt_file}"],
       "prompt_mode": "file"
+    },
+    "hybrid_cli": {
+      "command_template": ["gemini", "--yolo", "-p", ""],
+      "prompt_mode": "stdin",
+      "phase_overrides": {
+        "solution_design": {
+          "prompt_file": "prompts/04_solution_design.md",
+          "skill_file": "skills/solution-design/SKILL.md"
+        },
+        "implementation": {
+          "command_template": ["codex", "exec", "--model", "gpt-5-codex", "--full-auto", "-"],
+          "prompt_mode": "stdin"
+        },
+        "review_fix_loop": {
+          "command_template": ["copilot", "--allow-all-tools", "--silent"]
+        }
+      }
     }
   }
 }

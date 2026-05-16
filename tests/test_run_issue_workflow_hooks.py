@@ -379,7 +379,7 @@ class WorkflowHookExecutionTests(unittest.TestCase):
 
             artifact_dir = workdir / ".kelpie" / "artifacts" / "file" / "local" / "issue-phase-overrides-runner-config"
             intent_payload = json.loads(
-                (artifact_dir / "intent-records" / "05-intent-record.json").read_text(encoding="utf-8")
+                (artifact_dir / "intent-records" / "06-intent-record.json").read_text(encoding="utf-8")
             )
             self.assertEqual(
                 intent_payload["effective_runner_config"],
@@ -431,12 +431,12 @@ class WorkflowHookExecutionTests(unittest.TestCase):
             runner.run_pre_checks("implementation")
 
             checks_dir = workdir / ".kelpie" / "artifacts" / "file" / "local" / "issue-1" / "checks"
-            summary = (checks_dir / "05-pre-check.txt").read_text(encoding="utf-8")
-            stdout = (checks_dir / "05-pre-hook-01.stdout.txt").read_text(encoding="utf-8")
-            stderr = (checks_dir / "05-pre-hook-01.stderr.txt").read_text(encoding="utf-8")
+            summary = (checks_dir / "06-pre-check.txt").read_text(encoding="utf-8")
+            stdout = (checks_dir / "06-pre-hook-01.stdout.txt").read_text(encoding="utf-8")
+            stderr = (checks_dir / "06-pre-hook-01.stderr.txt").read_text(encoding="utf-8")
 
         self.assertIn("status: completed", summary)
-        self.assertIn("05-pre-hook-01.stdout.txt", summary)
+        self.assertIn("06-pre-hook-01.stdout.txt", summary)
         self.assertEqual(stdout, "hook-output")
         self.assertEqual(stderr, "")
 
@@ -465,7 +465,10 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 else:
                     os.environ["KELPIE_CONFIG_HOME"] = old_config_home
 
-            prompt = runner.compose_phase_prompt("prototype_planning")
+            prompt = runner.compose_phase_prompt(
+                "prototype_planning",
+                runner.runner_config.resolve_for_phase("prototype_planning"),
+            )
             runner.run_phase("prototype_planning")
 
             artifact_dir = workdir / ".kelpie" / "artifacts" / "manual" / "local" / "task-refactor-auth-flow"

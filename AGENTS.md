@@ -8,10 +8,11 @@
 1. prototype planning
 2. prototyping
 3. red team review
-4. planning
-5. implementation
-6. review/fix loop
-7. pull request
+4. solution design
+5. work breakdown
+6. implementation
+7. review/fix loop
+8. pull request
 
 ---
 
@@ -48,10 +49,11 @@
             01-prototype-planning.md
             02-prototype-summary.md
             03-red-team-review.md
-            04-plan.md
-            05-implementation-notes.md
-            06-review-fix-loop.md
-            07-pr-draft.md
+            04-solution-design.md
+            05-work-breakdown.md
+            06-implementation-notes.md
+            07-review-fix-loop.md
+            08-pr-draft.md
             .issue-cache/
               issue.json
               issue_comments.json
@@ -63,10 +65,11 @@
           01-prototype-planning.md
           02-prototype-summary.md
           03-red-team-review.md
-          04-plan.md
-          05-implementation-notes.md
-          06-review-fix-loop.md
-          07-pr-draft.md
+          04-solution-design.md
+          05-work-breakdown.md
+          06-implementation-notes.md
+          07-review-fix-loop.md
+          08-pr-draft.md
           intent-records/
           checks/
 ```
@@ -86,13 +89,6 @@
 出力:
 - `01-prototype-planning.md`
 
-やること:
-- GitHub Issue または Manual Task を要約
-- 要件 / 非要件 / 仮定 / リスク整理
-- 最小スパイク案を 1〜3 個提案
-- 最初に作る試作品を 1 つに絞る
-- 何を捨てるか明記
-
 ### 2) prototyping
 目的:
 - 捨てやすい実験で見通しを得る
@@ -101,11 +97,6 @@
 - `02-prototype-summary.md`
 - 必要なら試作コード
 
-やること:
-- 本実装前提にせず、最短で仮説検証
-- 設計の美しさより学習速度を優先
-- 試したこと / わかったこと / 無理だったことを記録
-
 ### 3) red team review
 目的:
 - 試作や計画の危険点を先に炙る
@@ -113,57 +104,57 @@
 出力:
 - `03-red-team-review.md`
 
-やること:
-- 想定破綻点、誤用、過信、見落としを列挙
-- 仕様の穴、セキュリティ、運用事故、UX事故、保守性を点検
-- 「このまま進めるなら最低限必要なガード」を提案
-
-### 4) planning
+### 4) solution design
 目的:
-- 実装可能な計画に落とす
+- 本実装に向けた全体設計を固める
 
 出力:
-- `04-plan.md`
+- `04-solution-design.md`
 
 やること:
-- タスク分解
+- 設計方針の決定
+- アーキテクチャ設計
+- 主要インターフェースの定義
+
+### 5) work breakdown
+目的:
+- 設計をタスクに分解し、実装計画を立てる
+
+出力:
+- `05-work-breakdown.md`
+
+やること:
+- タスク分割
 - 依存関係整理
 - 実装順序決定
-- 完了条件と確認方法の明記
+- 完了条件の明記
 
-### 5) implementation
+### 6) implementation
 目的:
 - 計画に従って実装する
 
 出力:
 - コード変更
-- `05-implementation-notes.md`
+- `06-implementation-notes.md`
 
 やること:
 - 1回で全部盛りしない
 - 計画との差分が出たら理由を書く
 - 追加したファイル、主要変更点、未対応点を残す
 
-### 6) review/fix loop
+### 7) review/fix loop
 目的:
 - 実装品質を上げる
 
 出力:
-- `06-review-fix-loop.md`
+- `07-review-fix-loop.md`
 
-やること:
-- レビュー
-- 問題の優先度付け
-- 修正
-- 再確認
-- ループを定義回数または収束条件まで回す
-
-### 7) pull request
+### 8) pull request
 目的:
 - 人間がレビューしやすいPR材料を揃える
 
 出力:
-- `07-pr-draft.md`
+- `08-pr-draft.md`
 
 やること:
 - 変更概要

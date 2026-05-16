@@ -39,6 +39,23 @@ link_skill_root() {
   done
 }
 
+# Some tools (e.g. Node.js os.userInfo()) require the running UID to have a
+# /etc/passwd entry. When running as an arbitrary UID (common in Docker with
+# `user: "$UID:$GID"`), use libnss-wrapper to inject a synthetic entry.
+if ! getent passwd "$(id -u)" > /dev/null 2>&1; then
+  _nss_wrapper=$(find /usr/lib -name 'libnss_wrapper.so' 2>/dev/null | head -1)
+  if [ -n "$_nss_wrapper" ]; then
+    _nss_passwd=$(mktemp)
+    _nss_group=$(mktemp)
+    cat /etc/passwd > "$_nss_passwd"
+    echo "dev:x:$(id -u):$(id -g):dev:${HOME}:/bin/sh" >> "$_nss_passwd"
+    cat /etc/group > "$_nss_group"
+    export NSS_WRAPPER_PASSWD="$_nss_passwd"
+    export NSS_WRAPPER_GROUP="$_nss_group"
+    export LD_PRELOAD="$_nss_wrapper"
+  fi
+fi
+
 mkdir -p \
   "${HOME}/.gemini" \
   "${HOME}/.codex" \
