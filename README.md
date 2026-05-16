@@ -1,12 +1,12 @@
 # kelpie
 
-GitHub Issue または手動タスクを起点に、複数の LLM CLI を 7 工程で順番に実行するためのテンプレートです。
+GitHub Issue または手動タスクを起点に、複数の LLM CLI を 8 工程で順番に実行するためのテンプレートです。
 このリポジトリ自体をコンテナ内にマウントして使う前提で、ワークフロー実行スクリプトと各工程のプロンプト/スキルをまとめています。
 
 ## 何があるか
 
 - `AGENTS.md`
-  7 工程の責務、成果物、入力、失敗時の扱いを定義します。
+  8 工程の責務、成果物、入力、失敗時の扱いを定義します。
 - `prompts/*.md`
   各工程で CLI に渡すプロンプト雛形です。
 - `skills/*/SKILL.md`
@@ -346,13 +346,13 @@ python3 scripts/run_issue_workflow.py \
 - `file`
   prompt ファイルを自前オプションで読む CLI 向けです。`{prompt_file}` を `command_template` に埋め込めます。
 
-各 runner には省略可能な `phase_overrides` を追加できます。override 対象は現在 `command_template` と `prompt_mode` のみです。
+各 runner には省略可能な `phase_overrides` を追加できます。override 対象は `command_template`、`prompt_mode`、`prompt_file`、`skill_file` です。
 
 - `phase_overrides` がない場合は runner 直下の設定を使います。
 - 対象 phase に override がない場合も runner 直下の設定を使います。
-- `phase_overrides.<phase>` には `command_template` と `prompt_mode` だけを書けます。その他の key は設定読み込み時にエラーになります。
+- `phase_overrides.<phase>` には `command_template`、`prompt_mode`、`prompt_file`、`skill_file` を書けます。その他の key は設定読み込み時にエラーになります。
 - phase key は `prototype_planning` のような underscore 形式を推奨します。`review-fix-loop` のような hyphen 形式も受け付けますが、未知 phase は設定読み込み時にエラーになります。
-- 解決順序は `command_template` と `prompt_mode` の base 値を読み、その後 `phase_overrides.<phase>.command_template` と `phase_overrides.<phase>.prompt_mode` があれば個別に上書きします。
+- 解決順序は base 値を読み、その後 `phase_overrides.<phase>` の各フィールドがあれば個別に上書きします。`prompt_file` と `skill_file` を指定すると、そのフェーズのデフォルトプロンプト/スキルファイルを置き換えられます。
 
 使える埋め込み値は次です。
 

@@ -1,9 +1,9 @@
 ---
-name: solution_design
+name: solution-design
 description: Design a robust and scalable solution based on prototype findings.
 ---
 
-# SKILL: solution_design
+# SKILL: solution-design
 
 ## 目的
 実装の指針となる全体設計を固める。

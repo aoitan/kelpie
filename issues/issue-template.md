@@ -48,6 +48,6 @@
 - `Summary` は短く具体的に書く
 - `Goal` と `Non-Goals` を両方書く
 - `Constraints` があると phase の脱線を抑えやすい
-- `Validation` を書いておくと planning 以降が安定する
+- `Validation` を書いておくと solution_design 以降が安定する
 - 完璧でなくてよいが、少なくとも `Summary` と `Goal` は埋める
 

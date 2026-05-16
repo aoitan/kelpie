@@ -1,9 +1,9 @@
 ---
-name: work_breakdown
+name: work-breakdown
 description: Break down the design into actionable tasks with clear dependencies.
 ---
 
-# SKILL: work_breakdown
+# SKILL: work-breakdown
 
 ## 目的
 設計を具体的かつ並列可能なタスクに分解し、実装計画を立てる。

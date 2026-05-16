@@ -16,8 +16,8 @@
    * 各ステップに `inputs` と `outputs` を定義し、工程間の依存関係をデータとして可視化する。
    * `$issue`、`$loop_item` などの「仮想入力」を導入し、プロンプトへの動的なコンテキスト注入を簡潔に表現する。
 3. **Prompt と Skill の分離**
-   * `prompt`: タスクの指示内容そのもの（例: `prompts/04_planning.md`）
-   * `skill`: 実行ルール・作法・制約（例: `skills/planning/SKILL.md`）
+   * `prompt`: タスクの指示内容そのもの（例: `prompts/04_solution_design.md`）
+   * `skill`: 実行ルール・作法・制約（例: `skills/solution-design/SKILL.md`）
 4. **Loop コンテナによる反復制御**
    * 単一ステップの属性として `strategy: iterative` を持たせるのではなく、`type: loop` となるステップコンテナを導入する。
    * Loop内に `coding` -> `review` -> `fix` などのサブパイプラインを定義する。
