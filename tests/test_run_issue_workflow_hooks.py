@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.run_issue_workflow import (
@@ -12,7 +13,9 @@ from scripts.run_issue_workflow import (
     InstructionStagingConfig,
     RunnerConfig,
     WorkflowRunner,
+    parse_work_items_from_text,
     parse_yaml_like_file,
+    validate_work_items_payload,
 )
 
 
@@ -337,6 +340,139 @@ class HookConfigTests(unittest.TestCase):
 
 
 class WorkflowHookExecutionTests(unittest.TestCase):
+    def test_parse_work_items_from_text_returns_first_schema_valid_candidate(self) -> None:
+        source = """
+Some text
+{"foo": 1}
+
+```json
+{
+  "version": "1.0",
+  "tasks": [
+    {
+      "id": "task-1",
+      "title": "Title",
+      "description": "Description"
+    }
+  ]
+}
+```
+""".strip()
+        payload = parse_work_items_from_text(source)
+        self.assertEqual(payload["tasks"][0]["id"], "task-1")
+
+    def test_validate_work_items_payload_rejects_missing_required_field(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "id": "task-1",
+                    "title": "Title",
+                }
+            ]
+        }
+        self.assertEqual(
+            validate_work_items_payload(payload),
+            "tasks[0].description must be a non-empty string",
+        )
+
+    def test_run_phase_work_breakdown_writes_work_items_json(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            (workdir / "issues").mkdir()
+            (workdir / "issues" / "1.md").write_text("# Issue 1\n", encoding="utf-8")
+
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number="1",
+                    runner_config=RunnerConfig(name="codex", command_template=["mock-cli"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="file",
+                    dry_run=False,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
+                _ = args, kwargs
+                runner.work_breakdown_markdown_path().write_text(
+                    "\n".join(
+                        [
+                            "# Work Breakdown",
+                            "```json",
+                            '{"tasks":[{"id":"task-1","title":"Title","description":"Description"}]}',
+                            "```",
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0)
+
+            with patch("scripts.run_issue_workflow.subprocess.run", side_effect=fake_run):
+                runner.run_phase("work_breakdown")
+
+            payload = json.loads(runner.work_items_json_path().read_text(encoding="utf-8"))
+            self.assertEqual(payload["tasks"][0]["id"], "task-1")
+            self.assertFalse(runner.work_items_error_path().exists())
+
+    def test_run_phase_work_breakdown_fails_when_work_items_invalid(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            (workdir / "issues").mkdir()
+            (workdir / "issues" / "1.md").write_text("# Issue 1\n", encoding="utf-8")
+
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number="1",
+                    runner_config=RunnerConfig(name="codex", command_template=["mock-cli"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="file",
+                    dry_run=False,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
+                _ = args, kwargs
+                runner.work_breakdown_markdown_path().write_text(
+                    "\n".join(
+                        [
+                            "# Work Breakdown",
+                            "```json",
+                            '{"tasks":[{"id":"task-1","title":"Title"}]}',
+                            "```",
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0)
+
+            with patch("scripts.run_issue_workflow.subprocess.run", side_effect=fake_run):
+                with self.assertRaisesRegex(SystemExit, "Invalid work_items payload"):
+                    runner.run_phase("work_breakdown")
+
+            self.assertTrue(runner.work_items_error_path().exists())
+            self.assertFalse(runner.work_items_json_path().exists())
+
     def test_run_phase_uses_resolved_runner_config_for_cli_and_intent_record(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmpdir:
