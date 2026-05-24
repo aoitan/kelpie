@@ -342,15 +342,22 @@ class HookConfigTests(unittest.TestCase):
 class WorkflowHookExecutionTests(unittest.TestCase):
     def test_parse_work_items_from_text_returns_first_schema_valid_candidate(self) -> None:
         source = """
-Some text
-{"foo": 1}
+```json
+{
+  "tasks": [
+    {
+      "id": "task-0",
+      "title": "Invalid: missing description"
+    }
+  ]
+}
+```
 
 ```json
 {
-  "version": "1.0",
   "tasks": [
     {
-      "id": "task-1",
+      "id": "task-1-valid",
       "title": "Title",
       "description": "Description"
     }
@@ -359,7 +366,7 @@ Some text
 ```
 """.strip()
         payload = parse_work_items_from_text(source)
-        self.assertEqual(payload["tasks"][0]["id"], "task-1")
+        self.assertEqual(payload["tasks"][0]["id"], "task-1-valid")
 
     def test_validate_work_items_payload_rejects_missing_required_field(self) -> None:
         payload = {
@@ -449,6 +456,11 @@ Some text
                     os.environ.pop("KELPIE_CONFIG_HOME", None)
                 else:
                     os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            runner.work_items_json_path().write_text(
+                json.dumps({"tasks": [{"id": "stale", "title": "Old", "description": "Old"}]}),
+                encoding="utf-8",
+            )
 
             def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
                 _ = args, kwargs

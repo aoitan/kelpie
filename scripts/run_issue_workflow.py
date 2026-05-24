@@ -1038,6 +1038,9 @@ Current Phase: {phase}
         print(f"Generated work items: {output_path.relative_to(self.workdir)}")
 
     def write_work_items_error(self, message: str) -> None:
+        stale_json = self.work_items_json_path()
+        if stale_json.exists():
+            stale_json.unlink()
         self.work_items_error_path().write_text(message.strip() + "\n", encoding="utf-8")
 
     def write_intent_record_stub(self, phase: str, prompt_file: Path, resolved_runner_config: RunnerConfig) -> None:
