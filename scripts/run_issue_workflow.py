@@ -5,6 +5,7 @@ import argparse
 import ast
 import json
 import os
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -465,6 +466,111 @@ def validate_timeout(value: object, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a positive integer")
 
 
+def extract_json_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+
+    for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE):
+        body = match.group(1).strip()
+        if body.startswith("{"):
+            candidates.append(body)
+
+    start_index = 0
+    while True:
+        start = text.find("{", start_index)
+        if start < 0:
+            break
+
+        depth = 0
+        in_string = False
+        escaped = False
+        end = -1
+        for pos in range(start, len(text)):
+            ch = text[pos]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = pos + 1
+                    break
+
+        if end > start:
+            candidates.append(text[start:end].strip())
+        start_index = start + 1
+
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduplicated.append(candidate)
+    return deduplicated
+
+
+def validate_work_items_payload(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return "root must be an object"
+    version = payload.get("version")
+    if version is not None and not isinstance(version, str):
+        return "version must be a string when provided"
+
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return "tasks must be a non-empty list"
+
+    required_fields = ("id", "title", "description")
+    optional_list_fields = ("dependencies", "files", "acceptance_criteria")
+    for idx, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            return f"tasks[{idx}] must be an object"
+        for field in required_fields:
+            value = task.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return f"tasks[{idx}].{field} must be a non-empty string"
+        for field in optional_list_fields:
+            value = task.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                return f"tasks[{idx}].{field} must be a list[str] when provided"
+
+    return None
+
+
+def parse_work_items_from_text(text: str) -> dict[str, object]:
+    candidates = extract_json_candidates(text)
+    if not candidates:
+        raise ValueError("No JSON object candidates found in work breakdown output.")
+
+    errors: list[str] = []
+    for index, candidate in enumerate(candidates, start=1):
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            errors.append(f"candidate {index}: parse error at line {exc.lineno}, column {exc.colno}")
+            continue
+
+        validation_error = validate_work_items_payload(payload)
+        if validation_error is None:
+            return payload
+        errors.append(f"candidate {index}: {validation_error}")
+
+    detail = "\n".join(f"- {error}" for error in errors)
+    raise ValueError(f"No valid work_items payload found.\n{detail}")
+
+
 class WorkflowRunner:
     def __init__(
         self,
@@ -548,6 +654,8 @@ class WorkflowRunner:
         self.write_intent_record_stub(phase, prompt_file, resolved_runner_config)
         self.run_pre_checks(phase)
         self.invoke_cli(phase, prompt_text, prompt_file, resolved_runner_config)
+        if phase == "work_breakdown" and not self.dry_run:
+            self.write_work_items_artifact()
         self.run_post_checks(phase)
 
     def compose_phase_prompt(self, phase: str, runner_config: RunnerConfig) -> str:
@@ -895,6 +1003,45 @@ Current Phase: {phase}
             "pull_request": "08-",
         }
         return mapping[phase]
+
+    def work_breakdown_markdown_path(self) -> Path:
+        return self.artifact_dir / "05-work-breakdown.md"
+
+    def work_items_json_path(self) -> Path:
+        return self.artifact_dir / "work_items.json"
+
+    def work_items_error_path(self) -> Path:
+        return self.artifact_dir / "work_items.error.txt"
+
+    def write_work_items_artifact(self) -> None:
+        markdown_path = self.work_breakdown_markdown_path()
+        if not markdown_path.exists():
+            message = (
+                f"Missing work breakdown artifact: {markdown_path.relative_to(self.workdir)}. "
+                "Expected the phase output markdown to include a JSON block for work_items."
+            )
+            self.write_work_items_error(message)
+            raise SystemExit(message)
+
+        source_text = markdown_path.read_text(encoding="utf-8", errors="replace")
+        try:
+            payload = parse_work_items_from_text(source_text)
+        except ValueError as exc:
+            self.write_work_items_error(str(exc))
+            raise SystemExit(f"Invalid work_items payload: {exc}") from exc
+
+        output_path = self.work_items_json_path()
+        output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        error_path = self.work_items_error_path()
+        if error_path.exists():
+            error_path.unlink()
+        print(f"Generated work items: {output_path.relative_to(self.workdir)}")
+
+    def write_work_items_error(self, message: str) -> None:
+        stale_json = self.work_items_json_path()
+        if stale_json.exists():
+            stale_json.unlink()
+        self.work_items_error_path().write_text(message.strip() + "\n", encoding="utf-8")
 
     def write_intent_record_stub(self, phase: str, prompt_file: Path, resolved_runner_config: RunnerConfig) -> None:
         path = self.intent_dir / f"{self.phase_prefix(phase)}intent-record.json"
