@@ -144,7 +144,7 @@ install.bat
 - Node.js 22
 - `uv`
 - `gh`
-- `@google/gemini-cli`（既存互換用。plan comprehension checkでは使用しません）
+- `Antigravity CLI` (`agy`)
 - `@openai/codex`
 - `@github/copilot`
 
