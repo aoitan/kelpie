@@ -12,6 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+try:
+    from scripts.plan_comprehension import run_plan_check
+except ModuleNotFoundError:
+    from plan_comprehension import run_plan_check
+
 
 PHASES = [
     "prototype_planning",
@@ -19,6 +24,7 @@ PHASES = [
     "red_team_review",
     "solution_design",
     "work_breakdown",
+    "plan_comprehension_check",
     "implementation",
     "review_fix_loop",
     "pull_request",
@@ -30,6 +36,7 @@ PHASE_TO_PROMPT = {
     "red_team_review": "prompts/03_red_team_review.md",
     "solution_design": "prompts/04_solution_design.md",
     "work_breakdown": "prompts/05_work_breakdown.md",
+    "plan_comprehension_check": "prompts/05a_plan_comprehension_check.md",
     "implementation": "prompts/06_implementation.md",
     "review_fix_loop": "prompts/07_review_fix_loop.md",
     "pull_request": "prompts/08_pull_request.md",
@@ -41,6 +48,7 @@ PHASE_TO_SKILL = {
     "red_team_review": "skills/red-team-review/SKILL.md",
     "solution_design": "skills/solution-design/SKILL.md",
     "work_breakdown": "skills/work-breakdown/SKILL.md",
+    "plan_comprehension_check": "skills/plan-comprehension-check/SKILL.md",
     "implementation": "skills/implementation/SKILL.md",
     "review_fix_loop": "skills/review-fix-loop/SKILL.md",
     "pull_request": "skills/pull-request/SKILL.md",
@@ -423,6 +431,20 @@ class HookConfig:
         return phase_config.pre if stage == "pre" else phase_config.post
 
 
+@dataclass
+class StepSpec:
+    name: str
+    phase: str | None = None
+    prompt_file: str | None = None
+    skill_file: str | None = None
+    runner_name: str | None = None
+    inputs: list[str] | None = None
+    outputs: list[str] | None = None
+    context_id: str | None = None
+    artifact_subdir: str | None = None
+    post_actions: list[str] | None = None
+
+
 def merge_hook_dicts(base: dict[str, object], override: dict[str, object]) -> dict[str, object]:
     result = dict(base)
     for key, value in override.items():
@@ -584,6 +606,7 @@ class WorkflowRunner:
         include_issue_comments: bool = False,
         task_label: str | None = None,
         dry_run: bool = False,
+        allow_plan_check_external_send: bool = False,
     ) -> None:
         self.repo_root = repo_root
         self.workdir = workdir
@@ -595,6 +618,7 @@ class WorkflowRunner:
         self.include_issue_comments = include_issue_comments
         self.task_label = self.normalize_task_label(task_label)
         self.dry_run = dry_run
+        self.allow_plan_check_external_send = allow_plan_check_external_send
 
         self.kelpie_dir = self.workdir / ".kelpie"
         self.user_config_dir = Path(os.environ.get("KELPIE_CONFIG_HOME", "~/.config/kelpie")).expanduser()
@@ -635,6 +659,9 @@ class WorkflowRunner:
     def work_breakdown(self) -> None:
         self.run_phase("work_breakdown")
 
+    def plan_comprehension_check(self) -> None:
+        self.run_phase("plan_comprehension_check")
+
     def implementation(self) -> None:
         self.run_phase("implementation")
 
@@ -645,20 +672,148 @@ class WorkflowRunner:
         self.run_phase("pull_request")
 
     def run_phase(self, phase: str) -> None:
-        print(f"\n=== Running phase: {phase} ===")
-        resolved_runner_config = self.runner_config.resolve_for_phase(phase)
-        prompt_text = self.compose_phase_prompt(phase, resolved_runner_config)
-        prompt_file = self.prompt_cache_dir / f"{phase}.prompt.md"
+        self.run_step(self.build_step_spec_for_phase(phase))
+
+    def run_step(self, step: StepSpec) -> None:
+        phase = step.phase or step.name
+        print(f"\n=== Running step: {step.name} ===")
+        resolved_runner_config = self.resolve_runner_for_step(step)
+        step_artifact_dir = self.resolve_artifact_scope(step)
+        if phase == "plan_comprehension_check":
+            self.run_pre_checks(phase, artifact_dir=step_artifact_dir)
+            if self.allow_plan_check_external_send and not self.dry_run and (
+                not resolved_runner_config.command_template
+                or Path(resolved_runner_config.command_template[0]).name != "agy"
+            ):
+                raise SystemExit(
+                    "plan_comprehension_check requires an agy command_template phase override"
+                )
+            result = run_plan_check(
+                artifact_root=step_artifact_dir,
+                command_template=resolved_runner_config.command_template,
+                dry_run=self.dry_run,
+                allow_external_send=self.allow_plan_check_external_send,
+                prompt_text=(
+                    (self.repo_root / PHASE_TO_PROMPT[phase]).read_text(encoding="utf-8")
+                    + "\n\n"
+                    + (self.repo_root / PHASE_TO_SKILL[phase]).read_text(encoding="utf-8")
+                ),
+            )
+            print(f"Plan comprehension check status: {result['status']}")
+            self.run_post_checks(phase, artifact_dir=step_artifact_dir)
+            return
+        prompt_cache_dir = step_artifact_dir / ".generated-prompts"
+        prompt_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        prompt_text = self.compose_phase_prompt(phase, resolved_runner_config, artifact_dir=step_artifact_dir)
+        resolved_virtual_inputs = self.resolve_virtual_inputs(step.inputs or [])
+        if resolved_virtual_inputs:
+            rendered_inputs = "\n".join(
+                f"- {token}: {value.strip()[:2000]}" for token, value in resolved_virtual_inputs.items()
+            )
+            prompt_text = prompt_text.rstrip() + f"\n\n# Resolved Step Inputs\n\n{rendered_inputs}\n"
+        prompt_file = prompt_cache_dir / f"{step.name}.prompt.md"
         prompt_file.write_text(prompt_text, encoding="utf-8")
 
-        self.write_intent_record_stub(phase, prompt_file, resolved_runner_config)
-        self.run_pre_checks(phase)
+        self.write_intent_record_stub(phase, prompt_file, resolved_runner_config, artifact_dir=step_artifact_dir)
+        self.run_pre_checks(phase, artifact_dir=step_artifact_dir)
         self.invoke_cli(phase, prompt_text, prompt_file, resolved_runner_config)
-        if phase == "work_breakdown" and not self.dry_run:
-            self.write_work_items_artifact()
-        self.run_post_checks(phase)
+        self.run_step_post_actions(step, artifact_dir=step_artifact_dir)
+        self.run_post_checks(phase, artifact_dir=step_artifact_dir)
 
-    def compose_phase_prompt(self, phase: str, runner_config: RunnerConfig) -> str:
+    def build_step_spec_for_phase(self, phase: str) -> StepSpec:
+        post_actions: list[str] = []
+        outputs: list[str] = []
+        if phase == "work_breakdown":
+            post_actions.append("write_work_items_artifact")
+            outputs.append("work_items.json")
+        return StepSpec(
+            name=phase,
+            phase=phase,
+            inputs=[],
+            outputs=outputs,
+            post_actions=post_actions,
+        )
+
+    def resolve_runner_for_step(self, step: StepSpec) -> RunnerConfig:
+        phase = step.phase or step.name
+        if step.runner_name and step.runner_name != self.runner_config.name:
+            raise ValueError(
+                f"Unsupported runner override '{step.runner_name}'. "
+                f"Current workflow runner is '{self.runner_config.name}'."
+            )
+
+        if phase in PHASES:
+            resolved = self.runner_config.resolve_for_phase(phase)
+        else:
+            resolved = RunnerConfig(
+                name=self.runner_config.name,
+                command_template=list(self.runner_config.command_template),
+                prompt_mode=self.runner_config.prompt_mode,
+                prompt_file=self.runner_config.prompt_file,
+                skill_file=self.runner_config.skill_file,
+            )
+
+        if step.prompt_file is not None:
+            resolved.prompt_file = step.prompt_file
+        if step.skill_file is not None:
+            resolved.skill_file = step.skill_file
+        return resolved
+
+    def resolve_virtual_inputs(self, inputs: list[str]) -> dict[str, str]:
+        resolved: dict[str, str] = {}
+        loop_item = os.environ.get("KELPIE_LOOP_ITEM")
+        providers = {
+            "$issue": self.read_issue_text,
+            "$repo_instructions": self.render_instruction_file_notes,
+        }
+        for value in inputs:
+            if not value.startswith("$"):
+                resolved[value] = value
+                continue
+            if value == "$loop_item":
+                if loop_item is None:
+                    raise ValueError("Virtual input '$loop_item' requested but no loop item context is available.")
+                resolved[value] = loop_item
+                continue
+            provider = providers.get(value)
+            if provider is None:
+                raise ValueError(f"Unknown virtual input token: {value}")
+            resolved[value] = provider()
+        return resolved
+
+    def resolve_artifact_scope(self, step: StepSpec) -> Path:
+        artifact_dir = self.artifact_dir
+        segments: list[str] = []
+        for candidate in [step.context_id, step.artifact_subdir]:
+            if candidate is None:
+                continue
+            normalized = candidate.strip().strip("/")
+            if not normalized:
+                continue
+            if ".." in normalized.split("/"):
+                raise ValueError(f"Invalid artifact scope segment: {candidate}")
+            path_candidate = Path(normalized)
+            if path_candidate.is_absolute():
+                raise ValueError(f"Invalid artifact scope segment: {candidate}")
+            segments.append(normalized)
+
+        if not segments:
+            return artifact_dir
+        scoped = artifact_dir.joinpath(*segments)
+        scoped.mkdir(parents=True, exist_ok=True)
+        return scoped
+
+    def run_step_post_actions(self, step: StepSpec, artifact_dir: Path | None = None) -> None:
+        if self.dry_run:
+            return
+        for action in step.post_actions or []:
+            if action == "write_work_items_artifact":
+                self.write_work_items_artifact(artifact_dir=artifact_dir)
+                continue
+            raise ValueError(f"Unsupported step post action: {action}")
+
+    def compose_phase_prompt(self, phase: str, runner_config: RunnerConfig, artifact_dir: Path | None = None) -> str:
         agents_md = (self.repo_root / "AGENTS.md").read_text(encoding="utf-8")
         
         prompt_rel_path = runner_config.prompt_file or PHASE_TO_PROMPT[phase]
@@ -674,7 +829,8 @@ class WorkflowRunner:
 
         github_repo_text = self.github_repo or "(not specified)"
         issue_number_text = self.issue_number or "(not provided)"
-        artifact_dir_text = self.artifact_dir.relative_to(self.workdir)
+        effective_artifact_dir = artifact_dir or self.artifact_dir
+        artifact_dir_text = effective_artifact_dir.relative_to(self.workdir)
         prompt_md = prompt_md.replace(".kelpie/artifacts/.../issue-{{ISSUE_NUMBER}}", str(artifact_dir_text))
         prompt_md = prompt_md.replace("{{ISSUE_NUMBER}}", self.issue_number or self.task_label or "no-issue")
 
@@ -998,59 +1154,74 @@ Current Phase: {phase}
             "red_team_review": "03-",
             "solution_design": "04-",
             "work_breakdown": "05-",
+            "plan_comprehension_check": "05a-",
             "implementation": "06-",
             "review_fix_loop": "07-",
             "pull_request": "08-",
         }
         return mapping[phase]
 
-    def work_breakdown_markdown_path(self) -> Path:
-        return self.artifact_dir / "05-work-breakdown.md"
+    def work_breakdown_markdown_path(self, artifact_dir: Path | None = None) -> Path:
+        return (artifact_dir or self.artifact_dir) / "05-work-breakdown.md"
 
-    def work_items_json_path(self) -> Path:
-        return self.artifact_dir / "work_items.json"
+    def work_items_json_path(self, artifact_dir: Path | None = None) -> Path:
+        return (artifact_dir or self.artifact_dir) / "work_items.json"
 
-    def work_items_error_path(self) -> Path:
-        return self.artifact_dir / "work_items.error.txt"
+    def work_items_error_path(self, artifact_dir: Path | None = None) -> Path:
+        return (artifact_dir or self.artifact_dir) / "work_items.error.txt"
 
-    def write_work_items_artifact(self) -> None:
-        markdown_path = self.work_breakdown_markdown_path()
+    def write_work_items_artifact(self, artifact_dir: Path | None = None) -> None:
+        effective_artifact_dir = artifact_dir or self.artifact_dir
+        markdown_path = self.work_breakdown_markdown_path(artifact_dir=effective_artifact_dir)
         if not markdown_path.exists():
             message = (
                 f"Missing work breakdown artifact: {markdown_path.relative_to(self.workdir)}. "
                 "Expected the phase output markdown to include a JSON block for work_items."
             )
-            self.write_work_items_error(message)
+            self.write_work_items_error(message, artifact_dir=effective_artifact_dir)
             raise SystemExit(message)
 
         source_text = markdown_path.read_text(encoding="utf-8", errors="replace")
         try:
             payload = parse_work_items_from_text(source_text)
         except ValueError as exc:
-            self.write_work_items_error(str(exc))
+            self.write_work_items_error(str(exc), artifact_dir=effective_artifact_dir)
             raise SystemExit(f"Invalid work_items payload: {exc}") from exc
 
-        output_path = self.work_items_json_path()
+        output_path = self.work_items_json_path(artifact_dir=effective_artifact_dir)
         output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        error_path = self.work_items_error_path()
+        error_path = self.work_items_error_path(artifact_dir=effective_artifact_dir)
         if error_path.exists():
             error_path.unlink()
         print(f"Generated work items: {output_path.relative_to(self.workdir)}")
 
-    def write_work_items_error(self, message: str) -> None:
-        stale_json = self.work_items_json_path()
+    def write_work_items_error(self, message: str, artifact_dir: Path | None = None) -> None:
+        effective_artifact_dir = artifact_dir or self.artifact_dir
+        stale_json = self.work_items_json_path(artifact_dir=effective_artifact_dir)
         if stale_json.exists():
             stale_json.unlink()
-        self.work_items_error_path().write_text(message.strip() + "\n", encoding="utf-8")
+        self.work_items_error_path(artifact_dir=effective_artifact_dir).write_text(
+            message.strip() + "\n",
+            encoding="utf-8",
+        )
 
-    def write_intent_record_stub(self, phase: str, prompt_file: Path, resolved_runner_config: RunnerConfig) -> None:
-        path = self.intent_dir / f"{self.phase_prefix(phase)}intent-record.json"
+    def write_intent_record_stub(
+        self,
+        phase: str,
+        prompt_file: Path,
+        resolved_runner_config: RunnerConfig,
+        artifact_dir: Path | None = None,
+    ) -> None:
+        effective_artifact_dir = artifact_dir or self.artifact_dir
+        intent_dir = effective_artifact_dir / "intent-records"
+        intent_dir.mkdir(parents=True, exist_ok=True)
+        path = intent_dir / f"{self.phase_prefix(phase)}intent-record.json"
         payload = {
             "issue_number": self.issue_number,
             "issue_source": self.issue_source,
             "github_repo": self.github_repo,
             "task_label": self.task_label,
-            "artifact_dir": str(self.artifact_dir.relative_to(self.workdir)),
+            "artifact_dir": str(effective_artifact_dir.relative_to(self.workdir)),
             "phase": phase,
             "runner": self.runner_config.name,
             "prompt_file": str(prompt_file.relative_to(self.workdir)),
@@ -1063,14 +1234,17 @@ Current Phase: {phase}
         }
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    def run_pre_checks(self, phase: str) -> None:
-        self.run_hooks(phase, "pre")
+    def run_pre_checks(self, phase: str, artifact_dir: Path | None = None) -> None:
+        self.run_hooks(phase, "pre", artifact_dir=artifact_dir)
 
-    def run_post_checks(self, phase: str) -> None:
-        self.run_hooks(phase, "post")
+    def run_post_checks(self, phase: str, artifact_dir: Path | None = None) -> None:
+        self.run_hooks(phase, "post", artifact_dir=artifact_dir)
 
-    def run_hooks(self, phase: str, stage: str) -> None:
-        summary_path = self.checks_dir / f"{self.phase_prefix(phase)}{stage}-check.txt"
+    def run_hooks(self, phase: str, stage: str, artifact_dir: Path | None = None) -> None:
+        effective_artifact_dir = artifact_dir or self.artifact_dir
+        checks_dir = effective_artifact_dir / "checks"
+        checks_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = checks_dir / f"{self.phase_prefix(phase)}{stage}-check.txt"
         commands = self.hook_config.commands_for(phase, stage)
         lines = [
             f"phase: {phase}",
@@ -1090,8 +1264,8 @@ Current Phase: {phase}
             return
 
         for index, command in enumerate(commands, start=1):
-            stdout_path = self.checks_dir / f"{self.phase_prefix(phase)}{stage}-hook-{index:02d}.stdout.txt"
-            stderr_path = self.checks_dir / f"{self.phase_prefix(phase)}{stage}-hook-{index:02d}.stderr.txt"
+            stdout_path = checks_dir / f"{self.phase_prefix(phase)}{stage}-hook-{index:02d}.stdout.txt"
+            stderr_path = checks_dir / f"{self.phase_prefix(phase)}{stage}-hook-{index:02d}.stderr.txt"
             print(f"Running {stage} hook {index} for {phase}: {shlex.join(command.run)}")
             try:
                 completed = subprocess.run(
@@ -1214,6 +1388,11 @@ def parse_args() -> argparse.Namespace:
         help="End workflow at this phase.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Only render prompts and commands.")
+    parser.add_argument(
+        "--allow-plan-check-external-send",
+        action="store_true",
+        help="Allow external-safe plan artifacts to be sent to the plan comprehension model.",
+    )
     return parser.parse_args()
 
 
@@ -1250,6 +1429,7 @@ def main() -> None:
         include_issue_comments=args.include_issue_comments,
         task_label=args.task_label,
         dry_run=args.dry_run,
+        allow_plan_check_external_send=args.allow_plan_check_external_send,
     )
     runner.run(slice_phases(args.from_phase, args.to_phase))
 

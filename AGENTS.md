@@ -10,9 +10,10 @@
 3. red team review
 4. solution design
 5. work breakdown
-6. implementation
-7. review/fix loop
-8. pull request
+6. plan comprehension check
+7. implementation
+8. review/fix loop
+9. pull request
 
 ---
 
@@ -51,6 +52,7 @@
             03-red-team-review.md
             04-solution-design.md
             05-work-breakdown.md
+            05a-plan-comprehension-check.md
             06-implementation-notes.md
             07-review-fix-loop.md
             08-pr-draft.md
@@ -67,6 +69,7 @@
           03-red-team-review.md
           04-solution-design.md
           05-work-breakdown.md
+          05a-plan-comprehension-check.md
           06-implementation-notes.md
           07-review-fix-loop.md
           08-pr-draft.md
@@ -129,7 +132,22 @@
 - 実装順序決定
 - 完了条件の明記
 
-### 6) implementation
+### 6) plan comprehension check
+目的:
+- 弱モデル代理が計画を根拠付きで再構成できるか確認する
+- 解釈差分を advisory finding として残す
+
+出力:
+- `05a-plan-comprehension-check.md`
+- `plan-check/iterations/<nnnn>/` 配下の検証・provenance成果物
+
+やること:
+- allowlistされた `external-safe` 成果物だけを入力にする
+- finding、実行障害、invalid outputを区別する
+- no-findingsを「安全」「実装可能」と扱わない
+- 計画を自動修正せず、人間レビューへ渡す
+
+### 7) implementation
 目的:
 - 計画に従って実装する
 
@@ -142,14 +160,14 @@
 - 計画との差分が出たら理由を書く
 - 追加したファイル、主要変更点、未対応点を残す
 
-### 7) review/fix loop
+### 8) review/fix loop
 目的:
 - 実装品質を上げる
 
 出力:
 - `07-review-fix-loop.md`
 
-### 8) pull request
+### 9) pull request
 目的:
 - 人間がレビューしやすいPR材料を揃える
 
@@ -186,6 +204,11 @@
 - 対応工程の `skills/<phase>/SKILL.md`
 - 対応工程の `prompts/*.md`
 - それ以前の工程で生成された `.kelpie/artifacts/.../issue-xx/*` または `.kelpie/artifacts/.../task-xxxx/*`
+
+`plan_comprehension_check` で外部モデルへ渡せるのは、入力specで
+`external-safe` と明示された成果物だけとする。この工程は advisory-only であり、
+自動差し戻しや自動修正を行わない。live実行ではさらに
+`--allow-plan-check-external-send` による明示opt-inを必須とする。
 
 ---
 

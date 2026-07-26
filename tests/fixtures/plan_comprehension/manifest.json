@@ -1,0 +1,26 @@
+{
+  "version": "1.0",
+  "review_status": "pending-independent-review",
+  "fixtures": [
+    {"id":"clean-01","path":"clean/clean-01.md","input_mode":"prose_only","expected_clean":true,"expected_clean_rationale":"Inputs, outputs, completion, and non-goal are explicit.","expected_findings":[]},
+    {"id":"clean-02","path":"clean/clean-02.md","input_mode":"prose_only","expected_clean":true,"expected_clean_rationale":"Dependencies and non-goal are explicit.","expected_findings":[]},
+    {"id":"clean-03","path":"clean/clean-03.md","input_mode":"prose_only","expected_clean":true,"expected_clean_rationale":"Order and non-goal are explicit.","expected_findings":[]},
+    {"id":"clean-04","path":"clean/clean-04.md","input_mode":"prose_only","expected_clean":true,"expected_clean_rationale":"Compatibility and completion are explicit.","expected_findings":[]},
+    {"id":"clean-05","path":"clean/clean-05.md","input_mode":"prose_only","expected_clean":true,"expected_clean_rationale":"Artifact flow and completion are explicit.","expected_findings":[]},
+    {"id":"clean-06","path":"clean/clean-06.md","input_mode":"copy_assisted","expected_clean":true,"expected_clean_rationale":"Task and non-goal are explicit.","expected_findings":[]},
+    {"id":"clean-07","path":"clean/clean-07.md","input_mode":"copy_assisted","expected_clean":true,"expected_clean_rationale":"Dependency and completion are explicit.","expected_findings":[]},
+    {"id":"clean-08","path":"clean/clean-08.md","input_mode":"copy_assisted","expected_clean":true,"expected_clean_rationale":"Order and non-goal are explicit.","expected_findings":[]},
+    {"id":"clean-09","path":"clean/clean-09.md","input_mode":"copy_assisted","expected_clean":true,"expected_clean_rationale":"Files, guard, and completion are explicit.","expected_findings":[]},
+    {"id":"clean-10","path":"clean/clean-10.md","input_mode":"copy_assisted","expected_clean":true,"expected_clean_rationale":"Inputs, outputs, completion, and advisory scope are explicit.","expected_findings":[]},
+    {"id":"defect-01","path":"known-defect/defect-01.md","input_mode":"prose_only","expected_clean":false,"defect_types":["missing dependency"],"expected_findings":[{"classification":"missing","severity":"high","source_section":"plan"}]},
+    {"id":"defect-02","path":"known-defect/defect-02.md","input_mode":"prose_only","expected_clean":false,"defect_types":["contradictory scope"],"expected_findings":[{"classification":"contradiction","severity":"high","source_section":"scope"}]},
+    {"id":"defect-03","path":"known-defect/defect-03.md","input_mode":"prose_only","expected_clean":false,"defect_types":["unsupported assumption"],"expected_findings":[{"classification":"unsupported_assumption","severity":"medium","source_section":"plan"}]},
+    {"id":"defect-04","path":"known-defect/defect-04.md","input_mode":"prose_only","expected_clean":false,"defect_types":["missing acceptance criteria"],"expected_findings":[{"classification":"missing","severity":"high","source_section":"completion"}]},
+    {"id":"defect-05","path":"known-defect/defect-05.md","input_mode":"prose_only","expected_clean":false,"defect_types":["ambiguous input/output"],"expected_findings":[{"classification":"ambiguous","severity":"medium","source_section":"task"}]},
+    {"id":"defect-06","path":"known-defect/defect-06.md","input_mode":"prose_only","expected_clean":false,"defect_types":["unresolved blocking decision"],"expected_findings":[{"classification":"ambiguous","severity":"high","source_section":"decision"}]},
+    {"id":"defect-07","path":"known-defect/defect-07.md","input_mode":"copy_assisted","expected_clean":false,"defect_types":["missing dependency"],"expected_findings":[{"classification":"missing","severity":"high","source_section":"structured-plan"}]},
+    {"id":"defect-08","path":"known-defect/defect-08.md","input_mode":"copy_assisted","expected_clean":false,"defect_types":["contradictory scope"],"expected_findings":[{"classification":"contradiction","severity":"critical","source_section":"structured-plan"}]},
+    {"id":"defect-09","path":"known-defect/defect-09.md","input_mode":"copy_assisted","expected_clean":false,"defect_types":["missing acceptance criteria"],"expected_findings":[{"classification":"missing","severity":"high","source_section":"structured-plan"}]},
+    {"id":"defect-10","path":"known-defect/defect-10.md","input_mode":"copy_assisted","expected_clean":false,"defect_types":["ambiguous input/output","unresolved blocking decision"],"expected_findings":[{"classification":"ambiguous","severity":"high","source_section":"structured-plan"}]}
+  ]
+}

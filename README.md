@@ -1,12 +1,12 @@
 # kelpie
 
-GitHub Issue または手動タスクを起点に、複数の LLM CLI を 8 工程で順番に実行するためのテンプレートです。
+GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工程で順番に実行するためのテンプレートです。
 このリポジトリ自体をコンテナ内にマウントして使う前提で、ワークフロー実行スクリプトと各工程のプロンプト/スキルをまとめています。
 
 ## 何があるか
 
 - `AGENTS.md`
-  8 工程の責務、成果物、入力、失敗時の扱いを定義します。
+  9 工程の責務、成果物、入力、失敗時の扱いを定義します。
 - `prompts/*.md`
   各工程で CLI に渡すプロンプト雛形です。
 - `skills/*/SKILL.md`
@@ -78,16 +78,28 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 8 工�
 4. `.kelpie/artifacts/.../issue-xx/` または `.kelpie/artifacts/.../task-xxxx/` 配下に prompt キャッシュ、intent record、check ファイルを作る
 5. 指定した CLI を工程順に呼び出す
 
-工程は固定で次の 8 つです。
+工程は固定で次の 9 つです。
 
 1. `prototype_planning`
 2. `prototyping`
 3. `red_team_review`
 4. `solution_design`
 5. `work_breakdown`
-6. `implementation`
-7. `review_fix_loop`
-8. `pull_request`
+6. `plan_comprehension_check`
+7. `implementation`
+8. `review_fix_loop`
+9. `pull_request`
+
+`plan_comprehension_check` は、実装計画を軽量モデルへ再構成させ、
+source-backedな解釈差分を人間レビュー用に残す advisory-only step です。
+計画の技術的正しさ、安全性、実装可能性を保証せず、計画の自動修正や
+前工程への自動差し戻しも行いません。
+
+Gemini系モデルの呼び出しには Antigravity CLI (`agy`) を使います。
+実行環境へ `agy` を別途インストールし、認証を済ませてください。
+通常工程のサンプルは `gemini-3.6-flash-medium` / medium effort /
+accept-edits mode、plan comprehension checkだけは
+`gemini-3.5-flash-low` / low effort / plan modeを使用します。
 
 ## コンテナ実行
 
@@ -132,7 +144,7 @@ install.bat
 - Node.js 22
 - `uv`
 - `gh`
-- `@google/gemini-cli`
+- `@google/gemini-cli`（既存互換用。plan comprehension checkでは使用しません）
 - `@openai/codex`
 - `@github/copilot`
 
@@ -296,6 +308,10 @@ python3 scripts/run_issue_workflow.py \
   終了工程を指定します。
 - `--dry-run`
   prompt 生成と実行コマンド表示だけ行い、CLI 呼び出しを省略します。
+- `--allow-plan-check-external-send`
+  `external-safe` と分類された計画成果物を
+  `plan_comprehension_check` の外部モデルへ送ることを明示的に許可します。
+  未指定時、live checkは送信せず停止します。
 
 ## runner 設定
 
@@ -304,9 +320,14 @@ python3 scripts/run_issue_workflow.py \
 ```json
 {
   "runners": {
-    "gemini": {
-      "command_template": ["gemini", "--yolo", "-p", ""],
-      "prompt_mode": "stdin"
+    "agy": {
+      "command_template": ["agy", "--model", "gemini-3.6-flash-medium", "--effort", "medium", "--mode", "accept-edits", "--print", "Follow the task instructions supplied on stdin."],
+      "prompt_mode": "stdin",
+      "phase_overrides": {
+        "plan_comprehension_check": {
+          "command_template": ["agy", "--model", "gemini-3.5-flash-low", "--effort", "low", "--mode", "plan", "--print", "Reconstruct the plan data from stdin as JSON only."]
+        }
+      }
     },
     "codex": {
       "command_template": ["codex", "exec", "--full-auto", "-"],
@@ -314,6 +335,9 @@ python3 scripts/run_issue_workflow.py \
       "phase_overrides": {
         "prototype_planning": {
           "command_template": ["codex", "exec", "--model", "gpt-5.4", "--full-auto", "-"]
+        },
+        "plan_comprehension_check": {
+          "command_template": ["agy", "--model", "gemini-3.5-flash-low", "--effort", "low", "--mode", "plan", "--print", "Reconstruct the plan data from stdin as JSON only."]
         },
         "implementation": {
           "command_template": ["codex", "exec", "--model", "gpt-5-codex", "--full-auto", "-"]
@@ -332,8 +356,8 @@ python3 scripts/run_issue_workflow.py \
 
 - `codex exec`
   prompt 省略または `-` 指定で stdin を読める
-- `gemini`
-  `-p` を付けた非対話モードで stdin を追記入力として読める
+- `agy`
+  `--print` の非対話モードで stdin のplan dataを読める
 - `copilot`
   非対話分岐で stdin を読める実装を確認済み。`--allow-all-tools` を付ける
 

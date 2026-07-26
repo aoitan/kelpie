@@ -9,17 +9,30 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.run_issue_workflow import (
+    PHASES,
     HookConfig,
     InstructionStagingConfig,
     RunnerConfig,
+    StepSpec,
     WorkflowRunner,
     parse_work_items_from_text,
     parse_yaml_like_file,
+    slice_phases,
     validate_work_items_payload,
 )
 
 
 class HookConfigTests(unittest.TestCase):
+    def test_example_agy_runner_uses_general_profile_and_plan_check_override(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        config = RunnerConfig.from_json(repo_root / "examples" / "runner_config.json", "agy")
+        plan_check = config.resolve_for_phase("plan_comprehension_check")
+
+        self.assertIn("gemini-3.6-flash-medium", config.command_template)
+        self.assertIn("accept-edits", config.command_template)
+        self.assertIn("gemini-3.5-flash-low", plan_check.command_template)
+        self.assertIn("plan", plan_check.command_template)
+
     def test_runner_config_resolve_for_phase_uses_base_values_without_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "runner_config.json"
@@ -340,6 +353,213 @@ class HookConfigTests(unittest.TestCase):
 
 
 class WorkflowHookExecutionTests(unittest.TestCase):
+    def test_plan_comprehension_check_is_between_work_breakdown_and_implementation(self) -> None:
+        self.assertLess(PHASES.index("work_breakdown"), PHASES.index("plan_comprehension_check"))
+        self.assertLess(PHASES.index("plan_comprehension_check"), PHASES.index("implementation"))
+        self.assertEqual(
+            slice_phases("work_breakdown", "implementation"),
+            ["work_breakdown", "plan_comprehension_check", "implementation"],
+        )
+
+    def test_plan_comprehension_dry_run_uses_internal_handler_without_external_invocation(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["codex", "exec", "-"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="plan-check-test",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            with (
+                patch("scripts.run_issue_workflow.run_plan_check", return_value={"status": "prepared"}) as mock_check,
+                patch.object(runner, "invoke_cli") as mock_invoke,
+            ):
+                runner.plan_comprehension_check()
+
+        mock_check.assert_called_once()
+        self.assertTrue(mock_check.call_args.kwargs["dry_run"])
+        self.assertIn("plan comprehension check prompt", mock_check.call_args.kwargs["prompt_text"])
+        self.assertIn("SKILL: plan comprehension check", mock_check.call_args.kwargs["prompt_text"])
+        mock_invoke.assert_not_called()
+
+    def test_plan_comprehension_without_external_opt_in_does_not_require_agy(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="custom", command_template=["custom-cli"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="plan-check-no-send",
+                    dry_run=False,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            with patch(
+                "scripts.run_issue_workflow.run_plan_check",
+                return_value={"status": "approval_required"},
+            ) as mock_check:
+                runner.plan_comprehension_check()
+
+        mock_check.assert_called_once()
+        self.assertFalse(mock_check.call_args.kwargs["allow_external_send"])
+
+    def test_run_phase_delegates_to_run_step(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            (workdir / "issues").mkdir()
+            (workdir / "issues" / "1.md").write_text("# Issue 1\n", encoding="utf-8")
+
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number="1",
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="file",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            with patch.object(runner, "run_step") as mock_run_step:
+                runner.run_phase("implementation")
+
+        mock_run_step.assert_called_once()
+        step_arg = mock_run_step.call_args.args[0]
+        self.assertIsInstance(step_arg, StepSpec)
+        self.assertEqual(step_arg.name, "implementation")
+        self.assertEqual(step_arg.phase, "implementation")
+
+    def test_run_step_preserves_execution_order(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            (workdir / "issues").mkdir()
+            (workdir / "issues" / "1.md").write_text("# Issue 1\n", encoding="utf-8")
+
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number="1",
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="file",
+                    dry_run=False,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            calls: list[str] = []
+            step = StepSpec(name="implementation", phase="implementation")
+            with (
+                patch.object(runner, "write_intent_record_stub", side_effect=lambda *args, **kwargs: calls.append("intent")),
+                patch.object(runner, "run_pre_checks", side_effect=lambda *args, **kwargs: calls.append("pre")),
+                patch.object(runner, "invoke_cli", side_effect=lambda *args, **kwargs: calls.append("invoke")),
+                patch.object(runner, "run_step_post_actions", side_effect=lambda *args, **kwargs: calls.append("post_actions")),
+                patch.object(runner, "run_post_checks", side_effect=lambda *args, **kwargs: calls.append("post")),
+            ):
+                runner.run_step(step)
+
+        self.assertEqual(calls, ["intent", "pre", "invoke", "post_actions", "post"])
+
+    def test_resolve_virtual_inputs_rejects_unknown_token(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="virtual-input-test",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            with self.assertRaisesRegex(ValueError, "Unknown virtual input token"):
+                runner.resolve_virtual_inputs(["$unknown"])
+
+    def test_resolve_artifact_scope_rejects_parent_traversal(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="artifact-scope-test",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            with self.assertRaisesRegex(ValueError, "Invalid artifact scope segment"):
+                runner.resolve_artifact_scope(StepSpec(name="implementation", phase="implementation", artifact_subdir="../x"))
+
     def test_parse_work_items_from_text_returns_first_schema_valid_candidate(self) -> None:
         source = """
 ```json
