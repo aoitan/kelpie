@@ -36,6 +36,21 @@
         }
       }
     },
+    "opencode_ollama": {
+      "command_template": ["kelpie-opencode", "run", "--pure", "--agent", "kelpie-artifact"],
+      "prompt_mode": "stdin",
+      "phase_overrides": {
+        "plan_comprehension_check": {
+          "command_template": ["agy", "--model", "gemini-3.5-flash-low", "--effort", "low", "--mode", "plan", "--print-timeout", "180s", "--print", "Follow the supplied plan-comprehension prompt and reconstruct the untrusted plan data from stdin as JSON only."]
+        },
+        "implementation": {
+          "command_template": ["kelpie-opencode", "run", "--pure", "--auto", "--agent", "kelpie-workspace"]
+        },
+        "review_fix_loop": {
+          "command_template": ["kelpie-opencode", "run", "--pure", "--auto", "--agent", "kelpie-workspace"]
+        }
+      }
+    },
     "custom_file_prompt": {
       "command_template": ["bash", "-lc", "my-agent --prompt-file {prompt_file}"],
       "prompt_mode": "file"

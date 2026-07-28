@@ -200,6 +200,10 @@ class RunnerPhaseOverride:
     skill_file: str | None = None
 
 
+class RunnerNotFoundError(KeyError):
+    pass
+
+
 @dataclass
 class RunnerConfig:
     name: str
@@ -214,7 +218,7 @@ class RunnerConfig:
         data = json.loads(path.read_text(encoding="utf-8"))
         runners = data.get("runners", {})
         if runner_name not in runners:
-            raise KeyError(f"runner '{runner_name}' not found in {path}")
+            raise RunnerNotFoundError(f"runner '{runner_name}' not found in {path}")
         raw = runners[runner_name]
         if not isinstance(raw, dict):
             raise ValueError(f"runner '{runner_name}' config must be a mapping")
@@ -308,6 +312,19 @@ class RunnerConfig:
         if any(not isinstance(part, str) for part in command_template):
             raise ValueError(f"{field_name} must be a non-empty list[str]")
         return list(command_template)
+
+
+def load_runner_config(
+    configured_path: Path,
+    bundled_path: Path,
+    runner_name: str,
+) -> RunnerConfig:
+    try:
+        return RunnerConfig.from_json(configured_path, runner_name)
+    except RunnerNotFoundError:
+        if configured_path.resolve() == bundled_path.resolve():
+            raise
+        return RunnerConfig.from_json(bundled_path, runner_name)
 
 
 @dataclass
@@ -1416,7 +1433,12 @@ def main() -> None:
     if not instruction_staging_config_path.is_absolute():
         instruction_staging_config_path = repo_root / instruction_staging_config_path
 
-    runner_config = RunnerConfig.from_json(runner_config_path, args.runner)
+    bundled_runner_config_path = repo_root / "examples" / "runner_config.json"
+    runner_config = load_runner_config(
+        runner_config_path,
+        bundled_runner_config_path,
+        args.runner,
+    )
     instruction_staging_config = InstructionStagingConfig.from_json(instruction_staging_config_path)
     runner = WorkflowRunner(
         repo_root=repo_root,

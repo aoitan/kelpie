@@ -1,0 +1,61 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "kelpie-ollama/model:tag",
+  "provider": {
+    "kelpie-ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Kelpie external Ollama",
+      "options": {
+        "baseURL": "http://host.docker.internal:11434/v1"
+      },
+      "models": {
+        "model:tag": {
+          "name": "model:tag",
+          "limit": {
+            "context": 65536,
+            "output": 32768
+          }
+        }
+      }
+    }
+  },
+  "agent": {
+    "kelpie-artifact": {
+      "description": "Read the workspace and write only Kelpie artifacts",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "lsp": "allow",
+        "skill": "allow",
+        "edit": {
+          "*": "deny",
+          "**/.kelpie/artifacts/**": "allow",
+          "**/.kelpie/instructions/**": "allow"
+        }
+      }
+    },
+    "kelpie-workspace": {
+      "description": "Implement and fix code within the mounted workspace",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "lsp": "allow",
+        "skill": "allow",
+        "edit": "allow",
+        "bash": {
+          "*": "ask",
+          "rm": "deny",
+          "rm *": "deny",
+          "git commit": "deny",
+          "git commit *": "deny",
+          "git push": "deny",
+          "git push *": "deny"
+        }
+      }
+    }
+  }
+}

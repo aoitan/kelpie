@@ -23,11 +23,12 @@ COPY scripts/ ${KELPIE_SCRIPT_DIR}/
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates git gh curl wget ripgrep less procps openssh-client libnss-wrapper bubblewrap \
-    && npm install -g @openai/codex @github/copilot \
+    && npm install -g @openai/codex @github/copilot opencode-ai@1.18.7 \
     && curl -fsSL https://antigravity.google/cli/install.sh | bash \
     && chmod +x /usr/local/bin/llm-entrypoint.sh \
     && find "${KELPIE_SCRIPT_DIR}" -maxdepth 1 -type f -exec chmod 0755 {} + \
     && find "${KELPIE_SCRIPT_DIR}" -maxdepth 1 -type f -exec ln -sf {} /usr/local/bin/ \; \
+    && ln -sf "${KELPIE_SCRIPT_DIR}/run_opencode_with_config.sh" /usr/local/bin/kelpie-opencode \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p \
         /workspace \

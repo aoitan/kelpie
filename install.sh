@@ -38,7 +38,8 @@ chmod +x \
   "$KELPIE_HOME/llm-entrypoint.sh" \
   "$KELPIE_HOME/scripts/run_issue_workflow.py" \
   "$KELPIE_HOME/scripts/run_issue_workflow_in_container.sh" \
-  "$KELPIE_HOME/scripts/open_llm_shell_in_container.sh"
+  "$KELPIE_HOME/scripts/open_llm_shell_in_container.sh" \
+  "$KELPIE_HOME/scripts/run_opencode_with_config.sh"
 
 if [ ! -f "$KELPIE_CONFIG_HOME/runner_config.json" ]; then
   copy_file "$SCRIPT_DIR/examples/runner_config.json" "$KELPIE_CONFIG_HOME/runner_config.json"
@@ -48,6 +49,9 @@ if [ ! -f "$KELPIE_CONFIG_HOME/instruction_staging.json" ]; then
 fi
 if [ ! -f "$KELPIE_CONFIG_HOME/compose.local.yaml" ]; then
   copy_file "$SCRIPT_DIR/compose.local.yaml" "$KELPIE_CONFIG_HOME/compose.local.yaml"
+fi
+if [ ! -f "$KELPIE_CONFIG_HOME/opencode.json" ]; then
+  copy_file "$SCRIPT_DIR/examples/opencode.json" "$KELPIE_CONFIG_HOME/opencode.json"
 fi
 cat >"$KELPIE_BIN_DIR/kelpie" <<EOF
 #!/bin/sh

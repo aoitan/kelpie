@@ -137,6 +137,7 @@ install.bat
 - `~/.config/kelpie/instruction_staging.json`
 - `~/.config/kelpie/hooks.yaml`
 - `~/.config/kelpie/compose.local.yaml`
+- `~/.config/kelpie/opencode.json`
 
 `Dockerfile.llm-base` は以下を含みます。
 
@@ -147,6 +148,7 @@ install.bat
 - `Antigravity CLI` (`agy`)
 - `@openai/codex`
 - `@github/copilot`
+- OpenCode (`opencode-ai` 1.18.7)
 
 `AGENTS.md`、`prompts/`、`skills/`、`examples/`、`scripts/` はイメージ build 時に `/opt/kelpie` へコピーされます。`scripts/` 配下は実行権限を付けたうえで `/usr/local/bin` からも呼べるようにしています。`/workspace` に別の対象リポジトリを bind mount しても、テンプレート一式は `/opt/kelpie` から参照できます。
 また entrypoint は `/opt/kelpie/skills` を次の想定ディレクトリへ symlink し、CLI がネイティブに skill を見に行く場合にも参照しやすくしています。
@@ -154,6 +156,108 @@ install.bat
 - `~/.codex/skills`
 - `~/.gemini/skills`
 - `~/.config/github-copilot/skills`
+
+### OpenCodeから外部Ollama APIを使う
+
+KelpieのコンテナにはOpenCodeが含まれますが、Ollama CLIとOllama daemonは含まれません。
+ホストのOllama commandやsocketもmountしません。OpenCodeは設定された
+Ollama OpenAI-compatible APIへ直接接続します。
+
+`install.sh` / `install.bat` は、存在しない場合に限り
+`~/.config/kelpie/opencode.json` を作成します。最低限、次を利用環境に合わせて変更してください。
+既存の `runner_config.json` に新しい同梱runnerがない場合、そのrunnerに限って
+image内の `examples/runner_config.json` へfallbackします。同名の利用者定義は常に優先されます。
+
+- `provider.kelpie-ollama.options.baseURL`
+- `provider.kelpie-ollama.models`
+- top-level `model`
+- modelの `limit.context` / `limit.output`
+
+たとえば別ホストのOllamaへ接続する場合、`baseURL` は次のように `/v1` まで指定します。
+
+```json
+{
+  "provider": {
+    "kelpie-ollama": {
+      "options": {
+        "baseURL": "http://hoge:11434/v1"
+      }
+    }
+  }
+}
+```
+
+OpenCodeはcoding agent用途で大きなcontextを必要とします。設定例は64k contextです。
+OpenCode側の `limit.context` だけでOllama serverのcontextは変更されないため、
+Ollama側も同等以上に設定してください。
+
+注意: 「Ollama」という名前でも接続先がlocalとは限りません。Issue本文、コメント、
+工程prompt、コードやtool contextは指定したendpointへ送信されます。
+信頼できないnetwork上のnon-loopback HTTPは盗聴・改ざんの対象になるため、
+利用可能ならHTTPSを使用してください。API keyが必要な場合はraw値をconfigへ埋め込まず、
+OpenCodeの `{env:VARIABLE}` または `{file:/path}` を使用してください。
+
+workflowではrunnerを指定します。
+
+```bash
+kelpie \
+  --target-workdir /path/to/target-repo \
+  -- \
+  --issue 12 \
+  --issue-source github \
+  --github-repo owner/repo \
+  --runner opencode_ollama
+```
+
+shellから同じ設定で直接確認する場合は、`opencode` ではなくwrapperを使います。
+
+```bash
+kelpie-shell --target-workdir /path/to/target-repo
+kelpie-opencode run --pure --agent kelpie-artifact "Reply with OK"
+```
+
+`kelpie-opencode` は `/kelpie-config/opencode.json` を実行時inline設定として読み、
+project側のOpenCode設定より後に適用します。OpenCodeのdata/cache/stateは
+対象repositoryの `.data/opencode/` 配下へ分離されます。設定変更にimage rebuildは不要です。
+
+標準runnerは次の権限境界を使います。
+
+- planning、design、review、PR draft: `kelpie-artifact`
+  - source code変更とshell実行を禁止
+  - `.kelpie/artifacts/` と `.kelpie/instructions/` のみ変更可能
+- implementation、review/fix: `kelpie-workspace`
+  - workspace変更を許可
+  - `rm`、`git commit`、`git push` は明示的に禁止
+
+permission patternは完全なsandboxではありません。実装工程ではcontainerへmountした
+workspace全体が影響範囲になるため、重要なrepositoryでは独立cloneを使用してください。
+
+OpenCodeは通常応答のほかにtitle生成などの追加requestを行うことがあります。
+接続成功だけではmodelのtool-call品質を保証しません。最初は短い応答、read-only tool、
+破棄可能repositoryでの小さな編集の順に確認してください。
+
+接続は自動preflightしません。明示的に診断する場合はcontainer内からendpointを確認します。
+
+```bash
+kelpie-shell --target-workdir /path/to/target-repo -- \
+  curl -fsS http://hoge:11434/v1/models
+```
+
+主な失敗の切り分け:
+
+- `config file is missing or unreadable`
+  - `~/.config/kelpie/opencode.json` が存在し、config homeがmountされているか確認
+- config parse / provider / model error
+  - strict JSON、top-level model、provider内model IDの一致を確認
+- DNS / connection refused / timeout
+  - containerからの名前解決、Ollama listen address、firewallを確認
+- streaming / protocol error
+  - endpointがOpenAI-compatible chat completionsのSSEに対応するか確認
+- tool call failure
+  - modelのtool-call対応とOllama側contextを確認
+
+`host.docker.internal` の可用性はDocker実装に依存します。Linuxで必要な場合は
+`compose.local.yaml` に `host-gateway` を追加するなど、利用環境側で明示的に設定してください。
 
 ### build
 
