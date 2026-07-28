@@ -698,13 +698,6 @@ class WorkflowRunner:
         step_artifact_dir = self.resolve_artifact_scope(step)
         if phase == "plan_comprehension_check":
             self.run_pre_checks(phase, artifact_dir=step_artifact_dir)
-            if self.allow_plan_check_external_send and not self.dry_run and (
-                not resolved_runner_config.command_template
-                or Path(resolved_runner_config.command_template[0]).name != "agy"
-            ):
-                raise SystemExit(
-                    "plan_comprehension_check requires an agy command_template phase override"
-                )
             result = run_plan_check(
                 artifact_root=step_artifact_dir,
                 command_template=resolved_runner_config.command_template,

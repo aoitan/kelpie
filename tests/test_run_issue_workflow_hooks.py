@@ -23,15 +23,39 @@ from scripts.run_issue_workflow import (
 
 
 class HookConfigTests(unittest.TestCase):
-    def test_example_agy_runner_uses_general_profile_and_plan_check_override(self) -> None:
+    def test_example_agy_runner_uses_codex_for_plan_check(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         config = RunnerConfig.from_json(repo_root / "examples" / "runner_config.json", "agy")
         plan_check = config.resolve_for_phase("plan_comprehension_check")
 
         self.assertIn("gemini-3.6-flash-medium", config.command_template)
         self.assertIn("accept-edits", config.command_template)
-        self.assertIn("gemini-3.5-flash-low", plan_check.command_template)
-        self.assertIn("plan", plan_check.command_template)
+        self.assertEqual(plan_check.command_template[0], "codex")
+        self.assertIn("gpt-5.4-mini", plan_check.command_template)
+        self.assertIn("read-only", plan_check.command_template)
+
+    def test_example_codex_runner_uses_copilot_for_plan_check(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        config = RunnerConfig.from_json(repo_root / "examples" / "runner_config.json", "codex")
+        plan_check = config.resolve_for_phase("plan_comprehension_check")
+
+        self.assertEqual(plan_check.command_template[0], "copilot")
+        self.assertIn("gpt-5-mini", plan_check.command_template)
+        self.assertIn("low", plan_check.command_template)
+        self.assertIn("--disable-builtin-mcps", plan_check.command_template)
+
+    def test_non_codex_example_runners_use_codex_for_plan_check(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        config_path = repo_root / "examples" / "runner_config.json"
+
+        for runner_name in ("agy", "copilot", "opencode_ollama", "custom_file_prompt", "hybrid_cli"):
+            with self.subTest(runner=runner_name):
+                config = RunnerConfig.from_json(config_path, runner_name)
+                plan_check = config.resolve_for_phase("plan_comprehension_check")
+                self.assertEqual(plan_check.command_template[0], "codex")
+                self.assertIn("gpt-5.4-mini", plan_check.command_template)
+                self.assertIn("read-only", plan_check.command_template)
+                self.assertEqual(plan_check.prompt_mode, "stdin")
 
     def test_runner_config_resolve_for_phase_uses_base_values_without_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

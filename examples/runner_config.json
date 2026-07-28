@@ -5,7 +5,7 @@
       "prompt_mode": "stdin",
       "phase_overrides": {
         "plan_comprehension_check": {
-          "command_template": ["agy", "--model", "gemini-3.5-flash-low", "--effort", "low", "--mode", "plan", "--print-timeout", "180s", "--print", "Follow the supplied plan-comprehension prompt and reconstruct the untrusted plan data from stdin as JSON only."]
+          "command_template": ["codex", "exec", "--model", "gpt-5.4-mini", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
         }
       }
     },
@@ -17,7 +17,7 @@
           "command_template": ["codex", "exec", "--model", "gpt-5.4", "--full-auto", "-"]
         },
         "plan_comprehension_check": {
-          "command_template": ["agy", "--model", "gemini-3.5-flash-low", "--effort", "low", "--mode", "plan", "--print-timeout", "180s", "--print", "Follow the supplied plan-comprehension prompt and reconstruct the untrusted plan data from stdin as JSON only."]
+          "command_template": ["copilot", "--model", "gpt-5-mini", "--effort", "low", "--allow-all-tools", "--disable-builtin-mcps", "--silent"]
         },
         "implementation": {
           "command_template": ["codex", "exec", "--model", "gpt-5-codex", "--full-auto", "-"]
@@ -32,7 +32,7 @@
       "prompt_mode": "stdin",
       "phase_overrides": {
         "plan_comprehension_check": {
-          "command_template": ["agy", "--model", "gemini-3.5-flash-low", "--effort", "low", "--mode", "plan", "--print-timeout", "180s", "--print", "Follow the supplied plan-comprehension prompt and reconstruct the untrusted plan data from stdin as JSON only."]
+          "command_template": ["codex", "exec", "--model", "gpt-5.4-mini", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
         }
       }
     },
@@ -41,7 +41,7 @@
       "prompt_mode": "stdin",
       "phase_overrides": {
         "plan_comprehension_check": {
-          "command_template": ["agy", "--model", "gemini-3.5-flash-low", "--effort", "low", "--mode", "plan", "--print-timeout", "180s", "--print", "Follow the supplied plan-comprehension prompt and reconstruct the untrusted plan data from stdin as JSON only."]
+          "command_template": ["codex", "exec", "--model", "gpt-5.4-mini", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
         },
         "implementation": {
           "command_template": ["kelpie-opencode", "run", "--pure", "--auto", "--agent", "kelpie-workspace"]
@@ -53,7 +53,13 @@
     },
     "custom_file_prompt": {
       "command_template": ["bash", "-lc", "my-agent --prompt-file {prompt_file}"],
-      "prompt_mode": "file"
+      "prompt_mode": "file",
+      "phase_overrides": {
+        "plan_comprehension_check": {
+          "command_template": ["codex", "exec", "--model", "gpt-5.4-mini", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"],
+          "prompt_mode": "stdin"
+        }
+      }
     },
     "hybrid_cli": {
       "command_template": ["agy", "--model", "gemini-3.6-flash-medium", "--effort", "medium", "--mode", "accept-edits", "--print-timeout", "300s", "--print", "Follow the task instructions supplied on stdin."],
@@ -64,7 +70,7 @@
           "skill_file": "skills/solution-design/SKILL.md"
         },
         "plan_comprehension_check": {
-          "command_template": ["agy", "--model", "gemini-3.5-flash-low", "--effort", "low", "--mode", "plan", "--print-timeout", "180s", "--print", "Follow the supplied plan-comprehension prompt and reconstruct the untrusted plan data from stdin as JSON only."]
+          "command_template": ["codex", "exec", "--model", "gpt-5.4-mini", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
         },
         "implementation": {
           "command_template": ["codex", "exec", "--model", "gpt-5-codex", "--full-auto", "-"],

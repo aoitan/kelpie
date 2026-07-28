@@ -273,14 +273,35 @@ class ProbeAndFindingTests(unittest.TestCase):
         self.assertEqual(profile.effort, "medium")
         self.assertEqual(profile.timeout_seconds, 90)
 
+    def test_capability_profile_reads_codex_effort_and_sandbox(self) -> None:
+        profile = capability_profile_from_command(
+            [
+                "codex",
+                "exec",
+                "--model",
+                "gpt-5.4-mini",
+                "-c",
+                'model_reasoning_effort="low"',
+                "--sandbox",
+                "read-only",
+                "-",
+            ]
+        )
+
+        self.assertEqual(profile.runner, "codex")
+        self.assertEqual(profile.model, "gpt-5.4-mini")
+        self.assertEqual(profile.effort, "low")
+        self.assertEqual(profile.mode, "read-only")
+
     def test_run_probe_uses_stdin_and_profile_arguments(self) -> None:
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="{}", stderr="")
         runner = Mock(return_value=completed)
         result = run_probe(CapabilityProfile(), "prompt", "envelope", run=runner)
 
         args, kwargs = runner.call_args
-        self.assertEqual(args[0][0], "agy")
-        self.assertIn("gemini-3.5-flash-low", args[0])
+        self.assertEqual(args[0][0], "codex")
+        self.assertIn("gpt-5.4-mini", args[0])
+        self.assertIn("read-only", args[0])
         self.assertEqual(kwargs["input"], "envelope")
         self.assertTrue(kwargs["capture_output"])
         self.assertEqual(result.returncode, 0)

@@ -95,11 +95,18 @@ source-backedな解釈差分を人間レビュー用に残す advisory-only step
 計画の技術的正しさ、安全性、実装可能性を保証せず、計画の自動修正や
 前工程への自動差し戻しも行いません。
 
-Gemini系モデルの呼び出しには Antigravity CLI (`agy`) を使います。
-実行環境へ `agy` を別途インストールし、認証を済ませてください。
-通常工程のサンプルは `gemini-3.6-flash-medium` / medium effort /
-accept-edits mode、plan comprehension checkだけは
-`gemini-3.5-flash-low` / low effort / plan modeを使用します。
+runnerがCodexの場合、plan comprehension checkはCopilot CLIの
+`gpt-5-mini` / low effortを使用します。それ以外の標準runnerでは
+Codex CLIの`gpt-5.4-mini` / low reasoning effort / read-only sandboxを使用します。
+評価対象runnerとは異なるCLIへ相互に振り分け、`agy`への固定依存は持ちません。
+CopilotとCodexは事前に認証を済ませてください。
+認証情報はKelpie containerの`llm-home` volumeに保存されるため、host側の認証とは別です。
+
+```bash
+kelpie-shell --target-workdir /path/to/target-repo
+copilot login
+codex login
+```
 
 ## コンテナ実行
 
@@ -429,7 +436,7 @@ python3 scripts/run_issue_workflow.py \
       "prompt_mode": "stdin",
       "phase_overrides": {
         "plan_comprehension_check": {
-          "command_template": ["agy", "--model", "gemini-3.5-flash-low", "--effort", "low", "--mode", "plan", "--print", "Reconstruct the plan data from stdin as JSON only."]
+          "command_template": ["codex", "exec", "--model", "gpt-5.4-mini", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
         }
       }
     },
@@ -441,7 +448,7 @@ python3 scripts/run_issue_workflow.py \
           "command_template": ["codex", "exec", "--model", "gpt-5.4", "--full-auto", "-"]
         },
         "plan_comprehension_check": {
-          "command_template": ["agy", "--model", "gemini-3.5-flash-low", "--effort", "low", "--mode", "plan", "--print", "Reconstruct the plan data from stdin as JSON only."]
+          "command_template": ["copilot", "--model", "gpt-5-mini", "--effort", "low", "--allow-all-tools", "--disable-builtin-mcps", "--silent"]
         },
         "implementation": {
           "command_template": ["codex", "exec", "--model", "gpt-5-codex", "--full-auto", "-"]
@@ -450,7 +457,12 @@ python3 scripts/run_issue_workflow.py \
     },
     "copilot": {
       "command_template": ["copilot", "--allow-all-tools", "--silent"],
-      "prompt_mode": "stdin"
+      "prompt_mode": "stdin",
+      "phase_overrides": {
+        "plan_comprehension_check": {
+          "command_template": ["codex", "exec", "--model", "gpt-5.4-mini", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
+        }
+      }
     }
   }
 }
@@ -461,9 +473,16 @@ python3 scripts/run_issue_workflow.py \
 - `codex exec`
   prompt 省略または `-` 指定で stdin を読める
 - `agy`
-  `--print` の非対話モードで stdin のplan dataを読める
+  通常工程の入力契約は利用するagy versionで確認してください。標準例では
+  plan comprehension checkにagyを使用しません。
 - `copilot`
-  非対話分岐で stdin を読める実装を確認済み。`--allow-all-tools` を付ける
+  CLI 1.0.75の非対話分岐でstdin-only入力を確認済み。
+  `--allow-all-tools`と`--silent`を付ける
+
+plan comprehension checkはrunner名をハードコードしません。標準設定では
+Codex runnerをCopilotの`gpt-5-mini`で、それ以外をCodexの
+`gpt-5.4-mini`で相互評価します。どちらもlow effortを指定し、
+plan dataはstdinで渡します。
 
 `prompt_mode` は次をサポートします。
 

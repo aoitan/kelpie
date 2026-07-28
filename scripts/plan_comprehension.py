@@ -150,10 +150,10 @@ class PlanCheckSpec:
 @dataclass(frozen=True)
 class CapabilityProfile:
     id: str = "weak-plan-reader-v1"
-    runner: str = "agy"
-    model: str = "gemini-3.5-flash-low"
+    runner: str = "codex"
+    model: str = "gpt-5.4-mini"
     effort: str = "low"
-    mode: str = "plan"
+    mode: str = "read-only"
     timeout_seconds: int = 180
     max_attempts: int = 2
 
@@ -206,14 +206,26 @@ def capability_profile_from_command(command: list[str] | None) -> CapabilityProf
             return default
         return command[index + 1]
 
+    effort = option_value("--effort", "unavailable")
+    if effort == "unavailable":
+        for index, part in enumerate(command[:-1]):
+            if part in {"-c", "--config"}:
+                match = re.fullmatch(
+                    r"""model_reasoning_effort=(?:"([^"]+)"|'([^']+)'|([^"']\S*))""",
+                    command[index + 1],
+                )
+                if match:
+                    effort = next(value for value in match.groups() if value is not None)
+                    break
+
     timeout_text = option_value("--print-timeout", "180s")
     timeout_match = re.fullmatch(r"(\d+)(?:s)?", timeout_text)
     timeout_seconds = int(timeout_match.group(1)) if timeout_match else 180
     return CapabilityProfile(
         runner=Path(command[0]).name,
         model=option_value("--model", "unavailable"),
-        effort=option_value("--effort", "unavailable"),
-        mode=option_value("--mode", "unavailable"),
+        effort=effort,
+        mode=option_value("--mode", option_value("--sandbox", "unavailable")),
         timeout_seconds=timeout_seconds,
     )
 
@@ -689,16 +701,16 @@ def run_probe(
         command_template
         or [
             profile.runner,
+            "exec",
             "--model",
             profile.model,
-            "--effort",
-            profile.effort,
-            "--mode",
+            "-c",
+            f'model_reasoning_effort="{profile.effort}"',
+            "--sandbox",
             profile.mode,
-            "--print-timeout",
-            f"{profile.timeout_seconds}s",
-            "--print",
-            prompt,
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "-",
         ]
     )
     try:
