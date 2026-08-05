@@ -31,7 +31,8 @@ class HookConfigTests(unittest.TestCase):
         self.assertIn("gemini-3.6-flash-medium", config.command_template)
         self.assertIn("accept-edits", config.command_template)
         self.assertEqual(plan_check.command_template[0], "codex")
-        self.assertIn("gpt-5.4-mini", plan_check.command_template)
+        self.assertIn("gpt-5.6-luna", plan_check.command_template)
+        self.assertIn('model_reasoning_effort="low"', plan_check.command_template)
         self.assertIn("read-only", plan_check.command_template)
 
     def test_example_codex_runner_uses_copilot_for_plan_check(self) -> None:
@@ -40,7 +41,7 @@ class HookConfigTests(unittest.TestCase):
         plan_check = config.resolve_for_phase("plan_comprehension_check")
 
         self.assertEqual(plan_check.command_template[0], "copilot")
-        self.assertIn("gpt-5-mini", plan_check.command_template)
+        self.assertIn("gpt-5.6-luna", plan_check.command_template)
         self.assertIn("low", plan_check.command_template)
         self.assertIn("--disable-builtin-mcps", plan_check.command_template)
 
@@ -53,9 +54,28 @@ class HookConfigTests(unittest.TestCase):
                 config = RunnerConfig.from_json(config_path, runner_name)
                 plan_check = config.resolve_for_phase("plan_comprehension_check")
                 self.assertEqual(plan_check.command_template[0], "codex")
-                self.assertIn("gpt-5.4-mini", plan_check.command_template)
+                self.assertIn("gpt-5.6-luna", plan_check.command_template)
+                self.assertIn('model_reasoning_effort="low"', plan_check.command_template)
                 self.assertIn("read-only", plan_check.command_template)
                 self.assertEqual(plan_check.prompt_mode, "stdin")
+
+    def test_example_codex_commands_use_role_specific_current_models(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        config_path = repo_root / "examples" / "runner_config.json"
+        codex = RunnerConfig.from_json(config_path, "codex")
+        hybrid = RunnerConfig.from_json(config_path, "hybrid_cli")
+
+        for phase in ("prototype_planning", "review_fix_loop"):
+            with self.subTest(phase=phase):
+                command = codex.resolve_for_phase(phase).command_template
+                self.assertIn("gpt-5.6-sol", command)
+
+        for runner in (codex, hybrid):
+            with self.subTest(runner=runner.name):
+                command = runner.resolve_for_phase("implementation").command_template
+                self.assertIn("gpt-5.6-luna", command)
+                self.assertIn('model_reasoning_effort="max"', command)
+                self.assertIn("--full-auto", command)
 
     def test_runner_config_resolve_for_phase_uses_base_values_without_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

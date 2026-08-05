@@ -96,8 +96,8 @@ source-backedな解釈差分を人間レビュー用に残す advisory-only step
 前工程への自動差し戻しも行いません。
 
 runnerがCodexの場合、plan comprehension checkはCopilot CLIの
-`gpt-5-mini` / low effortを使用します。それ以外の標準runnerでは
-Codex CLIの`gpt-5.4-mini` / low reasoning effort / read-only sandboxを使用します。
+`gpt-5.6-luna` / low effortを使用します。それ以外の標準runnerでも
+Codex CLIの`gpt-5.6-luna` / low reasoning effort / read-only sandboxを使用します。
 評価対象runnerとは異なるCLIへ相互に振り分け、`agy`への固定依存は持ちません。
 CopilotとCodexは事前に認証を済ませてください。
 認証情報はKelpie containerの`llm-home` volumeに保存されるため、host側の認証とは別です。
@@ -436,7 +436,7 @@ python3 scripts/run_issue_workflow.py \
       "prompt_mode": "stdin",
       "phase_overrides": {
         "plan_comprehension_check": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.4-mini", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
         }
       }
     },
@@ -445,13 +445,16 @@ python3 scripts/run_issue_workflow.py \
       "prompt_mode": "stdin",
       "phase_overrides": {
         "prototype_planning": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.4", "--full-auto", "-"]
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-sol", "--full-auto", "-"]
         },
         "plan_comprehension_check": {
-          "command_template": ["copilot", "--model", "gpt-5-mini", "--effort", "low", "--allow-all-tools", "--disable-builtin-mcps", "--silent"]
+          "command_template": ["copilot", "--model", "gpt-5.6-luna", "--effort", "low", "--allow-all-tools", "--disable-builtin-mcps", "--silent"]
         },
         "implementation": {
-          "command_template": ["codex", "exec", "--model", "gpt-5-codex", "--full-auto", "-"]
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"max\"", "--full-auto", "-"]
+        },
+        "review_fix_loop": {
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-sol", "--full-auto", "-"]
         }
       }
     },
@@ -460,7 +463,7 @@ python3 scripts/run_issue_workflow.py \
       "prompt_mode": "stdin",
       "phase_overrides": {
         "plan_comprehension_check": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.4-mini", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
         }
       }
     }
@@ -480,8 +483,8 @@ python3 scripts/run_issue_workflow.py \
   `--allow-all-tools`と`--silent`を付ける
 
 plan comprehension checkはrunner名をハードコードしません。標準設定では
-Codex runnerをCopilotの`gpt-5-mini`で、それ以外をCodexの
-`gpt-5.4-mini`で相互評価します。どちらもlow effortを指定し、
+Codex runnerをCopilotの`gpt-5.6-luna`で、それ以外をCodexの
+`gpt-5.6-luna`で相互評価します。どちらもlow effortを指定し、
 plan dataはstdinで渡します。
 
 `prompt_mode` は次をサポートします。

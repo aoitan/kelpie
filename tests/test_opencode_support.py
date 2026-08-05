@@ -157,7 +157,8 @@ class OpenCodeRunnerConfigTests(unittest.TestCase):
         self.assertIn("kelpie-workspace", review.command_template)
         self.assertIn("--auto", review.command_template)
         self.assertEqual(plan_check.command_template[0], "codex")
-        self.assertIn("gpt-5.4-mini", plan_check.command_template)
+        self.assertIn("gpt-5.6-luna", plan_check.command_template)
+        self.assertIn('model_reasoning_effort="low"', plan_check.command_template)
 
     def test_bundled_runner_is_fallback_for_existing_user_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
