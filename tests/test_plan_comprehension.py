@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from scripts.plan_comprehension import (
+    AdjudicationResult,
     ArtifactInput,
     CapabilityProfile,
     PlanCheckSpec,
@@ -19,6 +20,7 @@ from scripts.plan_comprehension import (
     capability_profile_from_command,
     evaluate_fixture_results,
     finding_fingerprint,
+    finding_id,
     next_iteration_dir,
     parse_json_payload,
     render_advisory_report,
@@ -88,6 +90,69 @@ def reconstruction(manifest) -> dict[str, object]:
 
 
 class PlanCheckSchemaTests(unittest.TestCase):
+    def test_adjudication_requires_known_findings_and_matching_snapshot(self) -> None:
+        payload = {
+            "schema_version": "1.0",
+            "input_snapshot_id": "snapshot-1",
+            "findings": [
+                {
+                    "finding_id": "PC-0001",
+                    "verdict": "rejected",
+                    "evidence_refs": ["05-work-breakdown.md#task"],
+                    "rationale": "The source already defines the dependency.",
+                    "action": "no_change",
+                }
+            ],
+            "plan_modified": False,
+            "modified_artifacts": [],
+            "unresolved_reasons": [],
+        }
+
+        result = AdjudicationResult.from_dict(
+            payload,
+            expected_snapshot_id="snapshot-1",
+            expected_finding_ids={"PC-0001"},
+        )
+
+        self.assertFalse(result.plan_modified)
+        self.assertEqual(result.findings[0].verdict, "rejected")
+
+    def test_adjudication_rejects_unknown_finding(self) -> None:
+        payload = {
+            "schema_version": "1.0",
+            "input_snapshot_id": "snapshot-1",
+            "findings": [
+                {
+                    "finding_id": "PC-9999",
+                    "verdict": "accepted",
+                    "evidence_refs": [],
+                    "rationale": "Invented finding.",
+                    "action": "plan_modified",
+                }
+            ],
+            "plan_modified": True,
+            "modified_artifacts": ["05-work-breakdown.md"],
+            "unresolved_reasons": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "unknown finding"):
+            AdjudicationResult.from_dict(
+                payload,
+                expected_snapshot_id="snapshot-1",
+                expected_finding_ids={"PC-0001"},
+            )
+
+    def test_finding_id_is_stable_for_same_finding(self) -> None:
+        finding = {
+            "classification": "missing",
+            "observed": "Task T2 has no dependency.",
+            "artifact_id": "05-work-breakdown",
+            "section_id": "task-t2",
+        }
+
+        self.assertEqual(finding_id(finding), finding_id(dict(finding)))
+        self.assertRegex(finding_id(finding), r"^PC-[0-9A-F]{12}$")
+
     def test_spec_rejects_unknown_field(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported keys"):
             PlanCheckSpec.from_dict(

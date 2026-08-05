@@ -23,6 +23,45 @@ from scripts.run_issue_workflow import (
 
 
 class HookConfigTests(unittest.TestCase):
+    def test_plan_refinement_uses_base_runner_by_default(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        config = RunnerConfig.from_json(repo_root / "examples" / "runner_config.json", "codex")
+
+        refinement = config.resolve_for_step("plan_refinement")
+
+        self.assertEqual(refinement.command_template, config.command_template)
+        self.assertNotEqual(
+            refinement.command_template,
+            config.resolve_for_phase("plan_comprehension_check").command_template,
+        )
+
+    def test_plan_refinement_supports_dedicated_step_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "runner_config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "runners": {
+                            "custom": {
+                                "command_template": ["strong", "-"],
+                                "step_overrides": {
+                                    "plan_refinement": {
+                                        "command_template": ["stronger", "-"]
+                                    }
+                                },
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = RunnerConfig.from_json(path, "custom")
+
+        self.assertEqual(
+            config.resolve_for_step("plan_refinement").command_template,
+            ["stronger", "-"],
+        )
+
     def test_example_agy_runner_uses_codex_for_plan_check(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         config = RunnerConfig.from_json(repo_root / "examples" / "runner_config.json", "agy")
@@ -397,6 +436,102 @@ class HookConfigTests(unittest.TestCase):
 
 
 class WorkflowHookExecutionTests(unittest.TestCase):
+    def test_plan_refinement_runs_strong_model_after_clean_probe(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            runner = WorkflowRunner(
+                repo_root=repo_root,
+                workdir=workdir,
+                issue_number=None,
+                runner_config=RunnerConfig(name="codex", command_template=["strong-cli"]),
+                instruction_staging_config=InstructionStagingConfig(),
+                issue_source="none",
+                task_label="refinement-clean",
+                dry_run=False,
+                allow_plan_check_external_send=True,
+            )
+            artifact_dir = runner.artifact_dir
+            for name in ("04-solution-design.md", "05-work-breakdown.md"):
+                (artifact_dir / name).write_text(f"# {name}\n", encoding="utf-8")
+            (artifact_dir / "work_items.json").write_text('{"version":"1.0","tasks":[]}\n', encoding="utf-8")
+            iteration = artifact_dir / "plan-check" / "iterations" / "0001"
+            iteration.mkdir(parents=True)
+
+            def fake_refinement(*args: object, **kwargs: object) -> None:
+                _ = args, kwargs
+                (iteration / "adjudication.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "input_snapshot_id": "snapshot-1",
+                            "findings": [],
+                            "plan_modified": False,
+                            "modified_artifacts": [],
+                            "unresolved_reasons": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            with (
+                patch(
+                    "scripts.run_issue_workflow.run_plan_check",
+                    return_value={
+                        "status": "completed_no_findings",
+                        "snapshot_id": "snapshot-1",
+                        "findings": [],
+                    },
+                ),
+                patch.object(runner, "invoke_cli", side_effect=fake_refinement) as mock_refinement,
+            ):
+                result = runner.run_plan_refinement_loop(
+                    artifact_dir=artifact_dir,
+                    probe_runner=runner.runner_config.resolve_for_phase("plan_comprehension_check"),
+                )
+            intent = json.loads(
+                (iteration / "refinement-intent-record.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["status"], "completed_no_change")
+        self.assertEqual(intent["status"], "completed")
+        self.assertEqual(intent["snapshot_id"], "snapshot-1")
+        self.assertIn("prompt_sha256", intent)
+        mock_refinement.assert_called_once()
+
+    def test_plan_refinement_pause_persists_workflow_state(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            runner = WorkflowRunner(
+                repo_root=repo_root,
+                workdir=workdir,
+                issue_number=None,
+                runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                instruction_staging_config=InstructionStagingConfig(),
+                issue_source="none",
+                task_label="refinement-paused",
+                dry_run=False,
+            )
+            (runner.artifact_dir / "05a-plan-comprehension-check.md").write_text(
+                "# Plan Comprehension Check\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(SystemExit, "paused_unresolved"):
+                runner.record_plan_refinement_outcome(
+                    runner.artifact_dir,
+                    {"status": "paused_unresolved"},
+                )
+            state = json.loads(
+                (runner.artifact_dir / "workflow-state.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(state["status"], "paused")
+        self.assertEqual(state["phase"], "plan_comprehension_check")
+
     def test_plan_comprehension_check_is_between_work_breakdown_and_implementation(self) -> None:
         self.assertLess(PHASES.index("work_breakdown"), PHASES.index("plan_comprehension_check"))
         self.assertLess(PHASES.index("plan_comprehension_check"), PHASES.index("implementation"))
@@ -469,7 +604,8 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 "scripts.run_issue_workflow.run_plan_check",
                 return_value={"status": "approval_required"},
             ) as mock_check:
-                runner.plan_comprehension_check()
+                with self.assertRaisesRegex(SystemExit, "approval_required"):
+                    runner.plan_comprehension_check()
 
         mock_check.assert_called_once()
         self.assertFalse(mock_check.call_args.kwargs["allow_external_send"])
@@ -543,10 +679,11 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 patch.object(runner, "invoke_cli", side_effect=lambda *args, **kwargs: calls.append("invoke")),
                 patch.object(runner, "run_step_post_actions", side_effect=lambda *args, **kwargs: calls.append("post_actions")),
                 patch.object(runner, "run_post_checks", side_effect=lambda *args, **kwargs: calls.append("post")),
+                patch.object(runner, "evaluate_phase_outcome", side_effect=lambda *args, **kwargs: calls.append("outcome")),
             ):
                 runner.run_step(step)
 
-        self.assertEqual(calls, ["intent", "pre", "invoke", "post_actions", "post"])
+        self.assertEqual(calls, ["intent", "pre", "invoke", "post_actions", "post", "outcome"])
 
     def test_resolve_virtual_inputs_rejects_unknown_token(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -688,7 +825,10 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 )
                 return SimpleNamespace(returncode=0)
 
-            with patch("scripts.run_issue_workflow.subprocess.run", side_effect=fake_run):
+            with (
+                patch("scripts.run_issue_workflow.subprocess.run", side_effect=fake_run),
+                patch.object(runner, "evaluate_phase_outcome"),
+            ):
                 runner.run_phase("work_breakdown")
 
             payload = json.loads(runner.work_items_json_path().read_text(encoding="utf-8"))
@@ -776,7 +916,10 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 else:
                     os.environ["KELPIE_CONFIG_HOME"] = old_config_home
 
-            with patch("scripts.run_issue_workflow.subprocess.run") as mock_run:
+            with (
+                patch("scripts.run_issue_workflow.subprocess.run") as mock_run,
+                patch.object(runner, "evaluate_phase_outcome"),
+            ):
                 mock_run.return_value.returncode = 0
                 mock_run.return_value.stdout = ""
                 mock_run.return_value.stderr = ""

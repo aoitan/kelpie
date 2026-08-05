@@ -31,6 +31,8 @@ TERMINAL_STATUSES = {
     "needs_human_review",
     "stale_input",
 }
+ADJUDICATION_VERDICTS = {"accepted", "rejected", "unresolved"}
+ADJUDICATION_ACTIONS = {"plan_modified", "no_change", "requires_human_decision"}
 DEFAULT_NON_GUARANTEES = [
     "technical correctness",
     "security",
@@ -63,6 +65,11 @@ SECRET_PATTERNS = [
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def finding_id(finding: dict[str, object]) -> str:
+    canonical = json.dumps(finding, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return f"PC-{sha256_text(canonical)[:12].upper()}"
 
 
 def utc_now() -> str:
@@ -99,6 +106,128 @@ class ArtifactInput:
         )
 
 
+@dataclass(frozen=True)
+class AdjudicatedFinding:
+    finding_id: str
+    verdict: str
+    evidence_refs: tuple[str, ...]
+    rationale: str
+    action: str
+
+    @staticmethod
+    def from_dict(raw: dict[str, object], expected_finding_ids: set[str]) -> "AdjudicatedFinding":
+        require_keys(
+            raw,
+            {"finding_id", "verdict", "evidence_refs", "rationale", "action"},
+            {"finding_id", "verdict", "evidence_refs", "rationale", "action"},
+            "adjudicated finding",
+        )
+        candidate_id = raw["finding_id"]
+        if not isinstance(candidate_id, str) or candidate_id not in expected_finding_ids:
+            raise ValueError(f"adjudication references unknown finding: {candidate_id}")
+        verdict = raw["verdict"]
+        if verdict not in ADJUDICATION_VERDICTS:
+            raise ValueError(f"unsupported adjudication verdict: {verdict}")
+        action = raw["action"]
+        if action not in ADJUDICATION_ACTIONS:
+            raise ValueError(f"unsupported adjudication action: {action}")
+        expected_actions = {
+            "accepted": {"plan_modified"},
+            "rejected": {"no_change"},
+            "unresolved": {"requires_human_decision"},
+        }
+        if action not in expected_actions[str(verdict)]:
+            raise ValueError(f"action {action} is inconsistent with verdict {verdict}")
+        evidence_refs = raw["evidence_refs"]
+        if not isinstance(evidence_refs, list) or any(not isinstance(item, str) for item in evidence_refs):
+            raise ValueError("adjudicated finding evidence_refs must be a list[str]")
+        rationale = raw["rationale"]
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise ValueError("adjudicated finding rationale must be a non-empty string")
+        return AdjudicatedFinding(
+            finding_id=candidate_id,
+            verdict=str(verdict),
+            evidence_refs=tuple(evidence_refs),
+            rationale=rationale,
+            action=str(action),
+        )
+
+
+@dataclass(frozen=True)
+class AdjudicationResult:
+    schema_version: str
+    input_snapshot_id: str
+    findings: tuple[AdjudicatedFinding, ...]
+    plan_modified: bool
+    modified_artifacts: tuple[str, ...]
+    unresolved_reasons: tuple[str, ...]
+
+    @staticmethod
+    def from_dict(
+        raw: dict[str, object],
+        *,
+        expected_snapshot_id: str,
+        expected_finding_ids: set[str],
+    ) -> "AdjudicationResult":
+        require_keys(
+            raw,
+            {
+                "schema_version",
+                "input_snapshot_id",
+                "findings",
+                "plan_modified",
+                "modified_artifacts",
+                "unresolved_reasons",
+            },
+            {
+                "schema_version",
+                "input_snapshot_id",
+                "findings",
+                "plan_modified",
+                "modified_artifacts",
+                "unresolved_reasons",
+            },
+            "adjudication result",
+        )
+        if raw["schema_version"] != SCHEMA_VERSION:
+            raise ValueError(f"Unsupported adjudication schema version: {raw['schema_version']}")
+        if raw["input_snapshot_id"] != expected_snapshot_id:
+            raise ValueError("adjudication input snapshot does not match the probe snapshot")
+        raw_findings = raw["findings"]
+        if not isinstance(raw_findings, list) or any(not isinstance(item, dict) for item in raw_findings):
+            raise ValueError("adjudication findings must be a list[object]")
+        findings = tuple(
+            AdjudicatedFinding.from_dict(item, expected_finding_ids) for item in raw_findings
+        )
+        adjudicated_ids = [item.finding_id for item in findings]
+        if len(adjudicated_ids) != len(set(adjudicated_ids)):
+            raise ValueError("adjudication contains duplicate finding IDs")
+        if set(adjudicated_ids) != expected_finding_ids:
+            missing = sorted(expected_finding_ids - set(adjudicated_ids))
+            raise ValueError(f"adjudication does not cover all findings: {', '.join(missing)}")
+        plan_modified = raw["plan_modified"]
+        if not isinstance(plan_modified, bool):
+            raise ValueError("adjudication plan_modified must be boolean")
+        modified_artifacts = raw["modified_artifacts"]
+        unresolved_reasons = raw["unresolved_reasons"]
+        for label, values in (
+            ("modified_artifacts", modified_artifacts),
+            ("unresolved_reasons", unresolved_reasons),
+        ):
+            if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+                raise ValueError(f"adjudication {label} must be a list[str]")
+        if plan_modified != bool(modified_artifacts):
+            raise ValueError("plan_modified must match whether modified_artifacts is non-empty")
+        if plan_modified != any(item.verdict == "accepted" for item in findings):
+            raise ValueError("plan_modified must match whether an accepted finding modified the plan")
+        return AdjudicationResult(
+            schema_version=SCHEMA_VERSION,
+            input_snapshot_id=expected_snapshot_id,
+            findings=findings,
+            plan_modified=plan_modified,
+            modified_artifacts=tuple(modified_artifacts),
+            unresolved_reasons=tuple(unresolved_reasons),
+        )
 @dataclass(frozen=True)
 class PlanCheckSpec:
     schema_version: str
@@ -915,6 +1044,8 @@ def run_plan_check(
     write_json(iteration / "evidence-validation.json", evidence)
     findings = build_structural_findings(reconstruction, manifest)
     findings.extend(build_findings(reconstruction, evidence))
+    for finding in findings:
+        finding.setdefault("finding_id", finding_id(finding))
     write_json(iteration / "findings.json", findings)
     try:
         current_manifest = build_snapshot(artifact_root, spec)

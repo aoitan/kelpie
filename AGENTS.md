@@ -136,6 +136,8 @@
 目的:
 - 弱モデル代理が計画を根拠付きで再構成できるか確認する
 - 解釈差分を advisory finding として残す
+- 強モデルが advisory finding を元成果物と照合して裁定する
+- 有効な finding があれば計画を必要最小限修正し、弱モデルで再確認する
 
 出力:
 - `05a-plan-comprehension-check.md`
@@ -145,7 +147,10 @@
 - allowlistされた `external-safe` 成果物だけを入力にする
 - finding、実行障害、invalid outputを区別する
 - no-findingsを「安全」「実装可能」と扱わない
-- 計画を自動修正せず、人間レビューへ渡す
+- 弱モデルには計画を修正させない
+- 強モデルは finding を `accepted` / `rejected` / `unresolved` に裁定する
+- 修正後は `work_items.json` を再生成し、再probeする
+- unresolved または非収束の場合だけ人間レビューへ渡す
 
 ### 7) implementation
 目的:
@@ -205,9 +210,10 @@
 - 対応工程の `prompts/*.md`
 - それ以前の工程で生成された `.kelpie/artifacts/.../issue-xx/*` または `.kelpie/artifacts/.../task-xxxx/*`
 
-`plan_comprehension_check` で外部モデルへ渡せるのは、入力specで
-`external-safe` と明示された成果物だけとする。この工程は advisory-only であり、
-自動差し戻しや自動修正を行わない。live実行ではさらに
+`plan_comprehension_check` の弱モデルprobeで外部モデルへ渡せるのは、入力specで
+`external-safe` と明示された成果物だけとする。弱モデルprobeは advisory-only であり、
+それ単独で実装可否を決めない。後段の強モデルがfindingを裁定し、必要なら計画を修正する。
+live実行ではさらに
 `--allow-plan-check-external-send` による明示opt-inを必須とする。
 
 ---

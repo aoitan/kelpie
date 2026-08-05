@@ -13,9 +13,25 @@ from pathlib import Path
 from typing import Iterable
 
 try:
-    from scripts.plan_comprehension import run_plan_check
+    from scripts.plan_comprehension import AdjudicationResult, parse_json_payload, run_plan_check
+    from scripts.workflow_outcomes import (
+        PHASE_REASON_CODES,
+        PhaseOutcome,
+        persist_phase_outcome,
+        safe_artifact_path,
+        sha256_file,
+        validate_outcome_artifacts,
+    )
 except ModuleNotFoundError:
-    from plan_comprehension import run_plan_check
+    from plan_comprehension import AdjudicationResult, parse_json_payload, run_plan_check
+    from workflow_outcomes import (
+        PHASE_REASON_CODES,
+        PhaseOutcome,
+        persist_phase_outcome,
+        safe_artifact_path,
+        sha256_file,
+        validate_outcome_artifacts,
+    )
 
 
 PHASES = [
@@ -212,6 +228,7 @@ class RunnerConfig:
     prompt_file: str | None = None
     skill_file: str | None = None
     phase_overrides: dict[str, RunnerPhaseOverride] | None = None
+    step_overrides: dict[str, RunnerPhaseOverride] | None = None
 
     @staticmethod
     def from_json(path: Path, runner_name: str) -> "RunnerConfig":
@@ -265,6 +282,38 @@ class RunnerConfig:
                 prompt_file=override.get("prompt_file"),
                 skill_file=override.get("skill_file"),
             )
+        step_overrides: dict[str, RunnerPhaseOverride] = {}
+        raw_step_overrides = raw.get("step_overrides", {})
+        if raw_step_overrides is None:
+            raw_step_overrides = {}
+        if not isinstance(raw_step_overrides, dict):
+            raise ValueError("step_overrides must be a mapping")
+        for step_name, override in raw_step_overrides.items():
+            if step_name != "plan_refinement":
+                raise ValueError(f"Unsupported step in step_overrides: {step_name}")
+            if not isinstance(override, dict):
+                raise ValueError(f"step_overrides.{step_name} must be a mapping")
+            unknown_keys = set(override) - {"command_template", "prompt_mode", "prompt_file", "skill_file"}
+            if unknown_keys:
+                raise ValueError(
+                    f"step_overrides.{step_name} has unsupported keys: {', '.join(sorted(unknown_keys))}"
+                )
+            override_prompt_mode = override.get("prompt_mode")
+            if override_prompt_mode is not None:
+                RunnerConfig.validate_prompt_mode(
+                    override_prompt_mode,
+                    field_name=f"step_overrides.{step_name}.prompt_mode",
+                )
+            step_overrides[step_name] = RunnerPhaseOverride(
+                command_template=RunnerConfig.validate_command_template(
+                    override.get("command_template"),
+                    field_name=f"step_overrides.{step_name}.command_template",
+                    allow_none=True,
+                ),
+                prompt_mode=override_prompt_mode,
+                prompt_file=override.get("prompt_file"),
+                skill_file=override.get("skill_file"),
+            )
         return RunnerConfig(
             name=runner_name,
             command_template=command_template,
@@ -272,10 +321,29 @@ class RunnerConfig:
             prompt_file=prompt_file,
             skill_file=skill_file,
             phase_overrides=phase_overrides,
+            step_overrides=step_overrides,
         )
 
     def resolve_for_phase(self, phase: str) -> "RunnerConfig":
         override = (self.phase_overrides or {}).get(phase)
+        if override is None:
+            return RunnerConfig(
+                name=self.name,
+                command_template=list(self.command_template),
+                prompt_mode=self.prompt_mode,
+                prompt_file=self.prompt_file,
+                skill_file=self.skill_file,
+            )
+        return RunnerConfig(
+            name=self.name,
+            command_template=list(override.command_template or self.command_template),
+            prompt_mode=override.prompt_mode or self.prompt_mode,
+            prompt_file=override.prompt_file or self.prompt_file,
+            skill_file=override.skill_file or self.skill_file,
+        )
+
+    def resolve_for_step(self, step_name: str) -> "RunnerConfig":
+        override = (self.step_overrides or {}).get(step_name)
         if override is None:
             return RunnerConfig(
                 name=self.name,
@@ -698,19 +766,14 @@ class WorkflowRunner:
         step_artifact_dir = self.resolve_artifact_scope(step)
         if phase == "plan_comprehension_check":
             self.run_pre_checks(phase, artifact_dir=step_artifact_dir)
-            result = run_plan_check(
-                artifact_root=step_artifact_dir,
-                command_template=resolved_runner_config.command_template,
-                dry_run=self.dry_run,
-                allow_external_send=self.allow_plan_check_external_send,
-                prompt_text=(
-                    (self.repo_root / PHASE_TO_PROMPT[phase]).read_text(encoding="utf-8")
-                    + "\n\n"
-                    + (self.repo_root / PHASE_TO_SKILL[phase]).read_text(encoding="utf-8")
-                ),
+            result = self.run_plan_refinement_loop(
+                artifact_dir=step_artifact_dir,
+                probe_runner=resolved_runner_config,
             )
             print(f"Plan comprehension check status: {result['status']}")
             self.run_post_checks(phase, artifact_dir=step_artifact_dir)
+            if not self.dry_run:
+                self.record_plan_refinement_outcome(step_artifact_dir, result)
             return
         prompt_cache_dir = step_artifact_dir / ".generated-prompts"
         prompt_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -730,6 +793,413 @@ class WorkflowRunner:
         self.invoke_cli(phase, prompt_text, prompt_file, resolved_runner_config)
         self.run_step_post_actions(step, artifact_dir=step_artifact_dir)
         self.run_post_checks(phase, artifact_dir=step_artifact_dir)
+        if not self.dry_run:
+            self.evaluate_phase_outcome(phase, step_artifact_dir)
+
+    def phase_outcome_path(self, phase: str, artifact_dir: Path) -> Path:
+        return artifact_dir / f"{self.phase_prefix(phase)}phase-outcome.json"
+
+    def evaluate_phase_outcome(self, phase: str, artifact_dir: Path) -> PhaseOutcome:
+        path = self.phase_outcome_path(phase, artifact_dir)
+        if not path.exists():
+            raise SystemExit(f"Phase '{phase}' did not create required outcome: {path.relative_to(self.workdir)}")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("phase outcome must be a JSON object")
+            outcome = PhaseOutcome.from_dict(raw, expected_phase=phase)
+            validate_outcome_artifacts(artifact_dir, outcome)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise SystemExit(f"Invalid phase outcome for '{phase}': {exc}") from exc
+        evidence_digests = {
+            reference.split("#", 1)[0]: sha256_file(
+                safe_artifact_path(artifact_dir, reference.split("#", 1)[0])
+            )
+            for reference in outcome.evidence_refs
+        }
+        outcome = PhaseOutcome(
+            schema_version=outcome.schema_version,
+            phase=outcome.phase,
+            decision=outcome.decision,
+            reason_code=outcome.reason_code,
+            summary=outcome.summary,
+            evidence_refs=outcome.evidence_refs,
+            resume_condition=outcome.resume_condition,
+            artifact_digests={**outcome.artifact_digests, **evidence_digests},
+        )
+        persist_phase_outcome(artifact_dir, outcome)
+        if outcome.decision == "pause":
+            raise SystemExit(f"Workflow paused in phase '{phase}': {outcome.reason_code}")
+        if outcome.decision == "fail":
+            raise SystemExit(f"Workflow failed in phase '{phase}': {outcome.reason_code}")
+        if phase == "pull_request" and outcome.decision != "complete":
+            raise SystemExit("Pull request phase must finish with decision 'complete'")
+        if phase != "pull_request" and outcome.decision == "complete":
+            raise SystemExit(f"Only pull_request may return decision 'complete', got '{phase}'")
+        return outcome
+
+    def record_plan_refinement_outcome(
+        self,
+        artifact_dir: Path,
+        result: dict[str, object],
+    ) -> PhaseOutcome:
+        status = str(result["status"])
+        mapping = {
+            "completed_no_change": ("advance", "completed_no_change", None),
+            "completed_refined": ("advance", "completed_refined", None),
+            "paused_unresolved": (
+                "pause",
+                "unresolved_findings",
+                "Resolve or approve the unresolved plan findings.",
+            ),
+            "paused_non_convergent": (
+                "pause",
+                "non_convergent",
+                "Revise the plan or approve a new refinement attempt.",
+            ),
+            "approval_required": (
+                "pause",
+                "external_send_approval_required",
+                "Allow the external-safe plan-check send.",
+            ),
+        }
+        decision, reason_code, resume_condition = mapping.get(
+            status,
+            ("fail", "execution_error", None),
+        )
+        outcome = PhaseOutcome(
+            schema_version="1.0",
+            phase="plan_comprehension_check",
+            decision=decision,
+            reason_code=reason_code,
+            summary=f"Plan refinement finished with status {status}.",
+            evidence_refs=("05a-plan-comprehension-check.md",),
+            resume_condition=resume_condition,
+            artifact_digests={},
+        )
+        persist_phase_outcome(artifact_dir, outcome)
+        if decision in {"pause", "fail"}:
+            raise SystemExit(f"Plan refinement cannot advance: {status}")
+        return outcome
+
+    def run_plan_refinement_loop(
+        self,
+        *,
+        artifact_dir: Path,
+        probe_runner: RunnerConfig,
+        max_iterations: int = 3,
+    ) -> dict[str, object]:
+        probe_prompt = (
+            (self.repo_root / PHASE_TO_PROMPT["plan_comprehension_check"]).read_text(encoding="utf-8")
+            + "\n\n"
+            + (self.repo_root / PHASE_TO_SKILL["plan_comprehension_check"]).read_text(encoding="utf-8")
+        )
+        if self.allow_plan_check_external_send and not self.dry_run:
+            from datetime import datetime, timezone
+
+            approval = {
+                "schema_version": "1.0",
+                "scope": "plan_comprehension_check_external_safe_artifacts",
+                "source": "--allow-plan-check-external-send",
+                "approved_at": datetime.now(timezone.utc).isoformat(),
+            }
+            (artifact_dir / "plan-check-external-send-approval.json").write_text(
+                json.dumps(approval, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        if self.dry_run:
+            return run_plan_check(
+                artifact_root=artifact_dir,
+                command_template=probe_runner.command_template,
+                dry_run=True,
+                allow_external_send=self.allow_plan_check_external_send,
+                prompt_text=probe_prompt,
+            )
+
+        refined_once = False
+        for _ in range(max_iterations):
+            result = run_plan_check(
+                artifact_root=artifact_dir,
+                command_template=probe_runner.command_template,
+                dry_run=False,
+                allow_external_send=self.allow_plan_check_external_send,
+                prompt_text=probe_prompt,
+            )
+            probe_status = str(result["status"])
+            if probe_status not in {"completed_no_findings", "needs_human_review"}:
+                return result
+
+            iteration_dirs = sorted((artifact_dir / "plan-check" / "iterations").glob("[0-9][0-9][0-9][0-9]"))
+            if not iteration_dirs:
+                raise SystemExit("Plan comprehension probe did not create an iteration directory")
+            iteration_dir = iteration_dirs[-1]
+            snapshot_id = str(result.get("snapshot_id") or "")
+            findings = result.get("findings") or []
+            expected_finding_ids = {
+                str(item["finding_id"]) for item in findings if isinstance(item, dict) and item.get("finding_id")
+            }
+            if len(expected_finding_ids) != len(findings):
+                raise SystemExit("Plan comprehension findings are missing stable finding IDs")
+
+            adjudication_path = iteration_dir / "adjudication.json"
+            allowed_plan_artifacts = {
+                "04-solution-design.md",
+                "05-work-breakdown.md",
+                "work_items.json",
+            }
+            before_digests = self.plan_artifact_digests(artifact_dir, allowed_plan_artifacts)
+            before_protected_artifacts = self.protected_artifact_digests(
+                artifact_dir,
+                allowed_plan_artifacts,
+            )
+            before_workspace = self.workspace_file_digests()
+            refinement_prompt = self.compose_plan_refinement_prompt(
+                artifact_dir=artifact_dir,
+                iteration_dir=iteration_dir,
+                adjudication_path=adjudication_path,
+                snapshot_id=snapshot_id,
+            )
+            prompt_file = iteration_dir / "refinement-prompt.md"
+            prompt_file.write_text(refinement_prompt, encoding="utf-8")
+            refinement_runner = self.runner_config.resolve_for_step("plan_refinement")
+            refinement_intent_path = iteration_dir / "refinement-intent-record.json"
+            refinement_intent = {
+                "schema_version": "1.0",
+                "status": "prepared",
+                "snapshot_id": snapshot_id,
+                "runner": refinement_runner.name,
+                "command_template": refinement_runner.command_template,
+                "prompt_mode": refinement_runner.prompt_mode,
+                "prompt_sha256": self.text_sha256(refinement_prompt),
+                "before_plan_digests": before_digests,
+                "workspace_file_count": len(before_workspace),
+            }
+            refinement_intent_path.write_text(
+                json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            try:
+                self.invoke_cli(
+                    "plan_refinement",
+                    refinement_prompt,
+                    prompt_file,
+                    refinement_runner,
+                )
+            except SystemExit as exc:
+                refinement_intent["status"] = "execution_error"
+                refinement_intent["error"] = str(exc)
+                refinement_intent_path.write_text(
+                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                raise
+            if not adjudication_path.exists():
+                refinement_intent["status"] = "invalid_output"
+                refinement_intent["error"] = "adjudication.json was not created"
+                refinement_intent_path.write_text(
+                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                raise SystemExit(f"Plan refinement did not create {adjudication_path.relative_to(self.workdir)}")
+            try:
+                adjudication = AdjudicationResult.from_dict(
+                    parse_json_payload(adjudication_path.read_text(encoding="utf-8")),
+                    expected_snapshot_id=snapshot_id,
+                    expected_finding_ids=expected_finding_ids,
+                )
+            except ValueError as exc:
+                refinement_intent["status"] = "invalid_output"
+                refinement_intent["error"] = str(exc)
+                refinement_intent_path.write_text(
+                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                raise SystemExit(f"Invalid plan refinement adjudication: {exc}") from exc
+            after_digests = self.plan_artifact_digests(artifact_dir, allowed_plan_artifacts)
+            after_protected_artifacts = self.protected_artifact_digests(
+                artifact_dir,
+                allowed_plan_artifacts,
+            )
+            after_workspace = self.workspace_file_digests()
+            unexpected_workspace_changes = {
+                name
+                for name in set(before_workspace) | set(after_workspace)
+                if before_workspace.get(name) != after_workspace.get(name)
+            }
+            if unexpected_workspace_changes:
+                refinement_intent["status"] = "scope_violation"
+                refinement_intent["unexpected_workspace_changes"] = sorted(
+                    unexpected_workspace_changes
+                )
+                refinement_intent_path.write_text(
+                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                raise SystemExit(
+                    "Plan refinement changed files outside the planning artifact allowlist: "
+                    + ", ".join(sorted(unexpected_workspace_changes))
+                )
+            unexpected_artifact_changes = {
+                name
+                for name in set(before_protected_artifacts) | set(after_protected_artifacts)
+                if before_protected_artifacts.get(name) != after_protected_artifacts.get(name)
+            }
+            if unexpected_artifact_changes:
+                refinement_intent["status"] = "scope_violation"
+                refinement_intent["unexpected_artifact_changes"] = sorted(
+                    unexpected_artifact_changes
+                )
+                refinement_intent_path.write_text(
+                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                raise SystemExit(
+                    "Plan refinement changed protected workflow artifacts: "
+                    + ", ".join(sorted(unexpected_artifact_changes))
+                )
+            actual_modified = {
+                name
+                for name in allowed_plan_artifacts
+                if before_digests.get(name) != after_digests.get(name)
+            }
+            if actual_modified != set(adjudication.modified_artifacts):
+                refinement_intent["status"] = "artifact_mismatch"
+                refinement_intent["declared_modified_artifacts"] = list(adjudication.modified_artifacts)
+                refinement_intent["actual_modified_artifacts"] = sorted(actual_modified)
+                refinement_intent_path.write_text(
+                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                raise SystemExit(
+                    "Plan refinement declared modified artifacts do not match actual changes: "
+                    f"declared={sorted(adjudication.modified_artifacts)}, actual={sorted(actual_modified)}"
+                )
+
+            if adjudication.unresolved_reasons or any(
+                item.verdict == "unresolved" for item in adjudication.findings
+            ):
+                refinement_intent["status"] = "paused_unresolved"
+                refinement_intent["after_plan_digests"] = after_digests
+                refinement_intent_path.write_text(
+                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                status = {
+                    "status": "paused_unresolved",
+                    "snapshot_id": snapshot_id,
+                    "unresolved_reasons": list(adjudication.unresolved_reasons),
+                }
+                (artifact_dir / "plan-refinement-status.json").write_text(
+                    json.dumps(status, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                return status
+
+            if not adjudication.plan_modified:
+                refinement_intent["status"] = "completed"
+                refinement_intent["after_plan_digests"] = after_digests
+                refinement_intent_path.write_text(
+                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                status = {
+                    "status": "completed_refined" if refined_once else "completed_no_change",
+                    "snapshot_id": snapshot_id,
+                    "iterations": len(iteration_dirs),
+                }
+                (artifact_dir / "plan-refinement-status.json").write_text(
+                    json.dumps(status, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                return status
+
+            refined_once = True
+            refinement_intent["status"] = "plan_modified"
+            refinement_intent["after_plan_digests"] = after_digests
+            refinement_intent_path.write_text(
+                json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            if "05-work-breakdown.md" in adjudication.modified_artifacts:
+                self.write_work_items_artifact(artifact_dir=artifact_dir)
+
+        status = {"status": "paused_non_convergent", "iterations": max_iterations}
+        (artifact_dir / "plan-refinement-status.json").write_text(
+            json.dumps(status, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return status
+
+    def plan_artifact_digests(
+        self,
+        artifact_dir: Path,
+        names: set[str],
+    ) -> dict[str, str]:
+        import hashlib
+
+        return {
+            name: hashlib.sha256((artifact_dir / name).read_bytes()).hexdigest()
+            for name in names
+            if (artifact_dir / name).is_file()
+        }
+
+    def text_sha256(self, value: str) -> str:
+        import hashlib
+
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def workspace_file_digests(self) -> dict[str, str]:
+        import hashlib
+
+        digests: dict[str, str] = {}
+        for path in self.workdir.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(self.workdir)
+            if relative.parts and relative.parts[0] in {".git", ".kelpie"}:
+                continue
+            digests[str(relative)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return digests
+
+    def protected_artifact_digests(
+        self,
+        artifact_dir: Path,
+        allowed_names: set[str],
+    ) -> dict[str, str]:
+        import hashlib
+
+        digests: dict[str, str] = {}
+        for path in artifact_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(artifact_dir)
+            if relative.parts and relative.parts[0] == "plan-check":
+                continue
+            if str(relative) in allowed_names:
+                continue
+            digests[str(relative)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return digests
+
+    def compose_plan_refinement_prompt(
+        self,
+        *,
+        artifact_dir: Path,
+        iteration_dir: Path,
+        adjudication_path: Path,
+        snapshot_id: str,
+    ) -> str:
+        instructions = (self.repo_root / "prompts/05b_plan_refinement.md").read_text(encoding="utf-8")
+        skill = (self.repo_root / "skills/plan-refinement/SKILL.md").read_text(encoding="utf-8")
+        return (
+            f"{instructions}\n\n{skill}\n\n"
+            f"Artifact directory: {artifact_dir}\n"
+            f"Immutable probe snapshot: {iteration_dir / 'snapshot'}\n"
+            f"Reconstruction: {iteration_dir / 'reconstruction.json'}\n"
+            f"Evidence validation: {iteration_dir / 'evidence-validation.json'}\n"
+            f"Findings: {iteration_dir / 'findings.json'}\n"
+            f"Input snapshot ID: {snapshot_id}\n"
+            f"Write adjudication JSON to: {adjudication_path}\n"
+        )
 
     def build_step_spec_for_phase(self, phase: str) -> StepSpec:
         post_actions: list[str] = []
@@ -841,6 +1311,8 @@ class WorkflowRunner:
         issue_number_text = self.issue_number or "(not provided)"
         effective_artifact_dir = artifact_dir or self.artifact_dir
         artifact_dir_text = effective_artifact_dir.relative_to(self.workdir)
+        outcome_path = self.phase_outcome_path(phase, effective_artifact_dir)
+        outcome_reasons = ", ".join(sorted(PHASE_REASON_CODES[phase]))
         prompt_md = prompt_md.replace(".kelpie/artifacts/.../issue-{{ISSUE_NUMBER}}", str(artifact_dir_text))
         prompt_md = prompt_md.replace("{{ISSUE_NUMBER}}", self.issue_number or self.task_label or "no-issue")
 
@@ -890,6 +1362,19 @@ Current Phase: {phase}
 - Prefer small, reviewable diffs.
 - Leave explicit notes when blocked or uncertain.
 - Read and follow any instruction files listed above before making changes.
+
+# Required Phase Outcome
+
+Write a JSON object to `{outcome_path}` before finishing.
+Required fields: `schema_version`, `phase`, `decision`, `reason_code`, `summary`,
+`evidence_refs`, `resume_condition`, and `artifact_digests`.
+Use schema version `1.0` and phase `{phase}`.
+Allowed reason codes: {outcome_reasons}.
+Use `advance` only when this phase's artifacts are sufficient for the next phase.
+Use `pause` with a concrete `resume_condition` for semantic decision or authority waits.
+Use `fail` only for an operational or invalid-artifact failure.
+Only the pull_request phase may use `complete`.
+Do not use a negative experiment result or the mere existence of review findings as a pause reason.
 """.strip() + "\n"
 
     def ensure_kelpie_dir(self) -> None:
@@ -1399,6 +1884,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="Only render prompts and commands.")
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume by re-running the phase recorded as paused in workflow-state.json.",
+    )
+    parser.add_argument(
         "--allow-plan-check-external-send",
         action="store_true",
         help="Allow external-safe plan artifacts to be sent to the plan comprehension model.",
@@ -1446,7 +1936,19 @@ def main() -> None:
         dry_run=args.dry_run,
         allow_plan_check_external_send=args.allow_plan_check_external_send,
     )
-    runner.run(slice_phases(args.from_phase, args.to_phase))
+    start_phase = args.from_phase
+    if args.resume:
+        state_path = runner.artifact_dir / "workflow-state.json"
+        if not state_path.exists():
+            raise SystemExit(f"Cannot resume: workflow state not found at {state_path}")
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Cannot resume: invalid workflow state: {exc}") from exc
+        if state.get("status") != "paused" or state.get("phase") not in PHASES:
+            raise SystemExit("Cannot resume: workflow is not in a valid paused phase")
+        start_phase = str(state["phase"])
+    runner.run(slice_phases(start_phase, args.to_phase))
 
 
 if __name__ == "__main__":

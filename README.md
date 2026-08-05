@@ -91,9 +91,15 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 9. `pull_request`
 
 `plan_comprehension_check` は、実装計画を軽量モデルへ再構成させ、
-source-backedな解釈差分を人間レビュー用に残す advisory-only step です。
-計画の技術的正しさ、安全性、実装可能性を保証せず、計画の自動修正や
-前工程への自動差し戻しも行いません。
+source-backedな解釈差分を得た後、通常runnerの強モデルが各findingを
+`accepted` / `rejected` / `unresolved` に裁定する工程です。弱モデルprobe自体は
+advisory-onlyかつread-onlyです。有効なfindingは強モデルが計画へ必要最小限反映し、
+`work_items.json`を再生成した後に再probeします。unresolvedまたは規定回数で
+収束しない場合だけ、人間レビュー待ちとして停止します。
+
+各工程は`advance` / `pause` / `fail` / `complete`の構造化outcomeを出力します。
+hookやCLIの非0終了は運用障害、`pause`は工程固有の判断・入力待ちとして区別されます。
+機械checkの失敗をLLMの`advance`で上書きすることはできません。
 
 runnerがCodexの場合、plan comprehension checkはCopilot CLIの
 `gpt-5.6-luna` / low effortを使用します。それ以外の標準runnerでも
@@ -419,6 +425,9 @@ python3 scripts/run_issue_workflow.py \
   終了工程を指定します。
 - `--dry-run`
   prompt 生成と実行コマンド表示だけ行い、CLI 呼び出しを省略します。
+- `--resume`
+  artifact directoryの`workflow-state.json`に記録されたpause工程を再実行します。
+  pause後に成果物を変更した場合も、古いoutcomeを再利用せず対象工程を再評価します。
 - `--allow-plan-check-external-send`
   `external-safe` と分類された計画成果物を
   `plan_comprehension_check` の外部モデルへ送ることを明示的に許可します。
