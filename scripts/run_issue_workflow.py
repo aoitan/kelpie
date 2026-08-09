@@ -955,9 +955,8 @@ class WorkflowRunner:
         self.validate_prompt_cache_path(resolved.prompt_path)
         for child_name in (".generated-prompts", "intent-records", "checks", "plan-check"):
             child_path = resolved.artifact_dir / child_name
-            self._assert_artifact_path_contained(child_path)
-            self._reject_symlink_components(self.artifact_dir, child_path)
-        resolved.prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            self.prepare_artifact_scope(child_path)
+        self.validate_prompt_cache_path(resolved.prompt_path)
         self.atomic_write_text(resolved.prompt_path, resolved.prompt_text)
         self.write_intent_record_stub(
             resolved.phase,

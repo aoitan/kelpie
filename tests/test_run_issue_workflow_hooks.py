@@ -1022,6 +1022,56 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 )
             self.assertEqual(list(outside.iterdir()), [])
 
+    def test_child_artifact_symlink_swap_is_rejected_before_prompt_write(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = (Path(tmpdir) / "target-repo").resolve()
+            workdir.mkdir()
+            outside = Path(tmpdir) / "outside"
+            outside.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="symlink-swap",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            resolved = runner.step_resolver.resolve(
+                StepSpec(name="loop-like", phase="implementation", context_id="ctx-1")
+            )
+            prompt_dir = resolved.prompt_path.parent
+            original_reject = runner._reject_symlink_components
+            injected = False
+
+            def inject_symlink_after_check(root: Path, path: Path) -> None:
+                nonlocal injected
+                original_reject(root, path)
+                if path == prompt_dir and not injected:
+                    prompt_dir.symlink_to(outside, target_is_directory=True)
+                    injected = True
+
+            with patch.object(
+                runner,
+                "_reject_symlink_components",
+                side_effect=inject_symlink_after_check,
+            ):
+                with self.assertRaisesRegex(ValueError, "artifact root|Symlink"):
+                    runner.prepare_resolved_step(resolved)
+
+            self.assertEqual(list(outside.iterdir()), [])
+
     def test_symlinked_kelpie_root_is_rejected_before_artifact_writes(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmpdir:
