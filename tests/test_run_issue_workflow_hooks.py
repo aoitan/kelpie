@@ -12,7 +12,9 @@ from scripts.run_issue_workflow import (
     PHASES,
     HookConfig,
     InstructionStagingConfig,
+    RunnerPhaseOverride,
     RunnerConfig,
+    RunnerNotFoundError,
     StepSpec,
     WorkflowRunner,
     parse_work_items_from_text,
@@ -645,6 +647,39 @@ class WorkflowHookExecutionTests(unittest.TestCase):
         self.assertEqual(step_arg.name, "implementation")
         self.assertEqual(step_arg.phase, "implementation")
 
+    def test_every_top_level_phase_method_delegates_to_run_step(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="phase-delegation",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            with patch.object(runner, "run_step") as mock_run_step:
+                for phase in PHASES:
+                    getattr(runner, phase)()
+                    step = mock_run_step.call_args.args[0]
+                    self.assertEqual(step.name, phase)
+                    self.assertEqual(step.phase, phase)
+
+            self.assertEqual(mock_run_step.call_count, len(PHASES))
+
     def test_run_step_preserves_execution_order(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -684,6 +719,47 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 runner.run_step(step)
 
         self.assertEqual(calls, ["intent", "pre", "invoke", "post_actions", "post", "outcome"])
+
+    def test_plan_comprehension_uses_common_lifecycle_dispatch(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="plan-lifecycle",
+                    dry_run=False,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            calls: list[str] = []
+            with (
+                patch.object(runner, "write_intent_record_stub", side_effect=lambda *args, **kwargs: calls.append("intent")),
+                patch.object(runner, "run_pre_checks", side_effect=lambda *args, **kwargs: calls.append("pre")),
+                patch.object(
+                    runner,
+                    "run_plan_refinement_loop",
+                    side_effect=lambda *args, **kwargs: (calls.append("execute") or {"status": "completed_no_change"}),
+                ),
+                patch.object(runner, "run_step_post_actions", side_effect=lambda *args, **kwargs: calls.append("post_actions")),
+                patch.object(runner, "run_post_checks", side_effect=lambda *args, **kwargs: calls.append("post")),
+                patch.object(runner, "record_plan_refinement_outcome", side_effect=lambda *args, **kwargs: calls.append("outcome")),
+            ):
+                runner.run_phase("plan_comprehension_check")
+
+        self.assertEqual(calls, ["intent", "pre", "execute", "post_actions", "post", "outcome"])
 
     def test_resolve_virtual_inputs_rejects_unknown_token(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -740,6 +816,318 @@ class WorkflowHookExecutionTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "Invalid artifact scope segment"):
                 runner.resolve_artifact_scope(StepSpec(name="implementation", phase="implementation", artifact_subdir="../x"))
+
+    def test_custom_step_resolves_named_runner_and_isolates_artifacts(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            base = RunnerConfig(name="base", command_template=["base-cli"])
+            alternate = RunnerConfig(
+                name="alternate",
+                command_template=["alternate-cli", "{phase}"],
+                phase_overrides={
+                    "implementation": RunnerPhaseOverride(command_template=["alternate-implementation"])
+                },
+            )
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=base,
+                    runner_registry={"alternate": alternate},
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="named-step",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            runner.run_step(
+                StepSpec(
+                    name="loop-like",
+                    phase="implementation",
+                    runner_name="alternate",
+                    prompt_file="prompts/04_solution_design.md",
+                    skill_file="skills/solution-design/SKILL.md",
+                    inputs=["plain-id"],
+                    outputs=["declared-only.md"],
+                    context_id="loop-7",
+                    artifact_subdir="step-a",
+                )
+            )
+
+            scoped = runner.artifact_dir / "loop-7" / "step-a"
+            prompt = (scoped / ".generated-prompts" / "loop-like.prompt.md").read_text(encoding="utf-8")
+            intent = json.loads(
+                (scoped / "intent-records" / "loop-like-intent-record.json").read_text(encoding="utf-8")
+            )
+            output_exists = (scoped / "declared-only.md").exists()
+
+        self.assertIn("# solution design prompt", prompt)
+        self.assertIn("plain-id: plain-id", prompt)
+        self.assertEqual(intent["effective_runner_config"]["command_template"], ["alternate-implementation"])
+        self.assertEqual(intent["outputs"], ["declared-only.md"])
+        self.assertFalse(output_exists)
+
+    def test_invalid_step_metadata_has_no_scoped_artifact_side_effect(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="invalid-step",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            with self.assertRaisesRegex(ValueError, "Unknown virtual input token"):
+                runner.run_step(
+                    StepSpec(
+                        name="loop-like",
+                        phase="implementation",
+                        context_id="ctx-1",
+                        inputs=["$unknown"],
+                    )
+                )
+
+            self.assertFalse((runner.artifact_dir / "ctx-1").exists())
+
+    def test_external_prompt_override_is_rejected_by_run_step(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            external_prompt = Path(tmpdir) / "external.md"
+            external_prompt.write_text("# External\n", encoding="utf-8")
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="external-prompt",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            with self.assertRaisesRegex(ValueError, "prompt_file"):
+                runner.run_step(
+                    StepSpec(
+                        name="loop-like",
+                        phase="implementation",
+                        prompt_file=str(external_prompt),
+                        context_id="ctx-1",
+                    )
+                )
+            self.assertFalse((runner.artifact_dir / "ctx-1").exists())
+
+    def test_unknown_runner_is_rejected_before_scope_creation(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="unknown-runner",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            with self.assertRaisesRegex(RunnerNotFoundError, "not registered"):
+                runner.run_step(
+                    StepSpec(
+                        name="loop-like",
+                        phase="implementation",
+                        runner_name="missing",
+                        context_id="ctx-1",
+                    )
+                )
+            self.assertFalse((runner.artifact_dir / "ctx-1").exists())
+
+    def test_artifact_scope_symlink_is_rejected(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            outside = Path(tmpdir) / "outside"
+            outside.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="symlink-scope",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            (runner.artifact_dir / "ctx-1").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "artifact root|Symlink"):
+                runner.run_step(
+                    StepSpec(
+                        name="loop-like",
+                        phase="implementation",
+                        context_id="ctx-1",
+                    )
+                )
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_symlinked_kelpie_root_is_rejected_before_artifact_writes(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            outside = Path(tmpdir) / "outside"
+            outside.mkdir()
+            (workdir / ".kelpie").symlink_to(outside, target_is_directory=True)
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                with self.assertRaisesRegex(ValueError, "Symlinked kelpie directory"):
+                    WorkflowRunner(
+                        repo_root=repo_root,
+                        workdir=workdir,
+                        issue_number=None,
+                        runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                        instruction_staging_config=InstructionStagingConfig(),
+                        issue_source="none",
+                        task_label="symlink-root",
+                        dry_run=True,
+                    )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_same_scope_rerun_is_allowed_but_existing_lock_fails_fast(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="scope-lock",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            step = StepSpec(name="loop-like", phase="implementation", context_id="ctx-1")
+            runner.run_step(step)
+            runner.run_step(step)
+            lock_path = runner.artifact_dir / "ctx-1" / ".step-lock"
+            lock_path.write_text("held\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "already locked"):
+                runner.run_step(step)
+
+    def test_virtual_input_truncation_is_recorded(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="truncation",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            with patch.dict(os.environ, {"KELPIE_LOOP_ITEM": "x" * 2001}):
+                runner.run_step(
+                    StepSpec(
+                        name="loop-like",
+                        phase="implementation",
+                        inputs=["$loop_item"],
+                        context_id="ctx-1",
+                    )
+                )
+
+            scoped = runner.artifact_dir / "ctx-1"
+            prompt = (scoped / ".generated-prompts" / "loop-like.prompt.md").read_text(encoding="utf-8")
+            intent = json.loads(
+                (scoped / "intent-records" / "loop-like-intent-record.json").read_text(encoding="utf-8")
+            )
+
+        self.assertIn('original_length="2001"', prompt)
+        self.assertIn('truncated="true"', prompt)
+        self.assertEqual(intent["inputs"][0]["original_length"], 2001)
+        self.assertTrue(intent["inputs"][0]["truncated"])
 
     def test_parse_work_items_from_text_returns_first_schema_valid_candidate(self) -> None:
         source = """
