@@ -9,7 +9,9 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +74,117 @@ PHASE_TO_SKILL = {
     "review_fix_loop": "skills/review-fix-loop/SKILL.md",
     "pull_request": "skills/pull-request/SKILL.md",
 }
+
+
+@dataclass(frozen=True)
+class CodexFailureDiagnosis:
+    category: str
+    retryable: bool
+    error_code: str | None
+    retry_after_seconds: int | None
+    reset_at: str | None
+    evidence: str
+    recommended_action: str
+
+
+def find_explicit_reset_at(output: str) -> str | None:
+    for line in output.splitlines():
+        if "reset" not in line.lower():
+            continue
+        match = re.search(
+            r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b",
+            line,
+        )
+        if match:
+            return match.group(0)
+    return None
+
+
+def find_retry_after_seconds(output: str) -> int | None:
+    match = re.search(r"(?:retry-after|retry after)\s*[:=]?\s*(\d+)\b", output, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def diagnose_codex_failure(stdout: str, stderr: str) -> CodexFailureDiagnosis:
+    output = f"{stdout}\n{stderr}"
+    normalized = output.lower()
+    reset_at = find_explicit_reset_at(output)
+
+    if (
+        "selected model is at capacity" in normalized
+        or "server_overloaded" in normalized
+        or "engine is currently overloaded" in normalized
+    ):
+        return CodexFailureDiagnosis(
+            category="provider_capacity",
+            retryable=True,
+            error_code="server_overloaded",
+            retry_after_seconds=None,
+            reset_at=None,
+            evidence="selected_model_at_capacity",
+            recommended_action="Wait briefly or select a different model, then rerun the phase.",
+        )
+
+    if any(
+        marker in normalized
+        for marker in (
+            "insufficient_quota",
+            "usage limit",
+            "weekly limit",
+            "weekly usage",
+            "5-hour usage",
+            "five-hour usage",
+            "spend limit",
+            "billing",
+        )
+    ):
+        return CodexFailureDiagnosis(
+            category="usage_or_billing_limited",
+            retryable=False,
+            error_code="insufficient_quota" if "insufficient_quota" in normalized else None,
+            retry_after_seconds=None,
+            reset_at=reset_at,
+            evidence="usage_or_billing_limit",
+            recommended_action="Check usage or billing status before rerunning the phase.",
+        )
+
+    has_429 = "429" in normalized
+    has_rate_limit = "rate limit" in normalized or "rate_limit" in normalized
+    if has_429 and has_rate_limit:
+        return CodexFailureDiagnosis(
+            category="request_rate_limited",
+            retryable=True,
+            error_code="http_429_rate_limit",
+            retry_after_seconds=find_retry_after_seconds(output),
+            reset_at=reset_at,
+            evidence="http_429_rate_limit",
+            recommended_action="Wait for Retry-After or the explicit reset time, then rerun the phase.",
+        )
+
+    if has_429:
+        return CodexFailureDiagnosis(
+            category="unknown",
+            retryable=False,
+            error_code="http_429",
+            retry_after_seconds=None,
+            reset_at=reset_at,
+            evidence="http_429_without_cause",
+            recommended_action="Inspect the provider message or usage status before deciding whether to rerun.",
+        )
+
+    return CodexFailureDiagnosis(
+        category="unknown",
+        retryable=False,
+        error_code=None,
+        retry_after_seconds=None,
+        reset_at=reset_at,
+        evidence="nonzero_exit_without_recognized_codex_error",
+        recommended_action="Inspect the runner output and rerun only after identifying the cause.",
+    )
+
+
+def is_codex_exec_command(command: list[str]) -> bool:
+    return len(command) >= 2 and command[:2] == ["codex", "exec"]
 
 
 def normalize_phase_name(name: str) -> str:
@@ -2361,9 +2474,118 @@ Do not use a negative experiment result or the mere existence of review findings
         elif runner_config.prompt_mode == "file":
             pass
 
+        if is_codex_exec_command(cmd):
+            returncode, stdout, stderr = self.invoke_codex_with_live_output(
+                cmd,
+                prompt_text if runner_config.prompt_mode == "stdin" else None,
+            )
+            if returncode != 0:
+                diagnosis = diagnose_codex_failure(stdout, stderr)
+                artifact_path = self.write_codex_failure_diagnostic(
+                    phase=phase,
+                    command=cmd,
+                    returncode=returncode,
+                    diagnosis=diagnosis,
+                )
+                raise SystemExit(self.format_codex_failure_message(phase, diagnosis, artifact_path))
+            return
+
         completed = subprocess.run(cmd, **kwargs)
         if completed.returncode != 0:
             raise SystemExit(f"Phase '{phase}' failed with exit code {completed.returncode}")
+
+    def invoke_codex_with_live_output(
+        self,
+        command: list[str],
+        stdin_text: str | None,
+    ) -> tuple[int, str, str]:
+        process = subprocess.Popen(
+            command,
+            cwd=str(self.workdir),
+            text=True,
+            stdin=subprocess.PIPE if stdin_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=1,
+        )
+        if process.stdout is None or process.stderr is None:
+            raise RuntimeError("Codex process streams were not available")
+
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        def relay(stream: object, destination: object, chunks: list[str]) -> None:
+            readline = getattr(stream, "readline")
+            for line in iter(readline, ""):
+                chunks.append(line)
+                print(line, end="", file=destination, flush=True)
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+
+        stdout_thread = threading.Thread(target=relay, args=(process.stdout, sys.stdout, stdout_chunks))
+        stderr_thread = threading.Thread(target=relay, args=(process.stderr, sys.stderr, stderr_chunks))
+        stdout_thread.start()
+        stderr_thread.start()
+        if stdin_text is not None:
+            if process.stdin is None:
+                raise RuntimeError("Codex process stdin was not available")
+            process.stdin.write(stdin_text)
+            process.stdin.close()
+        returncode = process.wait()
+        stdout_thread.join()
+        stderr_thread.join()
+        return returncode, "".join(stdout_chunks), "".join(stderr_chunks)
+
+    def write_codex_failure_diagnostic(
+        self,
+        phase: str,
+        command: list[str],
+        returncode: int,
+        diagnosis: CodexFailureDiagnosis,
+    ) -> Path:
+        path = self.checks_dir / f"{self.phase_prefix(phase)}runner-failure.json"
+        payload = {
+            "schema_version": 1,
+            "phase": phase,
+            "runner": " ".join(command[:2]),
+            "exit_code": returncode,
+            "diagnosis": {
+                "category": diagnosis.category,
+                "retryable": diagnosis.retryable,
+                "error_code": diagnosis.error_code,
+                "retry_after_seconds": diagnosis.retry_after_seconds,
+                "reset_at": diagnosis.reset_at,
+                "evidence": diagnosis.evidence,
+                "recommended_action": diagnosis.recommended_action,
+            },
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def format_codex_failure_message(
+        self,
+        phase: str,
+        diagnosis: CodexFailureDiagnosis,
+        artifact_path: Path,
+    ) -> str:
+        category_message = {
+            "provider_capacity": "provider capacity is temporarily unavailable",
+            "request_rate_limited": "a short-term request rate limit was reached",
+            "usage_or_billing_limited": "a usage or billing limit was reached",
+            "unknown": "Codex returned a nonzero exit without a recognized cause",
+        }[diagnosis.category]
+        timing = []
+        if diagnosis.retry_after_seconds is not None:
+            timing.append(f"Retry-After: {diagnosis.retry_after_seconds} seconds")
+        if diagnosis.reset_at is not None:
+            timing.append(f"reset at {diagnosis.reset_at}")
+        timing_text = f" ({'; '.join(timing)})" if timing else ""
+        return (
+            f"Phase '{phase}' failed: {category_message}{timing_text}. "
+            f"{diagnosis.recommended_action} "
+            f"Diagnostic: {artifact_path.relative_to(self.workdir)}"
+        )
 
 
 def parse_args() -> argparse.Namespace:

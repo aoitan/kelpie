@@ -114,6 +114,20 @@ copilot login
 codex login
 ```
 
+### Codex runnerの失敗診断
+
+`codex exec` が非0終了すると、Kelpieは端末へのCodex出力を維持したまま、
+`.kelpie/artifacts/.../checks/NN-runner-failure.json` に機密になり得る生ログを含めない
+診断を保存します。`Selected model is at capacity` / `server_overloaded` は
+`provider_capacity`であり、HTTP 429とは別の一時的な提供側混雑です。
+
+429は本文に明示的な`rate limit`がある場合だけ`request_rate_limited`として扱います。
+`usage limit`、`weekly limit`、`insufficient_quota`、billing関連の文言は
+`usage_or_billing_limited`として自動再試行しません。原因のない429は`unknown`です。
+reset時刻や`Retry-After`はCodexが明示した値だけをartifactとエラー表示へ反映し、
+Kelpieは推測しません。いずれも自動retryやmodel fallbackは行わないため、診断の
+`recommended_action`に従って人が再実行してください。
+
 ## コンテナ実行
 
 ## インストール
