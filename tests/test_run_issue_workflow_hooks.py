@@ -74,7 +74,7 @@ class HookConfigTests(unittest.TestCase):
         self.assertEqual(plan_check.command_template[0], "codex")
         self.assertIn("gpt-5.6-luna", plan_check.command_template)
         self.assertIn('model_reasoning_effort="low"', plan_check.command_template)
-        self.assertIn("read-only", plan_check.command_template)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", plan_check.command_template)
 
     def test_example_codex_runner_uses_copilot_for_plan_check(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -97,7 +97,10 @@ class HookConfigTests(unittest.TestCase):
                 self.assertEqual(plan_check.command_template[0], "codex")
                 self.assertIn("gpt-5.6-luna", plan_check.command_template)
                 self.assertIn('model_reasoning_effort="low"', plan_check.command_template)
-                self.assertIn("read-only", plan_check.command_template)
+                self.assertIn(
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    plan_check.command_template,
+                )
                 self.assertEqual(plan_check.prompt_mode, "stdin")
 
     def test_example_codex_commands_use_role_specific_current_models(self) -> None:
@@ -116,7 +119,7 @@ class HookConfigTests(unittest.TestCase):
                 command = runner.resolve_for_phase("implementation").command_template
                 self.assertIn("gpt-5.6-luna", command)
                 self.assertIn('model_reasoning_effort="max"', command)
-                self.assertIn("--full-auto", command)
+                self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
 
     def test_runner_config_resolve_for_phase_uses_base_values_without_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1541,6 +1544,41 @@ class WorkflowHookExecutionTests(unittest.TestCase):
         self.assertIn("My custom task instructions.", prompt)
         self.assertIn("My custom skill rules.", prompt)
         self.assertNotIn("prototype_planning", prompt.split("# Phase Prompt")[1].split("\n")[0])
+
+    def test_compose_phase_prompt_documents_artifact_relative_outcome_paths(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number="2",
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            prompt = runner.compose_phase_prompt(
+                "red_team_review",
+                runner.runner_config.resolve_for_phase("red_team_review"),
+            )
+
+        self.assertIn("`evidence_refs` paths are relative to the current `Artifact Directory`", prompt)
+        self.assertIn("Do not prefix an evidence path with `.kelpie/`", prompt)
+        self.assertIn("Do not use `..`, `src/...`, or", prompt)
+        self.assertIn("Leave `artifact_digests` as {}", prompt)
+        self.assertIn("without a `sha256:` prefix", prompt)
 
 
 if __name__ == "__main__":

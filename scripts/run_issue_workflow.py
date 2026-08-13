@@ -1957,6 +1957,19 @@ Use `pause` with a concrete `resume_condition` for semantic decision or authorit
 Use `fail` only for an operational or invalid-artifact failure.
 Only the pull_request phase may use `complete`.
 Do not use a negative experiment result or the mere existence of review findings as a pause reason.
+
+Phase outcome path rules:
+- `evidence_refs` paths are relative to the current `Artifact Directory` above.
+  Use only files inside that directory, such as `03-red-team-review.md#section`.
+- Do not prefix an evidence path with `.kelpie/`, the `Artifact Directory`, the
+  `Working Directory`, or an absolute path. Do not use `..`, `src/...`, or
+  `tests/...` paths outside the artifact directory; put those observations in
+  the phase artifact itself.
+- An optional `#heading` may follow an evidence path, but the path before it
+  must name an existing regular file.
+- Leave `artifact_digests` as {{}}; Kelpie calculates evidence digests. If you
+  provide digest entries, use the same artifact-relative paths and lowercase
+  64-character SHA-256 hex values without a `sha256:` prefix.
 """.strip() + "\n"
 
     def ensure_kelpie_dir(self) -> None:

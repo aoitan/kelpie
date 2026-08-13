@@ -5,25 +5,25 @@
       "prompt_mode": "stdin",
       "phase_overrides": {
         "plan_comprehension_check": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--dangerously-bypass-approvals-and-sandbox", "--ephemeral", "--skip-git-repo-check", "-"]
         }
       }
     },
     "codex": {
-      "command_template": ["codex", "exec", "--full-auto", "-"],
+      "command_template": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"],
       "prompt_mode": "stdin",
       "phase_overrides": {
         "prototype_planning": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.6-sol", "--full-auto", "-"]
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-sol", "--dangerously-bypass-approvals-and-sandbox", "-"]
         },
         "plan_comprehension_check": {
           "command_template": ["copilot", "--model", "gpt-5.6-luna", "--effort", "low", "--allow-all-tools", "--disable-builtin-mcps", "--silent"]
         },
         "implementation": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"max\"", "--full-auto", "-"]
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"max\"", "--dangerously-bypass-approvals-and-sandbox", "-"]
         },
         "review_fix_loop": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.6-sol", "--full-auto", "-"]
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-sol", "--dangerously-bypass-approvals-and-sandbox", "-"]
         }
       }
     },
@@ -32,7 +32,7 @@
       "prompt_mode": "stdin",
       "phase_overrides": {
         "plan_comprehension_check": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--dangerously-bypass-approvals-and-sandbox", "--ephemeral", "--skip-git-repo-check", "-"]
         }
       }
     },
@@ -41,7 +41,7 @@
       "prompt_mode": "stdin",
       "phase_overrides": {
         "plan_comprehension_check": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--dangerously-bypass-approvals-and-sandbox", "--ephemeral", "--skip-git-repo-check", "-"]
         },
         "implementation": {
           "command_template": ["kelpie-opencode", "run", "--pure", "--auto", "--agent", "kelpie-workspace"]
@@ -56,7 +56,7 @@
       "prompt_mode": "file",
       "phase_overrides": {
         "plan_comprehension_check": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"],
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--dangerously-bypass-approvals-and-sandbox", "--ephemeral", "--skip-git-repo-check", "-"],
           "prompt_mode": "stdin"
         }
       }
@@ -70,10 +70,10 @@
           "skill_file": "skills/solution-design/SKILL.md"
         },
         "plan_comprehension_check": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "-"]
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"low\"", "--dangerously-bypass-approvals-and-sandbox", "--ephemeral", "--skip-git-repo-check", "-"]
         },
         "implementation": {
-          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"max\"", "--full-auto", "-"],
+          "command_template": ["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=\"max\"", "--dangerously-bypass-approvals-and-sandbox", "-"],
           "prompt_mode": "stdin"
         },
         "review_fix_loop": {
