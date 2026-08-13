@@ -1853,7 +1853,7 @@ class WorkflowRunner:
         return False
 
     def _reject_symlink_components(self, root: Path, path: Path) -> None:
-        if self._path_has_symlink(root.resolve(), path):
+        if self._path_has_symlink(root, path):
             raise ValueError(f"Symlinked artifact scope component is not allowed: {path}")
 
     def run_step_post_actions(self, step: StepSpec, artifact_dir: Path | None = None) -> None:

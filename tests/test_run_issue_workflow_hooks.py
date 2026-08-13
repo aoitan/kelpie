@@ -1025,6 +1025,37 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 )
             self.assertEqual(list(outside.iterdir()), [])
 
+    def test_artifact_scope_allows_a_symlinked_parent_outside_workdir(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_parent = Path(tmpdir) / "real-parent"
+            real_parent.mkdir()
+            parent_alias = Path(tmpdir) / "parent-alias"
+            parent_alias.symlink_to(real_parent, target_is_directory=True)
+            workdir = parent_alias / "target-repo"
+            workdir.mkdir()
+
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="symlinked-parent",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            self.assertTrue(runner.artifact_dir.is_dir())
+
     def test_child_artifact_symlink_swap_is_rejected_before_prompt_write(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmpdir:
