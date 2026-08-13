@@ -540,8 +540,12 @@ class IterationStore:
         self.iterations_root.mkdir(parents=True, exist_ok=True)
         _assert_safe_artifact_path(self.artifact_root, self.iterations_root)
         lock_path = self.work_item_root / ".work-item-lock"
+        if lock_path.is_symlink():
+            raise ValueError(f"single-change lock path must not be a symlink: {lock_path}")
+        open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        open_flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            descriptor = os.open(lock_path, open_flags, 0o600)
         except FileExistsError as exc:
             raise RuntimeError(
                 f"single-change work item is already locked: {self.work_item_id}"
@@ -1205,7 +1209,7 @@ class CheckRunner:
         timed_out = False
         drain_deadline: float | None = None
         try:
-            while selector.get_map():
+            while process.poll() is None or selector.get_map():
                 now = time.monotonic()
                 # A child process can outlive its parent while keeping the
                 # parent's stdout/stderr pipes open.  The deadline therefore
@@ -1219,15 +1223,22 @@ class CheckRunner:
                         selector.unregister(key.fileobj)
                         key.fileobj.close()
                     break
-                wait_time = 0.05
-                if not timed_out:
-                    wait_time = max(0.0, min(wait_time, deadline - now))
+                if timed_out:
+                    wait_time = max(0.0, min(0.05, (drain_deadline or now) - now))
+                elif not selector.get_map():
+                    # Once a check closes both output descriptors it may
+                    # still be running.  Wait for process completion instead
+                    # of treating closed pipes as completion of the check.
+                    wait_time = max(0.0, min(0.05, deadline - now))
+                    try:
+                        process.wait(timeout=wait_time)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    continue
+                else:
+                    wait_time = max(0.0, min(0.05, deadline - now))
                 events = selector.select(wait_time)
                 if not events:
-                    if process.poll() is not None and not timed_out:
-                        # A process can exit before both pipe EOFs become
-                        # observable; the next selector turn drains them.
-                        continue
                     continue
                 for key, _ in events:
                     stream = key.fileobj
@@ -1395,6 +1406,12 @@ class IterationClassifier:
         }
 
 
+def _summary_json(value: object) -> str:
+    """Render JSON values without allowing data to create Markdown code spans."""
+
+    return json.dumps(value, ensure_ascii=True).replace("`", r"\`")
+
+
 def render_summary(outcome: Mapping[str, object]) -> str:
     unplanned = outcome.get("unplanned_paths") or []
     unsupported = outcome.get("unsupported_states") or []
@@ -1406,20 +1423,20 @@ def render_summary(outcome: Mapping[str, object]) -> str:
         f"- Status: `{outcome.get('status')}`",
         f"- Work item: `{outcome.get('work_item_id')}`",
         f"- Iteration: `{outcome.get('iteration_id')}`",
-        f"- Target: `{json.dumps(outcome.get('target'), ensure_ascii=True)}`",
-        f"- Change intent: `{json.dumps(outcome.get('change_intent'), ensure_ascii=True)}`",
-        f"- Allowed paths: `{json.dumps(outcome.get('allowed_paths', []), ensure_ascii=True)}`",
+        f"- Target: {_summary_json(outcome.get('target'))}",
+        f"- Change intent: {_summary_json(outcome.get('change_intent'))}",
+        f"- Allowed paths: {_summary_json(outcome.get('allowed_paths', []))}",
         f"- Reason codes: `{', '.join(str(item) for item in reason_codes) or 'none'}`",
         "",
         "## Changes",
         "",
-        f"- Changed paths: `{json.dumps(outcome.get('changed_paths', []), ensure_ascii=True)}`",
-        f"- Executor boundary changes: `{json.dumps(outcome.get('executor_changed_paths', []), ensure_ascii=True)}`",
-        f"- Check boundary changes: `{json.dumps(outcome.get('check_changed_paths', []), ensure_ascii=True)}`",
+        f"- Changed paths: {_summary_json(outcome.get('changed_paths', []))}",
+        f"- Executor boundary changes: {_summary_json(outcome.get('executor_changed_paths', []))}",
+        f"- Check boundary changes: {_summary_json(outcome.get('check_changed_paths', []))}",
         "",
         "## Plan deviations",
         "",
-        f"- Unplanned paths: `{json.dumps(unplanned, ensure_ascii=True)}`",
+        f"- Unplanned paths: {_summary_json(unplanned)}",
         "- Potential hitchhiking changes: semantic relatedness inside an allowed path requires review of `diff.patch`.",
         "",
         "## Checks",
@@ -1439,7 +1456,7 @@ def render_summary(outcome: Mapping[str, object]) -> str:
             "",
             "## Unsupported or unhandled points",
             "",
-            f"- Unsupported states: `{json.dumps(unsupported, ensure_ascii=True)}`",
+            f"- Unsupported states: {_summary_json(unsupported)}",
             "- This artifact records provenance; it does not guarantee complete rollback.",
             "- Meaningful one-change boundaries cannot be proven mechanically from paths alone.",
             "",

@@ -22,6 +22,7 @@ from scripts.single_change import (
     GitStateCapture,
     IterationStore,
     SingleChangeRequestValidator,
+    render_summary,
     run_single_change,
 )
 
@@ -154,6 +155,46 @@ class SingleChangeValidationTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 validator.validate(malformed)
+
+    def test_summary_escapes_backticks_in_recorded_values(self) -> None:
+        summary = render_summary(
+            {
+                "status": "succeeded",
+                "work_item_id": "wi-1",
+                "iteration_id": "0001",
+                "target": {"id": "target-1"},
+                "change_intent": "preserve `literal` ticks",
+                "allowed_paths": ["target.txt"],
+            }
+        )
+
+        change_intent_line = next(
+            line for line in summary.splitlines() if line.startswith("- Change intent:")
+        )
+        self.assertEqual(
+            change_intent_line,
+            '- Change intent: "preserve \\`literal\\` ticks"',
+        )
+
+
+class IterationStoreSafetyTests(unittest.TestCase):
+    def test_preexisting_work_item_lock_symlink_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifact_root = root / ".kelpie" / "artifacts"
+            store = IterationStore(artifact_root, "wi-1")
+            store.iterations_root.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            lock_target = outside / "created-by-symlink"
+            lock_path = store.work_item_root / ".work-item-lock"
+            lock_path.symlink_to(lock_target)
+
+            with self.assertRaisesRegex(ValueError, "lock path.*symlink"):
+                store.reserve()
+
+            self.assertTrue(lock_path.is_symlink())
+            self.assertFalse(lock_target.exists())
 
 
 class SingleChangeFixtureTests(unittest.TestCase):
@@ -430,6 +471,34 @@ class SingleChangeFixtureTests(unittest.TestCase):
             check = json.loads((result.iteration_dir / "checks" / "0001.json").read_text())
             self.assertEqual(check["exit_code"], 3)
             self.assertEqual((result.iteration_dir / check["stderr_ref"]).read_text(), "err\n")
+
+    def test_check_waits_for_process_after_output_descriptors_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            _make_git_repo(root)
+            request = _request(
+                checks=(
+                    CheckSpec(
+                        argv=(
+                            sys.executable,
+                            "-c",
+                            "import os, time; os.close(1); os.close(2); time.sleep(0.8)",
+                        ),
+                        timeout_seconds=3,
+                    ),
+                )
+            )
+            result = run_single_change(
+                request,
+                workdir=root,
+                artifact_root=root / ".kelpie" / "artifacts",
+                executor=lambda _request, _scope: (root / "target.txt").write_text("changed\n"),
+            )
+
+            self.assertEqual(result.status, "succeeded")
+            check = json.loads((result.iteration_dir / "checks" / "0001.json").read_text())
+            self.assertEqual(check["status"], "passed")
+            self.assertFalse(check["timed_out"])
 
     def test_check_timeout_and_output_limit_are_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
