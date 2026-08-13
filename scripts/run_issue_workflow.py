@@ -19,6 +19,14 @@ from typing import Callable, Iterable, Mapping
 
 try:
     from scripts.plan_comprehension import AdjudicationResult, parse_json_payload, run_plan_check
+    from scripts.single_change import (
+        ActiveTarget,
+        CheckSpec,
+        IterationResult,
+        IterationScope,
+        SingleChangeRequest,
+        run_single_change,
+    )
     from scripts.workflow_outcomes import (
         PHASE_REASON_CODES,
         PhaseOutcome,
@@ -29,6 +37,14 @@ try:
     )
 except ModuleNotFoundError:
     from plan_comprehension import AdjudicationResult, parse_json_payload, run_plan_check
+    from single_change import (
+        ActiveTarget,
+        CheckSpec,
+        IterationResult,
+        IterationScope,
+        SingleChangeRequest,
+        run_single_change,
+    )
     from workflow_outcomes import (
         PHASE_REASON_CODES,
         PhaseOutcome,
@@ -1037,6 +1053,43 @@ class WorkflowRunner:
     def run_phase(self, phase: str) -> None:
         self.run_step(self.build_step_spec_for_phase(phase))
 
+    def run_single_change(self, request: SingleChangeRequest) -> IterationResult:
+        """Execute exactly one opt-in single-change iteration.
+
+        The existing ``run_step`` lifecycle remains the executor.  This
+        wrapper owns only target validation, iteration provenance, bounded
+        checks, and terminal classification.
+        """
+
+        def execute(validated: SingleChangeRequest, scope: IterationScope) -> object:
+            target = validated.active_targets[0]
+            self.run_step(
+                StepSpec(
+                    name="single-change",
+                    phase="implementation",
+                    inputs=[target.id, target.source_ref, validated.change_intent],
+                    outputs=list(validated.allowed_paths),
+                    context_id="work-items",
+                    artifact_subdir=(
+                        f"{validated.work_item_id}/iterations/{scope.iteration_id}"
+                    ),
+                )
+            )
+            return None
+
+        # Staged instruction copies live under .kelpie and are already
+        # excluded by the single-change capture policy.  Repository-owned
+        # instruction files remain observable source paths, so an executor or
+        # check cannot modify them without being recorded as an unplanned change.
+        excluded_paths = {".kelpie"}
+        return run_single_change(
+            request,
+            workdir=self.workdir,
+            artifact_root=self.artifact_dir,
+            executor=execute,
+            excluded_paths=excluded_paths,
+        )
+
     def run_step(self, step: StepSpec) -> None:
         print(f"\n=== Running step: {step.name} ===")
         resolved = self.step_resolver.resolve(step)
@@ -1841,6 +1894,8 @@ class WorkflowRunner:
 
     @staticmethod
     def _path_has_symlink(root: Path, path: Path) -> bool:
+        if root.is_symlink():
+            return True
         try:
             relative = path.relative_to(root)
         except ValueError:
