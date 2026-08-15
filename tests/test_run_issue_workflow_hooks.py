@@ -579,7 +579,46 @@ class WorkflowHookExecutionTests(unittest.TestCase):
         self.assertTrue(mock_check.call_args.kwargs["dry_run"])
         self.assertIn("plan comprehension check prompt", mock_check.call_args.kwargs["prompt_text"])
         self.assertIn("SKILL: plan comprehension check", mock_check.call_args.kwargs["prompt_text"])
+        self.assertIn("allowed top-level keys", mock_check.call_args.kwargs["prompt_text"])
+        self.assertIn("source_refs", mock_check.call_args.kwargs["prompt_text"])
+        self.assertIn("are JSON arrays", mock_check.call_args.kwargs["prompt_text"])
+        self.assertIn("wrap the entire array", mock_check.call_args.kwargs["prompt_text"])
         mock_invoke.assert_not_called()
+
+    def test_plan_refinement_invalid_output_pauses_with_distinct_reason(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            runner = WorkflowRunner(
+                repo_root=repo_root,
+                workdir=workdir,
+                issue_number=None,
+                runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                instruction_staging_config=InstructionStagingConfig(),
+                issue_source="none",
+                task_label="refinement-invalid-output",
+                dry_run=False,
+            )
+
+            with self.assertRaisesRegex(SystemExit, "invalid_output"):
+                runner.record_plan_refinement_outcome(
+                    runner.artifact_dir,
+                    {"status": "invalid_output"},
+                )
+
+            state = json.loads(
+                (runner.artifact_dir / "workflow-state.json").read_text(encoding="utf-8")
+            )
+            outcome = json.loads(
+                (runner.artifact_dir / state["outcome_path"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(outcome["decision"], "pause")
+        self.assertEqual(outcome["reason_code"], "invalid_output")
+        self.assertIsNotNone(outcome["resume_condition"])
+        self.assertEqual(state["status"], "paused")
+        self.assertEqual(state["phase"], "plan_comprehension_check")
 
     def test_plan_comprehension_without_external_opt_in_does_not_require_agy(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

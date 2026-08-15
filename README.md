@@ -101,6 +101,36 @@ advisory-onlyかつread-onlyです。有効なfindingは強モデルが計画へ
 hookやCLIの非0終了は運用障害、`pause`は工程固有の判断・入力待ちとして区別されます。
 機械checkの失敗をLLMの`advance`で上書きすることはできません。
 
+### 固定評価ループ
+
+`scripts/evaluation_loop.py` は、明示的に opt-in した呼び出しに対して一つの active target の
+`Implement -> Verify -> Review -> Finalize` を一回だけ実行します。Implement と targeted check は
+既存の `run_single_change()` の immutable artifact を使い、評価ループ自身は check を再実行しません。
+Reviewer は `EvaluationLoopRequest` に注入し、raw output、validation、最終結果を別 artifact として保存します。
+
+評価ループの artifact は次の配下です。
+
+```text
+.kelpie/artifacts/work-items/<work-item>/evaluation-loops/<loop-id>/
+  manifest.json
+  implementation.json
+  verify/execution.json
+  review/input.json
+  review/execution.json
+  review/raw-output.bin
+  review/validation.json
+  review/validated.json       # schema/evidence が有効な場合のみ
+  result.json
+  summary.md
+  finalized
+```
+
+最終 verdict は `satisfied`、`changes_requested`、`execution_failed`、`invalid_output`、`plan_defect`
+のいずれかです。`satisfied` は「必要な digest-bound evidence に対する有効な Review が open finding を返さなかった」
+という限定的な意味で、完全な正しさの証明ではありません。Reviewer の起動失敗は `execution_failed`、正常終了後の
+空・壊れた・schema 不適合な出力は `invalid_output`、tool/test の非ゼロ終了は finding ではなく
+`execution_failed` として保存されます。retry、finding の自動修正、複数 target の orchestration、暗黙の外部送信は行いません。
+
 runnerがCodexの場合、plan comprehension checkはCopilot CLIの
 `gpt-5.6-luna` / low effortを使用します。それ以外の標準runnerでも
 Codex CLIの`gpt-5.6-luna` / low reasoning effort / read-only sandboxを使用します。

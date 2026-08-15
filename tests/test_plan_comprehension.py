@@ -290,6 +290,10 @@ class ReconstructionValidationTests(unittest.TestCase):
         payload = parse_json_payload('before\n```json\n{"schema_version":"1.0"}\n```\nafter')
         self.assertEqual(payload["schema_version"], "1.0")
 
+    def test_parse_json_payload_does_not_select_nested_object_from_malformed_json(self) -> None:
+        with self.assertRaisesRegex(ValueError, "No JSON object"):
+            parse_json_payload('{"schema_version":"1.0","tasks":[{"id":{}}]}}')
+
     def test_validate_evidence_accepts_valid_source_and_rejects_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -370,6 +374,23 @@ class ProbeAndFindingTests(unittest.TestCase):
         self.assertEqual(kwargs["input"], "envelope")
         self.assertTrue(kwargs["capture_output"])
         self.assertEqual(result.returncode, 0)
+
+    def test_run_probe_decodes_bytes_from_timeout(self) -> None:
+        runner = Mock(
+            side_effect=subprocess.TimeoutExpired(
+                cmd=["codex"],
+                timeout=180,
+                output=b"partial output",
+                stderr=b"timed out",
+            )
+        )
+
+        result = run_probe(CapabilityProfile(), "prompt", "envelope", run=runner)
+
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(result.stdout, "partial output")
+        self.assertEqual(result.stderr, "timed out")
+        self.assertTrue(result.timed_out)
 
     def test_finding_fingerprint_is_deterministic(self) -> None:
         finding = {
@@ -577,6 +598,62 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
         self.assertEqual(result["status"], "needs_human_review")
         self.assertEqual(result["findings"], [])
 
+    def test_schema_invalid_probe_is_retried_with_correction_prompt(self) -> None:
+        invalid_payload = {
+            "schema_version": "1.0",
+            "tasks": [],
+            "non_goals": [],
+            "assumptions": [],
+            "decisions": [],
+            "uncertainties": [],
+        }
+        valid_payload = {
+            "schema_version": "1.0",
+            "tasks": [
+                {
+                    "id": {"value": "T1", "status": "missing", "source_refs": []},
+                    "summary": {"value": "missing", "status": "missing", "source_refs": []},
+                    "input_artifacts": [],
+                    "context_inputs": [],
+                    "files": [],
+                    "prerequisite_tasks": [],
+                    "outputs": [],
+                    "acceptance_criteria": [],
+                }
+            ],
+            "non_goals": [],
+            "assumptions": [],
+            "decisions": [],
+            "uncertainties": [],
+        }
+        probe_results = [
+            ProbeResult(
+                returncode=0,
+                stdout=json.dumps(invalid_payload),
+                stderr="",
+                timed_out=False,
+                command=("copilot",),
+            ),
+            ProbeResult(
+                returncode=0,
+                stdout=json.dumps(valid_payload),
+                stderr="",
+                timed_out=False,
+                command=("copilot",),
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
+            (root / "05-work-breakdown.md").write_text("# Work Breakdown\n", encoding="utf-8")
+            with patch("scripts.plan_comprehension.run_probe", side_effect=probe_results) as probe:
+                result = run_plan_check(root, allow_external_send=True)
+
+        self.assertEqual(result["status"], "needs_human_review")
+        self.assertEqual(probe.call_count, 2)
+        self.assertIn("previous response was rejected", probe.call_args_list[1].args[1])
+
     def test_input_mutation_during_probe_marks_result_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -617,6 +694,29 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
             with patch("scripts.plan_comprehension.run_probe", side_effect=mutate_input):
                 result = run_plan_check(root, allow_external_send=True)
         self.assertEqual(result["status"], "stale_input")
+
+    def test_timeout_result_is_persisted_as_execution_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
+            (root / "05-work-breakdown.md").write_text("# Work Breakdown\n", encoding="utf-8")
+            timed_out = ProbeResult(
+                returncode=124,
+                stdout=b"partial output",  # type: ignore[arg-type]
+                stderr=b"timed out",  # type: ignore[arg-type]
+                timed_out=True,
+                command=("codex",),
+            )
+            with patch("scripts.plan_comprehension.run_probe", return_value=timed_out):
+                result = run_plan_check(root, allow_external_send=True)
+            status = json.loads(
+                (root / "plan-check" / "iterations" / "0001" / "status.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["status"], "execution_error")
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(status["status"], "execution_error")
+        self.assertTrue(status["timed_out"])
 
     def test_evaluation_metrics_and_baseline_invalidation(self) -> None:
         fixtures = [

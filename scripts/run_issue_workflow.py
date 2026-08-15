@@ -27,6 +27,11 @@ try:
         SingleChangeRequest,
         run_single_change,
     )
+    from scripts.evaluation_loop import (
+        EvaluationLoopRequest,
+        EvaluationLoopResult,
+        run_evaluation_loop as run_fixed_evaluation_loop,
+    )
     from scripts.workflow_outcomes import (
         PHASE_REASON_CODES,
         PhaseOutcome,
@@ -44,6 +49,11 @@ except ModuleNotFoundError:
         IterationScope,
         SingleChangeRequest,
         run_single_change,
+    )
+    from evaluation_loop import (
+        EvaluationLoopRequest,
+        EvaluationLoopResult,
+        run_evaluation_loop as run_fixed_evaluation_loop,
     )
     from workflow_outcomes import (
         PHASE_REASON_CODES,
@@ -1090,6 +1100,45 @@ class WorkflowRunner:
             excluded_paths=excluded_paths,
         )
 
+    def run_evaluation_loop(
+        self,
+        request: EvaluationLoopRequest,
+        reviewer: object | None = None,
+    ) -> EvaluationLoopResult:
+        """Run one opt-in Implement -> Verify -> Review loop.
+
+        The workflow runner remains the implementer adapter.  The injected
+        reviewer is called once after Verify succeeds; no retry or finding
+        repair is performed here.
+        """
+
+        if not isinstance(request, EvaluationLoopRequest):
+            raise TypeError("request must be an EvaluationLoopRequest")
+
+        def execute(validated: SingleChangeRequest, scope: IterationScope) -> object:
+            target = validated.active_targets[0]
+            self.run_step(
+                StepSpec(
+                    name="evaluation-loop-implement",
+                    phase="implementation",
+                    inputs=[target.id, target.source_ref, validated.change_intent],
+                    outputs=list(validated.allowed_paths),
+                    context_id="work-items",
+                    artifact_subdir=(
+                        f"{validated.work_item_id}/iterations/{scope.iteration_id}"
+                    ),
+                )
+            )
+            return None
+
+        return run_fixed_evaluation_loop(
+            request,
+            workdir=self.workdir,
+            artifact_root=self.artifact_dir,
+            executor=execute,
+            reviewer=reviewer,
+        )
+
     def run_step(self, step: StepSpec) -> None:
         print(f"\n=== Running step: {step.name} ===")
         resolved = self.step_resolver.resolve(step)
@@ -1295,6 +1344,11 @@ class WorkflowRunner:
                 "pause",
                 "non_convergent",
                 "Revise the plan or approve a new refinement attempt.",
+            ),
+            "invalid_output": (
+                "pause",
+                "invalid_output",
+                "Provide schema-valid plan-check output or correct the plan-check prompt before retrying.",
             ),
             "approval_required": (
                 "pause",
