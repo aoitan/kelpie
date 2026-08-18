@@ -54,6 +54,8 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 │   ├── 07_review_fix_loop.md
 │   └── 08_pull_request.md
 ├── scripts/
+│   ├── install_all_projects.sh
+│   ├── test_all_projects.sh
 │   ├── open_llm_shell_in_container.sh
 │   ├── run_issue_workflow.py
 │   └── run_issue_workflow_in_container.sh
@@ -198,9 +200,14 @@ install.bat
 
 `Dockerfile.llm-base` は以下を含みます。
 
-- Python 3.12
+- Python 3.13 と uv 管理の Python 3.11 / 3.12 / 3.13
 - Node.js 22
 - `uv`
+- Poetry 2.2.0
+- Rust 1.85 / Cargo / rustfmt
+- Java 21
+- Swift 6.2.4 / SourceKitten 0.37.3（project-analyzer-mcp の Swift 連携テスト用）
+- Kotlin/Gradle、音声解析、ネイティブ拡張向けのビルド依存
 - `gh`
 - `Antigravity CLI` (`agy`)
 - `@openai/codex`
@@ -375,6 +382,43 @@ kelpie \
 - `run_issue_workflow.py --repo-root /opt/kelpie --workdir /workspace ...` を実行
 
 `--no-build` を付けると build を省略できます。
+
+### 全プロジェクトを同じコンテナでセットアップする
+
+現在の `compose.local.yaml` は、指定された workspace を `/projects` に
+bind mount します。`multi-llm-chat` の mount には `repo`、`codex`、
+`continue`、`gemini`、`copilot` の各バリエーションも含まれます。
+ソースはイメージへコピーせず、依存環境だけを各 checkout の
+`.venv` / `node_modules` と共有キャッシュへ作成します。
+
+イメージを build した後、次を一度実行します。
+
+```bash
+kelpie-shell --target-workdir /path/to/target-repo -- \
+  install_all_projects.sh
+```
+
+Demucs/Torch のオプション依存も必要な場合は次を使います。
+
+```bash
+kelpie-shell --target-workdir /path/to/target-repo -- \
+  install_all_projects.sh --with-vocal-extras
+```
+
+全プロジェクトの build/test は次で実行できます。
+
+```bash
+kelpie-shell --target-workdir /path/to/target-repo -- \
+  test_all_projects.sh
+```
+
+このチェックは既存の lockfile と各プロジェクトの標準スクリプトを使います。
+`project-analyzer-mcp` の `npm run test:all` は formatter を実行するため、
+mount された checkout を変更する可能性があります。chat系のpytestは
+checkout内の `.env` によるMCP stdioサーバーの自動起動を避けるため、
+`MULTI_LLM_CHAT_MCP_ENABLED=false` を一括runnerから明示します。MCP固有の
+モックテストはそのまま実行されます。provider、Ollama、Demucs/Torchなどの
+外部サービス・大型モデルが必要な実行はこの一括設定だけでは用意しません。
 
 ### コンテナ対象の推奨
 
@@ -679,7 +723,19 @@ phases:
 
 ## compose.local.yaml の使い方
 
-`compose.local.yaml` は環境固有の bind mount を足すための override です。現在は `llm` サービスに対して、ホスト側の `skills` ディレクトリを read-only でマウントする例を入れています。
+`compose.local.yaml` は環境固有の bind mount を足すための override です。
+現在の例はホスト側の `skills` と、対象プロジェクト群を `/projects` に
+mount します。各プロジェクトのホストパスは次の環境変数で上書きできます。
+
+- `KELPIE_PROJECT_MULTI_LLM_AGENT_CLI`
+- `KELPIE_PROJECT_MULTI_LLM_AGENT_CLI_POC`
+- `KELPIE_PROJECT_MULTI_LLM_CHAT`
+- `KELPIE_PROJECT_MULTI_LLM_REVIEWER`
+- `KELPIE_PROJECT_ANALYZER_MCP`
+- `KELPIE_PROJECT_ANALYZER_ISOHYPS`
+- `KELPIE_PROJECT_ANALYZER_TOMOE`
+- `KELPIE_PROJECT_TOKEN_FILTER`
+- `KELPIE_PROJECT_VOCAL_INSIGHT_AI`
 
 必要に応じて以下のような差分を追加してください。
 

@@ -1,18 +1,49 @@
 FROM node:22-bookworm-slim AS node
 
-FROM python:3.12-slim
+FROM rust:1.85-bookworm AS rust
+
+RUN rustup component add rustfmt
+
+FROM eclipse-temurin:21-jdk-jammy AS java
+
+FROM swift:6.2.4-bookworm@sha256:f8d93441c9ca4b643b01f6b5a7a2492599727a94c5cf3fe1b1f53df024b816ee AS sourcekitten
+
+ARG SOURCEKITTEN_COMMIT=6529c17fe80dd94843a3df7ed3e6a239790d5c91
+
+RUN git clone --depth 1 --branch 0.37.3 https://github.com/jpsim/SourceKitten.git /tmp/SourceKitten \
+    && test "$(git -C /tmp/SourceKitten rev-parse HEAD)" = "${SOURCEKITTEN_COMMIT}" \
+    && cd /tmp/SourceKitten \
+    && swift build -c release --product sourcekitten
+
+FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HOME=/home/dev \
     UV_CACHE_DIR=/var/cache/uv \
     UV_LINK_MODE=copy \
-    UV_PROJECT_ENVIRONMENT=/var/cache/uv/project-env \
+    UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+    UV_PYTHON_PREFERENCE=only-managed \
+    CARGO_HOME=/var/cache/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    GRADLE_USER_HOME=/var/cache/gradle \
+    JAVA_HOME=/opt/java/openjdk \
+    LD_LIBRARY_PATH=/usr/lib/swift/host/compiler:/usr/lib/swift/linux:/usr/lib:${LD_LIBRARY_PATH} \
+    POETRY_VIRTUALENVS_IN_PROJECT=true \
+    POETRY_NO_INTERACTION=1 \
     KELPIE_TEMPLATE_DIR=/opt/kelpie \
-    KELPIE_SCRIPT_DIR=/opt/kelpie/scripts
+    KELPIE_SCRIPT_DIR=/opt/kelpie/scripts \
+    PATH=/home/dev/.local/bin:/opt/uv/python/bin:/usr/local/cargo/bin:/opt/java/openjdk/bin:${PATH}
 
 COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /uvx /bin/
 COPY --from=node /usr/local/ /usr/local/
+COPY --from=rust /usr/local/cargo/ /usr/local/cargo/
+COPY --from=rust /usr/local/rustup/ /usr/local/rustup/
+COPY --from=java /opt/java/openjdk /opt/java/openjdk
+COPY --from=sourcekitten /tmp/SourceKitten/.build/release/sourcekitten /usr/local/bin/sourcekitten
+COPY --from=sourcekitten /usr/lib/libsourcekitdInProc.so /usr/lib/libsourcekitdInProc.so
+COPY --from=sourcekitten /usr/lib/swift/linux/ /usr/lib/swift/linux/
+COPY --from=sourcekitten /usr/lib/swift/host/compiler/ /usr/lib/swift/host/compiler/
 COPY llm-entrypoint.sh /usr/local/bin/llm-entrypoint.sh
 COPY AGENTS.md ${KELPIE_TEMPLATE_DIR}/AGENTS.md
 COPY prompts/ ${KELPIE_TEMPLATE_DIR}/prompts/
@@ -22,21 +53,47 @@ COPY scripts/ ${KELPIE_SCRIPT_DIR}/
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates git gh curl wget ripgrep less procps openssh-client libnss-wrapper bubblewrap \
+        bash \
+        build-essential \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        gh \
+        git \
+        libffi-dev \
+        libgomp1 \
+        libnss-wrapper \
+        libsndfile1 \
+        libssl-dev \
+        less \
+        openssh-client \
+        pkg-config \
+        procps \
+        ripgrep \
+        unzip \
+        wget \
+        zlib1g-dev \
     && npm install -g @openai/codex @github/copilot opencode-ai@1.18.7 \
     && curl -fsSL https://antigravity.google/cli/install.sh | bash \
+    && install -m 0755 /home/dev/.local/bin/agy /usr/local/bin/agy \
+    && python -m pip install --no-cache-dir "poetry==2.2.0" \
+    && mkdir -p /opt/uv/python \
+    && uv python install 3.11 3.12 3.13 \
     && chmod +x /usr/local/bin/llm-entrypoint.sh \
     && find "${KELPIE_SCRIPT_DIR}" -maxdepth 1 -type f -exec chmod 0755 {} + \
     && find "${KELPIE_SCRIPT_DIR}" -maxdepth 1 -type f -exec ln -sf {} /usr/local/bin/ \; \
     && ln -sf "${KELPIE_SCRIPT_DIR}/run_opencode_with_config.sh" /usr/local/bin/kelpie-opencode \
+    && printf '%s\n' 'export PATH="/home/dev/.local/bin:/opt/uv/python/bin:/usr/local/cargo/bin:/opt/java/openjdk/bin:${PATH}"' > /etc/profile.d/kelpie-path.sh \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p \
         /workspace \
         /home/dev \
         /var/cache/uv \
-        /var/cache/uv/project-env \
+        /var/cache/cargo \
+        /var/cache/gradle \
     && chown -R 1000:1000 /workspace /home/dev \
-    && chmod 1777 /var/cache/uv /var/cache/uv/project-env
+    && chmod 1777 /var/cache/uv /var/cache/cargo /var/cache/gradle \
+    && chmod -R a+rX /opt/uv/python /usr/local/rustup /opt/java/openjdk
 
 WORKDIR /workspace
 

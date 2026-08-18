@@ -1,5 +1,22 @@
 # Move this file to ../compose.local.yaml for shared worktree-local overrides.
 services:
   llm:
+    environment:
+      KELPIE_PROJECTS_ROOT: /projects
+      UV_PYTHON_INSTALL_DIR: /opt/uv/python
+      UV_PYTHON_PREFERENCE: only-managed
+      CARGO_HOME: /var/cache/cargo
+      GRADLE_USER_HOME: /var/cache/gradle
+      POETRY_VIRTUALENVS_IN_PROJECT: "true"
+      POETRY_NO_INTERACTION: "1"
     volumes:
       - /Users/aoitan/workspace/skills:/Users/aoitan/workspace/skills:ro
+      - ${KELPIE_PROJECT_MULTI_LLM_AGENT_CLI:-/Users/aoitan/workspace/multi-llm-agent-cli}:/projects/multi-llm-agent-cli
+      - ${KELPIE_PROJECT_MULTI_LLM_AGENT_CLI_POC:-/Users/aoitan/workspace/multi-llm-agent-cli-poc}:/projects/multi-llm-agent-cli-poc
+      - ${KELPIE_PROJECT_MULTI_LLM_CHAT:-/Users/aoitan/workspace/multi-llm-chat}:/projects/multi-llm-chat
+      - ${KELPIE_PROJECT_MULTI_LLM_REVIEWER:-/Users/aoitan/workspace/multi-llm-reviewer}:/projects/multi-llm-reviewer
+      - ${KELPIE_PROJECT_ANALYZER_MCP:-/Users/aoitan/workspace/project-analyzer-mcp}:/projects/project-analyzer-mcp
+      - ${KELPIE_PROJECT_ANALYZER_ISOHYPS:-/Users/aoitan/workspace/project-analyzer-rlm/isohyps}:/projects/project-analyzer-rlm/isohyps
+      - ${KELPIE_PROJECT_ANALYZER_TOMOE:-/Users/aoitan/workspace/project-analyzer-rlm/tomoe}:/projects/project-analyzer-rlm/tomoe
+      - ${KELPIE_PROJECT_TOKEN_FILTER:-/Users/aoitan/workspace/token_filter/repo}:/projects/token_filter/repo
+      - ${KELPIE_PROJECT_VOCAL_INSIGHT_AI:-/Users/aoitan/workspace/vocal_insight_ai}:/projects/vocal_insight_ai
