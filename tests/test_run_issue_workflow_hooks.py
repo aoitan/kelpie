@@ -84,6 +84,7 @@ class HookConfigTests(unittest.TestCase):
         self.assertEqual(plan_check.command_template[0], "copilot")
         self.assertIn("gpt-5.6-luna", plan_check.command_template)
         self.assertIn("low", plan_check.command_template)
+        self.assertIn("--no-custom-instructions", plan_check.command_template)
         self.assertIn("--disable-builtin-mcps", plan_check.command_template)
 
     def test_non_codex_example_runners_use_codex_for_plan_check(self) -> None:

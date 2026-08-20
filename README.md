@@ -54,6 +54,7 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 │   ├── 07_review_fix_loop.md
 │   └── 08_pull_request.md
 ├── scripts/
+│   ├── convergence_policy.py
 │   ├── open_llm_shell_in_container.sh
 │   ├── run_issue_workflow.py
 │   └── run_issue_workflow_in_container.sh
@@ -97,6 +98,12 @@ advisory-onlyかつread-onlyです。有効なfindingは強モデルが計画へ
 `work_items.json`を再生成した後に再probeします。unresolvedまたは規定回数で
 収束しない場合だけ、人間レビュー待ちとして停止します。
 
+probe inputには有効な `artifact_id`、hash、`section_id` のcatalogを含めるため、
+source referenceを推測させません。JSONまたはschemaが不正な応答は、位置を含む
+validation errorだけを渡す上限付きretryを行い、各試行のraw outputとvalidation
+resultを `plan-check/iterations/NNNN/attempts/` に保存します。retry後も不正な場合は
+従来どおり `invalid_output` として停止します。
+
 各工程は`advance` / `pause` / `fail` / `complete`の構造化outcomeを出力します。
 hookやCLIの非0終了は運用障害、`pause`は工程固有の判断・入力待ちとして区別されます。
 機械checkの失敗をLLMの`advance`で上書きすることはできません。
@@ -131,11 +138,38 @@ Reviewer は `EvaluationLoopRequest` に注入し、raw output、validation、�
 空・壊れた・schema 不適合な出力は `invalid_output`、tool/test の非ゼロ終了は finding ではなく
 `execution_failed` として保存されます。retry、finding の自動修正、複数 target の orchestration、暗黙の外部送信は行いません。
 
+### 有界 convergence policy
+
+`scripts/convergence_policy.py` は、固定評価ループを明示的に複数回組み合わせるための
+policy と durable attempt store です。各 run は有限な `max_iterations` を必須とし、
+`changes_requested`、`execution_failed`、`invalid_output` の retry policy、finding 再発、
+進展なし、strategy 再利用、取得可能な budget を判定します。通常の phase workflow は
+暗黙に反復せず、`WorkflowRunner.run_convergence()` の opt-in 入口だけがこの機能を開始します。
+
+attempt は次の状態を持ち、callback 前に `decision.json` と `reservation.json` が durable になります。
+`started` 後に結果が不明な crash は自動再実行せず `waiting_for_human` へ渡します。
+
+```text
+.kelpie/artifacts/work-items/<work-item>/convergence-runs/<run-id>/
+  manifest.json  policy.json  lifecycle.json
+  attempts/NNNN/
+    decision.json  reservation.json  lifecycle.json
+    result-binding.json  usage.json  progress.json
+  summary.json  summary.md  finalized
+```
+
+終了 summary は `satisfied` / `blocked` / `waiting_for_human`、終了理由、reservation 数、
+budget の値と availability、残存 finding、最後の retry instruction、result binding を含みます。
+上限到達は成功ではありません。完了済みの `satisfied` result と post-run budget overrun が
+同時に観測された場合は、acceptance と compliance を別フィールドで保存します。
+
 runnerがCodexの場合、plan comprehension checkはCopilot CLIの
 `gpt-5.6-luna` / low effortを使用します。それ以外の標準runnerでも
 Codex CLIの`gpt-5.6-luna` / low reasoning effort / read-only sandboxを使用します。
 評価対象runnerとは異なるCLIへ相互に振り分け、`agy`への固定依存は持ちません。
 CopilotとCodexは事前に認証を済ませてください。
+Copilot probeではtarget repositoryのcustom instructionを無効にし、probe用の
+promptとskillだけを出力契約として使います。
 認証情報はKelpie containerの`llm-home` volumeに保存されるため、host側の認証とは別です。
 
 ```bash

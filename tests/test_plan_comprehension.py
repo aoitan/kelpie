@@ -283,6 +283,8 @@ class PlanSnapshotTests(unittest.TestCase):
 
         self.assertIn("untrusted data", envelope)
         self.assertIn('<artifact id="plan"', envelope)
+        self.assertIn('"section_ids":["plan:plan"]', envelope)
+        self.assertIn("<artifact-content>", envelope)
 
 
 class ReconstructionValidationTests(unittest.TestCase):
@@ -293,6 +295,10 @@ class ReconstructionValidationTests(unittest.TestCase):
     def test_parse_json_payload_does_not_select_nested_object_from_malformed_json(self) -> None:
         with self.assertRaisesRegex(ValueError, "No JSON object"):
             parse_json_payload('{"schema_version":"1.0","tasks":[{"id":{}}]}}')
+
+    def test_parse_json_payload_reports_json_error_location(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"No JSON object.*line 1, column"):
+            parse_json_payload('{"schema_version":"1.0","tasks":[]}}')
 
     def test_validate_evidence_accepts_valid_source_and_rejects_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -612,7 +618,7 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
             "tasks": [
                 {
                     "id": {"value": "T1", "status": "missing", "source_refs": []},
-                    "summary": {"value": "missing", "status": "missing", "source_refs": []},
+                    "summary": {"value": "", "status": "missing", "source_refs": []},
                     "input_artifacts": [],
                     "context_inputs": [],
                     "files": [],
@@ -653,6 +659,80 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
         self.assertEqual(result["status"], "needs_human_review")
         self.assertEqual(probe.call_count, 2)
         self.assertIn("previous response was rejected", probe.call_args_list[1].args[1])
+        self.assertIn("required reconstruction schema", probe.call_args_list[1].args[1])
+
+    def test_malformed_probe_retry_records_diagnostic_and_each_attempt(self) -> None:
+        malformed_output = '{"schema_version":"1.0","tasks":[]}}'
+        valid_payload = {
+            "schema_version": "1.0",
+            "tasks": [
+                {
+                    "id": {"value": "T1", "status": "missing", "source_refs": []},
+                    "summary": {"value": "", "status": "missing", "source_refs": []},
+                    "input_artifacts": [],
+                    "context_inputs": [],
+                    "files": [],
+                    "prerequisite_tasks": [],
+                    "outputs": [],
+                    "acceptance_criteria": [],
+                }
+            ],
+            "non_goals": [],
+            "assumptions": [],
+            "decisions": [],
+            "uncertainties": [],
+        }
+        probe_results = [
+            ProbeResult(
+                returncode=0,
+                stdout=malformed_output,
+                stderr="",
+                timed_out=False,
+                command=("copilot",),
+            ),
+            ProbeResult(
+                returncode=0,
+                stdout=json.dumps(valid_payload),
+                stderr="",
+                timed_out=False,
+                command=("copilot",),
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
+            (root / "05-work-breakdown.md").write_text("# Work Breakdown\n", encoding="utf-8")
+            with patch("scripts.plan_comprehension.run_probe", side_effect=probe_results) as probe:
+                result = run_plan_check(root, allow_external_send=True)
+            first_attempt = json.loads(
+                (
+                    root
+                    / "plan-check"
+                    / "iterations"
+                    / "0001"
+                    / "attempts"
+                    / "0001"
+                    / "result.json"
+                ).read_text(encoding="utf-8")
+            )
+            second_attempt_exists = (
+                root
+                / "plan-check"
+                / "iterations"
+                / "0001"
+                / "attempts"
+                / "0002"
+                / "result.json"
+            ).exists()
+            correction_prompt = probe.call_args_list[1].args[1]
+
+        self.assertEqual(result["status"], "needs_human_review")
+        self.assertEqual(first_attempt["status"], "invalid_output")
+        self.assertIn("line 1, column", first_attempt["validation_error"])
+        self.assertTrue(second_attempt_exists)
+        self.assertIn("line 1, column", correction_prompt)
+        self.assertNotIn(malformed_output, correction_prompt)
 
     def test_input_mutation_during_probe_marks_result_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
