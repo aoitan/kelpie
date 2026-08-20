@@ -43,6 +43,8 @@ PHASE_REASON_CODES = {
     "plan_comprehension_check": {
         "completed_no_change",
         "completed_refined",
+        "advisory_check_unavailable",
+        "plan_check_waived",
         "unresolved_findings",
         "non_convergent",
         "invalid_output",
@@ -90,6 +92,8 @@ REASON_DECISIONS = {
     "unresolved_design_dependency": {"pause"},
     "completed_no_change": {"advance"},
     "completed_refined": {"advance"},
+    "advisory_check_unavailable": {"advance"},
+    "plan_check_waived": {"advance"},
     "unresolved_findings": {"pause"},
     "non_convergent": {"pause"},
     "invalid_output": {"pause"},
@@ -241,7 +245,12 @@ def effective_decision(outcome: PhaseOutcome, machine_failure: str | None = None
     return outcome.decision
 
 
-def persist_phase_outcome(artifact_root: Path, outcome: PhaseOutcome) -> None:
+def persist_phase_outcome(
+    artifact_root: Path,
+    outcome: PhaseOutcome,
+    *,
+    state_metadata: dict[str, object] | None = None,
+) -> None:
     payload = asdict(outcome)
     payload["evidence_refs"] = list(outcome.evidence_refs)
     history_dir = artifact_root / "phase-outcomes" / outcome.phase
@@ -266,6 +275,8 @@ def persist_phase_outcome(artifact_root: Path, outcome: PhaseOutcome) -> None:
         "outcome_path": str(history_path.relative_to(artifact_root)),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if state_metadata:
+        workflow_status.update(state_metadata)
     (artifact_root / "workflow-state.json").write_text(
         json.dumps(workflow_status, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",

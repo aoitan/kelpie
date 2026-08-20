@@ -97,7 +97,9 @@ source-backedな解釈差分を得た後、通常runnerの強モデルが各find
 `accepted` / `rejected` / `unresolved` に裁定する工程です。弱モデルprobe自体は
 advisory-onlyかつread-onlyです。有効なfindingは強モデルが計画へ必要最小限反映し、
 `work_items.json`を再生成した後に再probeします。unresolvedまたは規定回数で
-収束しない場合だけ、人間レビュー待ちとして停止します。
+収束しない場合は、人間レビュー待ちとして停止します。probeの応答がschema-invalid
+だった場合は、既定では`advisory_check_unavailable`として警告付きでadvanceし、
+`--require-plan-comprehension-check`を明示した場合だけ`invalid_output`でpauseします。
 
 各工程は`advance` / `pause` / `fail` / `complete`の構造化outcomeを出力します。
 hookやCLIの非0終了は運用障害、`pause`は工程固有の判断・入力待ちとして区別されます。
@@ -520,6 +522,12 @@ python3 scripts/run_issue_workflow.py \
   `external-safe` と分類された計画成果物を
   `plan_comprehension_check` の外部モデルへ送ることを明示的に許可します。
   未指定時、live checkは送信せず停止します。
+- `--require-plan-comprehension-check`
+  schema-invalidなplan checkを必須ゲートとして扱い、`invalid_output`で停止します。
+  未指定時は、probe unavailableの警告を記録してworkflowを継続します。
+- `--waive-plan-comprehension-check`
+  requiredな`invalid_output`でpauseしたworkflowを、明示的なwaiveとして再開します。
+  `--resume`との併用が必要です。
 
 ## runner 設定
 

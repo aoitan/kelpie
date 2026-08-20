@@ -150,7 +150,9 @@
 - 弱モデルには計画を修正させない
 - 強モデルは finding を `accepted` / `rejected` / `unresolved` に裁定する
 - 修正後は `work_items.json` を再生成し、再probeする
-- unresolved または非収束の場合だけ人間レビューへ渡す
+- 既定ではschema-invalidなprobeを`advisory_check_unavailable`として警告付きでadvanceする
+- `plan_comprehension_check`をrequired指定した場合だけinvalid outputでpauseし、明示的なretryまたはwaiveを要求する
+- 有効なfindingのunresolvedまたは非収束の場合は人間レビューへ渡す
 
 ### 7) implementation
 目的:

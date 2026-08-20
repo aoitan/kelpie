@@ -19,6 +19,8 @@ assumptions.
 - Attach source references to every asserted value.
 - Do not repair or rewrite the plan.
 - Do not call a no-findings result safe or implementation-ready.
+- A schema-invalid response is not a finding and is not a no-findings result;
+  leave its handling to the workflow runtime.
 
 ## Output
 
