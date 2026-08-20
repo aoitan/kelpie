@@ -578,6 +578,7 @@ class WorkflowHookExecutionTests(unittest.TestCase):
 
         mock_check.assert_called_once()
         self.assertTrue(mock_check.call_args.kwargs["dry_run"])
+        self.assertTrue(mock_check.call_args.kwargs["advisory_only"])
         self.assertIn("plan comprehension check prompt", mock_check.call_args.kwargs["prompt_text"])
         self.assertIn("SKILL: plan comprehension check", mock_check.call_args.kwargs["prompt_text"])
         self.assertIn("allowed top-level keys", mock_check.call_args.kwargs["prompt_text"])
@@ -586,7 +587,7 @@ class WorkflowHookExecutionTests(unittest.TestCase):
         self.assertIn("wrap the entire array", mock_check.call_args.kwargs["prompt_text"])
         mock_invoke.assert_not_called()
 
-    def test_plan_refinement_invalid_output_pauses_with_distinct_reason(self) -> None:
+    def test_plan_refinement_invalid_output_advances_with_advisory_warning_by_default(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmpdir:
             workdir = Path(tmpdir) / "target-repo"
@@ -600,6 +601,44 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 issue_source="none",
                 task_label="refinement-invalid-output",
                 dry_run=False,
+            )
+
+            with patch("builtins.print") as print_mock:
+                outcome_obj = runner.record_plan_refinement_outcome(
+                    runner.artifact_dir,
+                    {"status": "invalid_output"},
+                )
+
+            state = json.loads(
+                (runner.artifact_dir / "workflow-state.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(outcome_obj.decision, "advance")
+        self.assertEqual(outcome_obj.reason_code, "advisory_check_unavailable")
+        self.assertIsNone(outcome_obj.resume_condition)
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["phase"], "plan_comprehension_check")
+
+        self.assertEqual(state["plan_check_policy"], "advisory")
+        print_mock.assert_any_call(
+            "Warning: advisory check unavailable; advancing without treating the probe as a no-findings signal."
+        )
+
+    def test_required_invalid_output_pauses_with_protocol_reason(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            runner = WorkflowRunner(
+                repo_root=repo_root,
+                workdir=workdir,
+                issue_number=None,
+                runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                instruction_staging_config=InstructionStagingConfig(),
+                issue_source="none",
+                task_label="required-refinement-invalid-output",
+                dry_run=False,
+                plan_check_required=True,
             )
 
             with self.assertRaisesRegex(SystemExit, "invalid_output"):
@@ -617,9 +656,48 @@ class WorkflowHookExecutionTests(unittest.TestCase):
 
         self.assertEqual(outcome["decision"], "pause")
         self.assertEqual(outcome["reason_code"], "invalid_output")
-        self.assertIsNotNone(outcome["resume_condition"])
+        self.assertIn("Retry", outcome["resume_condition"])
+        self.assertIn("waive", outcome["resume_condition"])
         self.assertEqual(state["status"], "paused")
         self.assertEqual(state["phase"], "plan_comprehension_check")
+        self.assertEqual(state["plan_check_policy"], "required")
+
+    def test_required_invalid_output_can_be_explicitly_waived(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            runner = WorkflowRunner(
+                repo_root=repo_root,
+                workdir=workdir,
+                issue_number=None,
+                runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                instruction_staging_config=InstructionStagingConfig(),
+                issue_source="none",
+                task_label="required-refinement-waived",
+                dry_run=False,
+                plan_check_required=True,
+            )
+            (runner.artifact_dir / "05a-plan-comprehension-check.md").write_text(
+                "# Plan Comprehension Check\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "invalid_output"):
+                runner.record_plan_refinement_outcome(
+                    runner.artifact_dir,
+                    {"status": "invalid_output"},
+                )
+
+            outcome = runner.record_plan_check_waiver(runner.artifact_dir)
+            state = json.loads(
+                (runner.artifact_dir / "workflow-state.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(outcome.decision, "advance")
+        self.assertEqual(outcome.reason_code, "plan_check_waived")
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["reason_code"], "plan_check_waived")
+        self.assertEqual(state["plan_check_policy"], "required")
 
     def test_plan_comprehension_without_external_opt_in_does_not_require_agy(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

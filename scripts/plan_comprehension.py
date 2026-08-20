@@ -983,7 +983,7 @@ def write_summary(artifact_root: Path, status: str, findings: list[dict[str, obj
     )
 
 
-def default_spec(artifact_root: Path) -> PlanCheckSpec:
+def default_spec(artifact_root: Path, *, advisory_only: bool = True) -> PlanCheckSpec:
     entries = []
     for relative_path in DEFAULT_INPUT_ARTIFACTS:
         if (artifact_root / relative_path).is_file():
@@ -1001,7 +1001,7 @@ def default_spec(artifact_root: Path) -> PlanCheckSpec:
         input_artifacts=tuple(entries),
         capability_profile="weak-plan-reader-v1",
         input_mode="copy_assisted" if (artifact_root / "work_items.json").exists() else "prose_only",
-        advisory_only=True,
+        advisory_only=advisory_only,
     )
 
 
@@ -1012,11 +1012,13 @@ def run_plan_check(
     allow_external_send: bool = False,
     profile: CapabilityProfile | None = None,
     prompt_text: str | None = None,
+    *,
+    advisory_only: bool = True,
 ) -> dict[str, object]:
     profile = profile or capability_profile_from_command(command_template)
     plan_check_dir = artifact_root / "plan-check"
     iteration = next_iteration_dir(plan_check_dir)
-    spec = default_spec(artifact_root)
+    spec = default_spec(artifact_root, advisory_only=advisory_only)
     spec_payload = {
         "schema_version": spec.schema_version,
         "step_name": spec.step_name,

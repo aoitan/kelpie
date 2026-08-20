@@ -39,6 +39,8 @@ chmod +x \
   "$KELPIE_HOME/scripts/run_issue_workflow.py" \
   "$KELPIE_HOME/scripts/run_issue_workflow_in_container.sh" \
   "$KELPIE_HOME/scripts/open_llm_shell_in_container.sh" \
+  "$KELPIE_HOME/scripts/install_all_projects.sh" \
+  "$KELPIE_HOME/scripts/test_all_projects.sh" \
   "$KELPIE_HOME/scripts/run_opencode_with_config.sh"
 
 if [ ! -f "$KELPIE_CONFIG_HOME/runner_config.json" ]; then

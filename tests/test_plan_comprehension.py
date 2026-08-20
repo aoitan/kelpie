@@ -538,6 +538,19 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
         self.assertEqual(result["status"], "prepared")
         self.assertEqual(len(status_files), 1)
 
+    def test_dry_run_records_required_policy_in_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
+            run_plan_check(root, dry_run=True, advisory_only=False)
+            spec = json.loads(
+                (root / "plan-check" / "iterations" / "0001" / "spec.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertFalse(spec["advisory_only"])
+
     def test_operational_failure_has_no_findings(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -733,6 +746,28 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
         self.assertTrue(second_attempt_exists)
         self.assertIn("line 1, column", correction_prompt)
         self.assertNotIn(malformed_output, correction_prompt)
+
+    def test_schema_invalid_probe_is_persisted_as_invalid_output_with_raw_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
+            (root / "05-work-breakdown.md").write_text("# Work Breakdown\n", encoding="utf-8")
+            probe_result = ProbeResult(
+                returncode=0,
+                stdout="not-json",
+                stderr="",
+                timed_out=False,
+                command=("copilot",),
+            )
+            with patch("scripts.plan_comprehension.run_probe", return_value=probe_result):
+                result = run_plan_check(root, allow_external_send=True)
+            iteration = root / "plan-check" / "iterations" / "0001"
+            status = json.loads((iteration / "status.json").read_text(encoding="utf-8"))
+            raw_output = (iteration / "raw-output.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "invalid_output")
+        self.assertEqual(status["status"], "invalid_output")
+        self.assertEqual(raw_output, "not-json")
 
     def test_input_mutation_during_probe_marks_result_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -981,6 +981,7 @@ class WorkflowRunner:
         task_label: str | None = None,
         dry_run: bool = False,
         allow_plan_check_external_send: bool = False,
+        plan_check_required: bool = False,
         runner_registry: Mapping[str, RunnerConfig] | RunnerResolver | None = None,
     ) -> None:
         self.repo_root = repo_root
@@ -994,6 +995,7 @@ class WorkflowRunner:
         self.task_label = self.normalize_task_label(task_label)
         self.dry_run = dry_run
         self.allow_plan_check_external_send = allow_plan_check_external_send
+        self.plan_check_required = plan_check_required
 
         if isinstance(runner_registry, RunnerResolver):
             self.runner_resolver = runner_registry
@@ -1395,6 +1397,16 @@ class WorkflowRunner:
         result: dict[str, object],
     ) -> PhaseOutcome:
         status = str(result["status"])
+        invalid_output_decision = "pause" if self.plan_check_required else "advance"
+        invalid_output_reason = (
+            "invalid_output" if self.plan_check_required else "advisory_check_unavailable"
+        )
+        invalid_output_resume = (
+            "Retry with --resume after correcting the prompt or runner, or use "
+            "--resume --waive-plan-comprehension-check."
+            if self.plan_check_required
+            else None
+        )
         mapping = {
             "completed_no_change": ("advance", "completed_no_change", None),
             "completed_refined": ("advance", "completed_refined", None),
@@ -1408,11 +1420,7 @@ class WorkflowRunner:
                 "non_convergent",
                 "Revise the plan or approve a new refinement attempt.",
             ),
-            "invalid_output": (
-                "pause",
-                "invalid_output",
-                "Provide schema-valid plan-check output or correct the plan-check prompt before retrying.",
-            ),
+            "invalid_output": (invalid_output_decision, invalid_output_reason, invalid_output_resume),
             "approval_required": (
                 "pause",
                 "external_send_approval_required",
@@ -1423,19 +1431,62 @@ class WorkflowRunner:
             status,
             ("fail", "execution_error", None),
         )
+        summary = f"Plan refinement finished with status {status}."
+        if status == "invalid_output":
+            if self.plan_check_required:
+                summary = (
+                    "Plan comprehension stopped because probe output was schema-invalid; "
+                    "no semantic finding was adjudicated."
+                )
+            else:
+                summary = (
+                    "Plan comprehension advisory was unavailable after schema validation failures; "
+                    "the workflow advanced without treating the probe as a no-findings signal."
+                )
+                print(
+                    "Warning: advisory check unavailable; advancing without treating the probe "
+                    "as a no-findings signal."
+                )
         outcome = PhaseOutcome(
             schema_version="1.0",
             phase="plan_comprehension_check",
             decision=decision,
             reason_code=reason_code,
-            summary=f"Plan refinement finished with status {status}.",
+            summary=summary,
             evidence_refs=("05a-plan-comprehension-check.md",),
             resume_condition=resume_condition,
             artifact_digests={},
         )
-        persist_phase_outcome(artifact_dir, outcome)
+        persist_phase_outcome(
+            artifact_dir,
+            outcome,
+            state_metadata={
+                "plan_check_policy": "required" if self.plan_check_required else "advisory",
+            },
+        )
         if decision in {"pause", "fail"}:
             raise SystemExit(f"Plan refinement cannot advance: {status}")
+        return outcome
+
+    def record_plan_check_waiver(self, artifact_dir: Path) -> PhaseOutcome:
+        """Record an explicit human waiver for a required invalid probe output."""
+        outcome = PhaseOutcome(
+            schema_version="1.0",
+            phase="plan_comprehension_check",
+            decision="advance",
+            reason_code="plan_check_waived",
+            summary=(
+                "A human explicitly waived the required plan comprehension check after invalid probe output."
+            ),
+            evidence_refs=("05a-plan-comprehension-check.md",),
+            resume_condition=None,
+            artifact_digests={},
+        )
+        persist_phase_outcome(
+            artifact_dir,
+            outcome,
+            state_metadata={"plan_check_policy": "required"},
+        )
         return outcome
 
     def run_plan_refinement_loop(
@@ -1469,6 +1520,7 @@ class WorkflowRunner:
                 command_template=probe_runner.command_template,
                 dry_run=True,
                 allow_external_send=self.allow_plan_check_external_send,
+                advisory_only=not self.plan_check_required,
                 prompt_text=probe_prompt,
             )
 
@@ -1479,10 +1531,13 @@ class WorkflowRunner:
                 command_template=probe_runner.command_template,
                 dry_run=False,
                 allow_external_send=self.allow_plan_check_external_send,
+                advisory_only=not self.plan_check_required,
                 prompt_text=probe_prompt,
             )
             probe_status = str(result["status"])
             if probe_status not in {"completed_no_findings", "needs_human_review"}:
+                # Protocol failures are not semantic findings; never ask the strong model
+                # to repair or reinterpret malformed probe output.
                 return result
 
             iteration_dirs = sorted((artifact_dir / "plan-check" / "iterations").glob("[0-9][0-9][0-9][0-9]"))
@@ -2818,6 +2873,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow external-safe plan artifacts to be sent to the plan comprehension model.",
     )
+    parser.add_argument(
+        "--require-plan-comprehension-check",
+        action="store_true",
+        help="Pause on invalid plan-check output instead of advancing with an advisory warning.",
+    )
+    parser.add_argument(
+        "--waive-plan-comprehension-check",
+        action="store_true",
+        help="Explicitly waive a required invalid plan check while resuming a paused workflow.",
+    )
     return parser.parse_args()
 
 
@@ -2831,6 +2896,8 @@ def slice_phases(start: str, end: str) -> list[str]:
 
 def main() -> None:
     args = parse_args()
+    if args.waive_plan_comprehension_check and not args.resume:
+        raise SystemExit("--waive-plan-comprehension-check requires --resume")
     repo_root = Path(args.repo_root).resolve()
     workdir = Path(args.workdir).resolve()
 
@@ -2860,6 +2927,7 @@ def main() -> None:
         task_label=args.task_label,
         dry_run=args.dry_run,
         allow_plan_check_external_send=args.allow_plan_check_external_send,
+        plan_check_required=args.require_plan_comprehension_check,
     )
     start_phase = args.from_phase
     if args.resume:
@@ -2872,7 +2940,25 @@ def main() -> None:
             raise SystemExit(f"Cannot resume: invalid workflow state: {exc}") from exc
         if state.get("status") != "paused" or state.get("phase") not in PHASES:
             raise SystemExit("Cannot resume: workflow is not in a valid paused phase")
-        start_phase = str(state["phase"])
+        paused_phase = str(state["phase"])
+        if state.get("plan_check_policy") == "required":
+            runner.plan_check_required = True
+        if args.waive_plan_comprehension_check:
+            if (
+                paused_phase != "plan_comprehension_check"
+                or state.get("reason_code") != "invalid_output"
+                or state.get("plan_check_policy") != "required"
+            ):
+                raise SystemExit(
+                    "Cannot waive plan comprehension check: the paused outcome is not required invalid_output"
+                )
+            runner.record_plan_check_waiver(runner.artifact_dir)
+            next_phase_index = PHASES.index(paused_phase) + 1
+            if next_phase_index > PHASES.index(args.to_phase):
+                return
+            start_phase = PHASES[next_phase_index]
+        else:
+            start_phase = paused_phase
     runner.run(slice_phases(start_phase, args.to_phase))
 
 

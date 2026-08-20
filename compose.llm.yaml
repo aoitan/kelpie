@@ -9,7 +9,6 @@ services:
       HOME: /home/dev
       UV_CACHE_DIR: /var/cache/uv
       UV_LINK_MODE: copy
-      UV_PROJECT_ENVIRONMENT: /var/cache/uv/project-env
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
       TERM: xterm-256color
@@ -18,9 +17,13 @@ services:
       - ${LLM_DATA_DIR:-./.data}:/workspace/.data
       - llm-home:/home/dev
       - uv-cache:/var/cache/uv
+      - cargo-cache:/var/cache/cargo
+      - gradle-cache:/var/cache/gradle
     entrypoint: ["/usr/local/bin/llm-entrypoint.sh"]
     command: ["sh"]
 
 volumes:
   llm-home:
   uv-cache:
+  cargo-cache:
+  gradle-cache:

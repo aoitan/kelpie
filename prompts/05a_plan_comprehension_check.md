@@ -38,3 +38,8 @@ You are a plan comprehension probe.
 
 The result is advisory. It does not guarantee technical correctness, security,
 requirements correctness, or implementation readiness.
+
+If you cannot produce a schema-valid reconstruction, do not turn the malformed
+response into a finding or claim that there are no findings. The workflow
+runtime records invalid output separately from source-backed interpretation
+differences and applies the configured optional/required policy.

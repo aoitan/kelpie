@@ -182,9 +182,16 @@ terminal な `success`、`error` と、人間待ちの `waiting` は時間経過
 
 - `waiting` では `reason_code` と `resume_condition` を必須とする
 - `error` では `reason_code` を必須とする
-- `running`、`idle`、`success` では両フィールドを原則 `null` とする
+- `running`、`idle`、`success` では両フィールドを原則 `null` とする。ただし、継続可能な
+  advisory warningは`reason_code`だけを持ち、`resume_condition`は`null`とする
 - UI は未知の reason code も文字列として表示し、描画不能にしない
 - reason code から resume 条件を UI 側で推測しない
+
+plan comprehension checkでは、`unresolved_findings`を計画内容の判断待ち、
+`invalid_output`をrequiredなprobeプロトコル失敗として別表示する。前者はfindingの
+解消・承認を、後者はprobeのretryまたは明示的なwaiveをresume条件とする。optionalな
+probeのschema-invalidは`advisory_check_unavailable`としてadvanceし、no-findingsとは
+表示しない。
 
 既存 `PhaseOutcome` の reason code と resume condition はこの原則をほぼ満たしている。
 
