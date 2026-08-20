@@ -1649,6 +1649,14 @@ class WorkflowHookExecutionTests(unittest.TestCase):
         self.assertIn("Do not use `..`, `src/...`, or", prompt)
         self.assertIn("Leave `artifact_digests` as {}", prompt)
         self.assertIn("without a `sha256:` prefix", prompt)
+        self.assertIn(
+            "For `advance`, `fail`, and `complete`, set `resume_condition` to JSON `null`.",
+            prompt,
+        )
+        self.assertIn(
+            "Only `pause` may use a non-empty string; never use an empty string, whitespace, or omit the field.",
+            prompt,
+        )
 
 
 if __name__ == "__main__":

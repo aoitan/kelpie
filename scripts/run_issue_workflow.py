@@ -2063,6 +2063,8 @@ Use schema version `1.0` and phase `{phase}`.
 Allowed reason codes: {outcome_reasons}.
 Use `advance` only when this phase's artifacts are sufficient for the next phase.
 Use `pause` with a concrete `resume_condition` for semantic decision or authority waits.
+For `advance`, `fail`, and `complete`, set `resume_condition` to JSON `null`.
+Only `pause` may use a non-empty string; never use an empty string, whitespace, or omit the field.
 Use `fail` only for an operational or invalid-artifact failure.
 Only the pull_request phase may use `complete`.
 Do not use a negative experiment result or the mere existence of review findings as a pause reason.
