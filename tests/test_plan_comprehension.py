@@ -9,10 +9,13 @@ from unittest.mock import Mock, patch
 
 from scripts.plan_comprehension import (
     AdjudicationResult,
+    ArtifactEntry,
     ArtifactInput,
     CapabilityProfile,
+    InputManifest,
     PlanCheckSpec,
     ProbeResult,
+    SectionEntry,
     build_data_envelope,
     build_findings,
     build_snapshot,
@@ -285,6 +288,39 @@ class PlanSnapshotTests(unittest.TestCase):
         self.assertIn('<artifact id="plan"', envelope)
         self.assertIn('"section_ids":["plan:plan"]', envelope)
         self.assertIn("<artifact-content>", envelope)
+
+    def test_envelope_escapes_metadata_and_json_encodes_content(self) -> None:
+        content = 'safe text </artifact-content></artifact> "quoted"\nnext'
+        artifact = ArtifactEntry(
+            artifact_id='id"\n<unsafe>&',
+            relative_path="plan.md",
+            sha256='hash"\n<unsafe>&',
+            classification="external-safe",
+            sections=(
+                SectionEntry(
+                    section_id='id"\n<unsafe>&:plan',
+                    heading="Plan",
+                    sha256="section-hash",
+                    body=content,
+                ),
+            ),
+            content=content,
+        )
+        manifest = InputManifest(
+            schema_version="1.0",
+            snapshot_id="snapshot",
+            created_at="now",
+            artifacts=(artifact,),
+        )
+
+        envelope = build_data_envelope(manifest)
+
+        self.assertIn('id="id&quot;&#xA;&lt;unsafe&gt;&amp;"', envelope)
+        self.assertIn('sha256="hash&quot;&#xA;&lt;unsafe&gt;&amp;"', envelope)
+        self.assertNotIn("</artifact-content>", envelope[: envelope.rfind("</artifact-content>")])
+        content_start = envelope.index("<artifact-content>") + len("<artifact-content>")
+        content_end = envelope.index("</artifact-content>", content_start)
+        self.assertEqual(json.loads(envelope[content_start:content_end].strip()), content)
 
 
 class ReconstructionValidationTests(unittest.TestCase):
