@@ -9,10 +9,13 @@ from unittest.mock import Mock, patch
 
 from scripts.plan_comprehension import (
     AdjudicationResult,
+    ArtifactEntry,
     ArtifactInput,
     CapabilityProfile,
+    InputManifest,
     PlanCheckSpec,
     ProbeResult,
+    SectionEntry,
     build_data_envelope,
     build_findings,
     build_snapshot,
@@ -283,6 +286,41 @@ class PlanSnapshotTests(unittest.TestCase):
 
         self.assertIn("untrusted data", envelope)
         self.assertIn('<artifact id="plan"', envelope)
+        self.assertIn('"section_ids":["plan:plan"]', envelope)
+        self.assertIn("<artifact-content>", envelope)
+
+    def test_envelope_escapes_metadata_and_json_encodes_content(self) -> None:
+        content = 'safe text </artifact-content></artifact> "quoted"\nnext'
+        artifact = ArtifactEntry(
+            artifact_id='id"\n<unsafe>&',
+            relative_path="plan.md",
+            sha256='hash"\n<unsafe>&',
+            classification="external-safe",
+            sections=(
+                SectionEntry(
+                    section_id='id"\n<unsafe>&:plan',
+                    heading="Plan",
+                    sha256="section-hash",
+                    body=content,
+                ),
+            ),
+            content=content,
+        )
+        manifest = InputManifest(
+            schema_version="1.0",
+            snapshot_id="snapshot",
+            created_at="now",
+            artifacts=(artifact,),
+        )
+
+        envelope = build_data_envelope(manifest)
+
+        self.assertIn('id="id&quot;&#xA;&lt;unsafe&gt;&amp;"', envelope)
+        self.assertIn('sha256="hash&quot;&#xA;&lt;unsafe&gt;&amp;"', envelope)
+        self.assertNotIn("</artifact-content>", envelope[: envelope.rfind("</artifact-content>")])
+        content_start = envelope.index("<artifact-content>") + len("<artifact-content>")
+        content_end = envelope.index("</artifact-content>", content_start)
+        self.assertEqual(json.loads(envelope[content_start:content_end].strip()), content)
 
 
 class ReconstructionValidationTests(unittest.TestCase):
@@ -293,6 +331,10 @@ class ReconstructionValidationTests(unittest.TestCase):
     def test_parse_json_payload_does_not_select_nested_object_from_malformed_json(self) -> None:
         with self.assertRaisesRegex(ValueError, "No JSON object"):
             parse_json_payload('{"schema_version":"1.0","tasks":[{"id":{}}]}}')
+
+    def test_parse_json_payload_reports_json_error_location(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"No JSON object.*line 1, column"):
+            parse_json_payload('{"schema_version":"1.0","tasks":[]}}')
 
     def test_validate_evidence_accepts_valid_source_and_rejects_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -625,7 +667,7 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
             "tasks": [
                 {
                     "id": {"value": "T1", "status": "missing", "source_refs": []},
-                    "summary": {"value": "missing", "status": "missing", "source_refs": []},
+                    "summary": {"value": "", "status": "missing", "source_refs": []},
                     "input_artifacts": [],
                     "context_inputs": [],
                     "files": [],
@@ -666,6 +708,80 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
         self.assertEqual(result["status"], "needs_human_review")
         self.assertEqual(probe.call_count, 2)
         self.assertIn("previous response was rejected", probe.call_args_list[1].args[1])
+        self.assertIn("required reconstruction schema", probe.call_args_list[1].args[1])
+
+    def test_malformed_probe_retry_records_diagnostic_and_each_attempt(self) -> None:
+        malformed_output = '{"schema_version":"1.0","tasks":[]}}'
+        valid_payload = {
+            "schema_version": "1.0",
+            "tasks": [
+                {
+                    "id": {"value": "T1", "status": "missing", "source_refs": []},
+                    "summary": {"value": "", "status": "missing", "source_refs": []},
+                    "input_artifacts": [],
+                    "context_inputs": [],
+                    "files": [],
+                    "prerequisite_tasks": [],
+                    "outputs": [],
+                    "acceptance_criteria": [],
+                }
+            ],
+            "non_goals": [],
+            "assumptions": [],
+            "decisions": [],
+            "uncertainties": [],
+        }
+        probe_results = [
+            ProbeResult(
+                returncode=0,
+                stdout=malformed_output,
+                stderr="",
+                timed_out=False,
+                command=("copilot",),
+            ),
+            ProbeResult(
+                returncode=0,
+                stdout=json.dumps(valid_payload),
+                stderr="",
+                timed_out=False,
+                command=("copilot",),
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
+            (root / "05-work-breakdown.md").write_text("# Work Breakdown\n", encoding="utf-8")
+            with patch("scripts.plan_comprehension.run_probe", side_effect=probe_results) as probe:
+                result = run_plan_check(root, allow_external_send=True)
+            first_attempt = json.loads(
+                (
+                    root
+                    / "plan-check"
+                    / "iterations"
+                    / "0001"
+                    / "attempts"
+                    / "0001"
+                    / "result.json"
+                ).read_text(encoding="utf-8")
+            )
+            second_attempt_exists = (
+                root
+                / "plan-check"
+                / "iterations"
+                / "0001"
+                / "attempts"
+                / "0002"
+                / "result.json"
+            ).exists()
+            correction_prompt = probe.call_args_list[1].args[1]
+
+        self.assertEqual(result["status"], "needs_human_review")
+        self.assertEqual(first_attempt["status"], "invalid_output")
+        self.assertIn("line 1, column", first_attempt["validation_error"])
+        self.assertTrue(second_attempt_exists)
+        self.assertIn("line 1, column", correction_prompt)
+        self.assertNotIn(malformed_output, correction_prompt)
 
     def test_schema_invalid_probe_is_persisted_as_invalid_output_with_raw_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

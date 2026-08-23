@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
@@ -31,6 +31,11 @@ try:
         EvaluationLoopRequest,
         EvaluationLoopResult,
         run_evaluation_loop as run_fixed_evaluation_loop,
+    )
+    from scripts.convergence_policy import (
+        ConvergenceOrchestrator,
+        ConvergenceRequest,
+        ConvergenceRunResult,
     )
     from scripts.workflow_outcomes import (
         PHASE_REASON_CODES,
@@ -54,6 +59,11 @@ except ModuleNotFoundError:
         EvaluationLoopRequest,
         EvaluationLoopResult,
         run_evaluation_loop as run_fixed_evaluation_loop,
+    )
+    from convergence_policy import (
+        ConvergenceOrchestrator,
+        ConvergenceRequest,
+        ConvergenceRunResult,
     )
     from workflow_outcomes import (
         PHASE_REASON_CODES,
@@ -1141,6 +1151,59 @@ class WorkflowRunner:
             reviewer=reviewer,
         )
 
+    def run_convergence(
+        self,
+        request: ConvergenceRequest,
+        *,
+        evaluator: object | None = None,
+        proposal_provider: Callable[..., object] | None = None,
+        resume: bool = False,
+    ) -> ConvergenceRunResult:
+        """Run a bounded convergence loop through an explicit opt-in.
+
+        Normal phase execution and ``run_evaluation_loop`` remain one-shot.
+        Callers must provide either an evaluator adapter or an
+        ``evaluation_request`` on the convergence request.  The latter is
+        copied for each attempt with only the policy-approved change intent
+        replaced.
+        """
+
+        if not isinstance(request, ConvergenceRequest):
+            request = ConvergenceRequest.from_mapping(request)
+
+        adapter = evaluator
+        if adapter is None and request.evaluation_request is not None:
+            base_request = request.evaluation_request
+            if isinstance(base_request, Mapping):
+                base_request = EvaluationLoopRequest.from_mapping(base_request)
+            if not isinstance(base_request, EvaluationLoopRequest):
+                raise TypeError("evaluation_request must be an EvaluationLoopRequest or mapping")
+
+            def adapter(instruction: object) -> object:
+                if not hasattr(instruction, "change_intent"):
+                    raise TypeError("convergence instruction has no change_intent")
+                single_change = replace(
+                    base_request.single_change,
+                    change_intent=instruction.change_intent,
+                )
+                attempt_request = replace(base_request, single_change=single_change)
+                return self.run_evaluation_loop(attempt_request)
+
+        if adapter is None:
+            raise ValueError("run_convergence requires evaluator or evaluation_request")
+
+        return ConvergenceOrchestrator(
+            workdir=self.workdir,
+            artifact_root=self.artifact_dir,
+            evaluator=adapter,
+            proposal_provider=proposal_provider,
+        ).run(request, resume=resume)
+
+    # Explicit aliases for callers that name the feature as a loop rather than
+    # a run.  They remain opt-in and do not alter the phase workflow.
+    run_convergence_loop = run_convergence
+    converge = run_convergence
+
     def run_step(self, step: StepSpec) -> None:
         print(f"\n=== Running step: {step.name} ===")
         resolved = self.step_resolver.resolve(step)
@@ -2118,6 +2181,8 @@ Use schema version `1.0` and phase `{phase}`.
 Allowed reason codes: {outcome_reasons}.
 Use `advance` only when this phase's artifacts are sufficient for the next phase.
 Use `pause` with a concrete `resume_condition` for semantic decision or authority waits.
+For `advance`, `fail`, and `complete`, set `resume_condition` to JSON `null`.
+Only `pause` may use a non-empty string; never use an empty string, whitespace, or omit the field.
 Use `fail` only for an operational or invalid-artifact failure.
 Only the pull_request phase may use `complete`.
 Do not use a negative experiment result or the mere existence of review findings as a pause reason.
