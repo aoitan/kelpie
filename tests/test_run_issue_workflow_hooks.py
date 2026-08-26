@@ -792,12 +792,33 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 else:
                     os.environ["KELPIE_CONFIG_HOME"] = old_config_home
 
+            runner.work_items_json_path().write_text(
+                json.dumps(
+                    {
+                        "version": "1.0",
+                        "tasks": [
+                            {
+                                "id": "wi-implementation",
+                                "title": "Implementation item",
+                                "description": "Run implementation item",
+                            }
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             with patch.object(runner, "run_step") as mock_run_step:
                 for phase in PHASES:
                     getattr(runner, phase)()
                     step = mock_run_step.call_args.args[0]
-                    self.assertEqual(step.name, phase)
-                    self.assertEqual(step.phase, phase)
+                    if phase == "implementation":
+                        self.assertEqual(step.name, "implementation_coding")
+                        self.assertEqual(step.phase, "implementation")
+                        self.assertEqual(step.artifact_subdir, "wi-implementation")
+                    else:
+                        self.assertEqual(step.name, phase)
+                        self.assertEqual(step.phase, phase)
 
             self.assertEqual(mock_run_step.call_count, len(PHASES))
 
