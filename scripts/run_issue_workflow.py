@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -112,6 +113,18 @@ PHASE_TO_SKILL = {
     "implementation": "skills/implementation/SKILL.md",
     "review_fix_loop": "skills/review-fix-loop/SKILL.md",
     "pull_request": "skills/pull-request/SKILL.md",
+}
+
+IMPLEMENTATION_STEP_TO_PROMPT = {
+    "implementation_coder": "prompts/06_implementation_coder.md",
+    "implementation_reviewer": "prompts/06_implementation_reviewer.md",
+    "implementation_fix": "prompts/06_implementation_fix.md",
+}
+
+IMPLEMENTATION_STEP_TO_SKILL = {
+    "implementation_coder": "skills/implementation-coder/SKILL.md",
+    "implementation_reviewer": "skills/implementation-reviewer/SKILL.md",
+    "implementation_fix": "skills/implementation-fixer/SKILL.md",
 }
 
 
@@ -444,7 +457,7 @@ class RunnerConfig:
         if not isinstance(raw_step_overrides, dict):
             raise ValueError("step_overrides must be a mapping")
         for step_name, override in raw_step_overrides.items():
-            if step_name != "plan_refinement":
+            if step_name not in SUPPORTED_STEP_OVERRIDES:
                 raise ValueError(f"Unsupported step in step_overrides: {step_name}")
             if not isinstance(override, dict):
                 raise ValueError(f"step_overrides.{step_name} must be a mapping")
@@ -725,18 +738,66 @@ class HookConfig:
         return phase_config.pre if stage == "pre" else phase_config.post
 
 
-VIRTUAL_INPUT_TOKENS = frozenset({"$issue", "$repo_instructions", "$loop_item"})
+VIRTUAL_INPUT_TOKENS = frozenset({
+    "$issue",
+    "$repo_instructions",
+    "$loop_item",
+    "$review_findings",
+})
 MAX_VIRTUAL_INPUT_LENGTH = 2000
 MAX_IMPLEMENTATION_LOOP_SOURCE_BYTES = 1024 * 1024
 MAX_IMPLEMENTATION_LOOP_ITEMS = 100
 MAX_IMPLEMENTATION_LOOP_ITEM_BYTES = 64 * 1024
-IMPLEMENTATION_LOOP_STATUS_SCHEMA_VERSION = "1.0"
+IMPLEMENTATION_LOOP_STATUS_SCHEMA_VERSION = "2.0"
 IMPLEMENTATION_LOOP_ITEM_STATUSES = frozenset({
     "not_run",
     "running",
     "succeeded",
     "failed",
     "planned",
+})
+IMPLEMENTATION_LOOP_ROLES = frozenset({"coder", "reviewer", "fix"})
+IMPLEMENTATION_LOOP_TERMINAL_REASONS = frozenset({
+    "no_findings",
+    "fixed",
+    "execution_failed",
+    "invalid_review_output",
+    "safety_limit_reached",
+    "dry_run",
+})
+IMPLEMENTATION_LOOP_TERMINAL_REASON_BY_STATUS = {
+    "succeeded": frozenset({"no_findings", "fixed"}),
+    "failed": frozenset({"execution_failed", "invalid_review_output", "safety_limit_reached"}),
+    "planned": frozenset({"dry_run"}),
+}
+
+# The v5 implementation subpipeline has a deliberately narrow review result
+# contract.  Keep these limits local to the loader so that the generic step
+# output declarations remain metadata rather than an implicit parser API.
+REVIEW_RESULT_SCHEMA_VERSION = "1.0"
+REVIEW_RESULT_FILENAME = "review-result.json"
+MAX_REVIEW_RESULT_BYTES = 256 * 1024
+MAX_REVIEW_FINDINGS = 100
+MAX_REVIEW_FINDING_ID_BYTES = 128
+MAX_REVIEW_FINDING_DESCRIPTION_BYTES = 8_192
+MAX_CANONICAL_REVIEW_FINDINGS_BYTES = 128 * 1024
+# This alias names the input-side boundary explicitly while keeping the
+# canonical size limit owned by the review-result contract.
+MAX_REVIEW_FINDINGS_INPUT_BYTES = MAX_CANONICAL_REVIEW_FINDINGS_BYTES
+MAX_REVIEW_JSON_DEPTH = 32
+MAX_IMPLEMENTATION_FIX_ATTEMPTS = 1
+EMPTY_CANONICAL_REVIEW_FINDINGS_JSON = json.dumps(
+    {
+        "schema_version": REVIEW_RESULT_SCHEMA_VERSION,
+        "findings": [],
+    },
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+)
+SUPPORTED_STEP_OVERRIDES = frozenset({
+    "plan_refinement",
+    *IMPLEMENTATION_STEP_TO_PROMPT,
 })
 STEP_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 PATH_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -811,6 +872,642 @@ class WorkItemsSnapshot:
     source_path: Path
     source_sha256: str
     items: tuple[WorkItemSnapshot, ...]
+
+
+class ImplementationStepFactory:
+    """Build the fixed v5 implementation role specs.
+
+    The factory owns only the role contract.  It does not resolve runners or
+    create artifact directories; those responsibilities remain with
+    ``StepResolver`` and the normal ``run_step`` lifecycle respectively.
+    """
+
+    _ROLE_ALIASES = {
+        "coder": "implementation_coder",
+        "reviewer": "implementation_reviewer",
+        "fix": "implementation_fix",
+        "fixer": "implementation_fix",
+    }
+    _ROLE_NAMES = {
+        "implementation_coder": "coder",
+        "implementation_reviewer": "reviewer",
+        "implementation_fix": "fix",
+    }
+
+    def __init__(
+        self,
+        *,
+        runner_names: Mapping[str, str | None] | None = None,
+        prompt_files: Mapping[str, str] | None = None,
+        skill_files: Mapping[str, str] | None = None,
+    ) -> None:
+        self.runner_names = MappingProxyType(
+            self._normalize_role_mapping(runner_names, "runner_names", allow_none=True)
+        )
+        self.prompt_files = MappingProxyType(
+            self._merge_role_files(prompt_files, IMPLEMENTATION_STEP_TO_PROMPT, "prompt_files")
+        )
+        self.skill_files = MappingProxyType(
+            self._merge_role_files(skill_files, IMPLEMENTATION_STEP_TO_SKILL, "skill_files")
+        )
+
+    @classmethod
+    def _normalize_role_mapping(
+        cls,
+        values: Mapping[str, object] | None,
+        field_name: str,
+        *,
+        allow_none: bool,
+    ) -> dict[str, str | None]:
+        if values is None:
+            return {}
+        if not isinstance(values, Mapping):
+            raise ValueError(f"{field_name} must be a mapping")
+
+        normalized: dict[str, str | None] = {}
+        for raw_role, value in values.items():
+            if not isinstance(raw_role, str):
+                raise ValueError(f"{field_name} keys must be strings")
+            step_name = cls._ROLE_ALIASES.get(raw_role, raw_role)
+            if step_name not in IMPLEMENTATION_STEP_TO_PROMPT:
+                raise ValueError(f"Unsupported implementation role in {field_name}: {raw_role}")
+            if value is None and allow_none:
+                normalized[step_name] = None
+                continue
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{field_name}.{raw_role} must be a non-empty string")
+            normalized[step_name] = value
+        return normalized
+
+    @classmethod
+    def _merge_role_files(
+        cls,
+        overrides: Mapping[str, str] | None,
+        defaults: Mapping[str, str],
+        field_name: str,
+    ) -> dict[str, str]:
+        normalized = dict(defaults)
+        if overrides is None:
+            return normalized
+        if not isinstance(overrides, Mapping):
+            raise ValueError(f"{field_name} must be a mapping")
+        for raw_role, value in overrides.items():
+            if not isinstance(raw_role, str):
+                raise ValueError(f"{field_name} keys must be strings")
+            step_name = cls._ROLE_ALIASES.get(raw_role, raw_role)
+            if step_name not in defaults:
+                raise ValueError(f"Unsupported implementation role in {field_name}: {raw_role}")
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{field_name}.{raw_role} must be a non-empty string")
+            normalized[step_name] = value
+        return normalized
+
+    @staticmethod
+    def _validate_item(item: WorkItemSnapshot) -> None:
+        if not isinstance(item, WorkItemSnapshot):
+            raise TypeError("item must be a WorkItemSnapshot")
+
+    @staticmethod
+    def _validate_iteration(iteration: int) -> None:
+        if isinstance(iteration, bool) or not isinstance(iteration, int) or not 0 <= iteration <= 9999:
+            raise ValueError("implementation iteration must be an integer between 0 and 9999")
+
+    def _build(
+        self,
+        step_name: str,
+        item: WorkItemSnapshot,
+        *,
+        iteration: int,
+        inputs: list[str],
+        outputs: list[str],
+    ) -> StepSpec:
+        self._validate_item(item)
+        self._validate_iteration(iteration)
+        role = self._ROLE_NAMES[step_name]
+        return StepSpec(
+            name=step_name,
+            phase="implementation",
+            prompt_file=self.prompt_files[step_name],
+            skill_file=self.skill_files[step_name],
+            runner_name=self.runner_names.get(step_name),
+            inputs=list(inputs),
+            outputs=list(outputs),
+            context_id="work-items",
+            artifact_subdir=f"{item.id}/iterations/{iteration:04d}/{role}",
+        )
+
+    def coder(self, item: WorkItemSnapshot) -> StepSpec:
+        return self._build(
+            "implementation_coder",
+            item,
+            iteration=0,
+            inputs=["$loop_item"],
+            outputs=["06-implementation-notes.md"],
+        )
+
+    def reviewer(self, item: WorkItemSnapshot, iteration: int) -> StepSpec:
+        return self._build(
+            "implementation_reviewer",
+            item,
+            iteration=iteration,
+            inputs=["$loop_item"],
+            outputs=[REVIEW_RESULT_FILENAME],
+        )
+
+    def fix(self, item: WorkItemSnapshot, iteration: int) -> StepSpec:
+        return self._build(
+            "implementation_fix",
+            item,
+            iteration=iteration,
+            inputs=["$loop_item", "$review_findings"],
+            outputs=["06-implementation-notes.md"],
+        )
+
+    def potential_steps(self, item: WorkItemSnapshot) -> tuple[StepSpec, ...]:
+        """Return all four possible specs without resolving or executing them."""
+        return (
+            self.coder(item),
+            self.reviewer(item, 0),
+            self.fix(item, 1),
+            self.reviewer(item, 1),
+        )
+
+
+class ReviewResultValidationError(ValueError):
+    """Raised when a reviewer output cannot be trusted as a v5 result."""
+
+
+# Keep a descriptive alias for callers that name the artifact rather than the
+# parsed result.  Both names intentionally identify the same validation
+# boundary and remain ValueError-compatible for existing error handling.
+ReviewOutputValidationError = ReviewResultValidationError
+
+
+class ImplementationSafetyLimitReached(RuntimeError):
+    """Raised when the fixed implementation subpipeline still has findings."""
+
+
+# Keep a descriptive alias for callers that use ``Error`` as the suffix.
+ImplementationSafetyLimitError = ImplementationSafetyLimitReached
+
+
+@dataclass(frozen=True)
+class ReviewFinding:
+    """The bounded, immutable finding accepted from one review result."""
+
+    id: str
+    description: str
+
+
+@dataclass(frozen=True)
+class ReviewResult:
+    """A validated reviewer verdict and its canonical fixer input."""
+
+    schema_version: str
+    status: str
+    findings: tuple[ReviewFinding, ...]
+    canonical_findings_json: str
+
+
+@dataclass(frozen=True)
+class ReviewOutputExpectation:
+    """The fixed output target observed before a reviewer step starts."""
+
+    reviewer_scope: Path
+    target: Path
+    target_was_absent: bool = True
+
+    @property
+    def target_path(self) -> Path:
+        """Compatibility name for callers that refer to the output path."""
+        return self.target
+
+    @property
+    def path(self) -> Path:
+        """Compatibility name for callers that refer to the expected path."""
+        return self.target
+
+
+class _DuplicateReviewJsonKey(ValueError):
+    """Internal parser signal for duplicate object keys."""
+
+
+class ReviewResultLoader:
+    """Read and validate only the fixed reviewer result artifact.
+
+    The loader deliberately does not inspect implementation phase outcomes or
+    generic ``StepSpec.outputs`` declarations.  The controller is responsible
+    for calling ``prepare_target`` immediately before a reviewer step and only
+    calling ``load`` after that step's lifecycle completed successfully.
+    """
+
+    filename = REVIEW_RESULT_FILENAME
+
+    def __init__(self, artifact_root: Path) -> None:
+        self.artifact_root = Path(artifact_root)
+
+    def prepare_target(self, reviewer_scope: Path) -> ReviewOutputExpectation:
+        """Validate a reviewer scope and require a fresh, absent target."""
+        scope = self._validate_contained_path(reviewer_scope, "reviewer scope")
+        self._validate_existing_scope(scope)
+        target = self._validate_contained_path(
+            scope / self.filename,
+            "review result target",
+        )
+        if self._path_exists_or_is_symlink(target):
+            raise ReviewResultValidationError(
+                f"review result target must be absent before reviewer execution: {target}"
+            )
+        return ReviewOutputExpectation(
+            reviewer_scope=scope,
+            target=target,
+            target_was_absent=True,
+        )
+
+    def load(
+        self,
+        expectation: ReviewOutputExpectation,
+        *,
+        run_id: str,
+        item_id: str,
+        iteration: int,
+    ) -> ReviewResult:
+        """Load one fresh target and fail closed on every validation error.
+
+        ``run_id``, ``item_id`` and ``iteration`` are accepted as correlation
+        context for the controller's status/provenance layer.  They are not
+        trusted reviewer fields and are intentionally not copied into the
+        canonical findings input.
+        """
+        _ = run_id, item_id, iteration
+        if not isinstance(expectation, ReviewOutputExpectation):
+            raise ReviewResultValidationError(
+                "review result expectation must be a ReviewOutputExpectation"
+            )
+        if not expectation.target_was_absent:
+            raise ReviewResultValidationError(
+                "review result target was not verified absent before execution"
+            )
+
+        scope = self._validate_contained_path(
+            expectation.reviewer_scope,
+            "reviewer scope",
+        )
+        self._validate_existing_scope(scope)
+        target = self._validate_contained_path(
+            expectation.target,
+            "review result target",
+        )
+        expected_target = scope / self.filename
+        if target != expected_target:
+            raise ReviewResultValidationError(
+                f"review result target must be {expected_target}, got {target}"
+            )
+
+        raw_bytes = self._read_target_once(target)
+        return self._parse_result(raw_bytes)
+
+    def _read_target_once(self, target: Path) -> bytes:
+        """Open a regular, non-symlink target and perform one bounded read."""
+        try:
+            target_stat = target.lstat()
+        except FileNotFoundError as exc:
+            raise ReviewResultValidationError(
+                f"review result output is missing: {target}"
+            ) from exc
+        except OSError as exc:
+            raise ReviewResultValidationError(
+                f"cannot inspect review result output {target}: {exc}"
+            ) from exc
+
+        self._validate_regular_file(target, target_stat)
+        if target_stat.st_size > MAX_REVIEW_RESULT_BYTES:
+            raise ReviewResultValidationError(
+                f"review result output exceeds {MAX_REVIEW_RESULT_BYTES} bytes: {target}"
+            )
+
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        # Avoid blocking if a special file is swapped in between lstat/open;
+        # the fstat check below still rejects anything that is not regular.
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        descriptor: int | None = None
+        try:
+            try:
+                descriptor = os.open(target, flags)
+            except FileNotFoundError as exc:
+                raise ReviewResultValidationError(
+                    f"review result output disappeared before reading: {target}"
+                ) from exc
+            except OSError as exc:
+                raise ReviewResultValidationError(
+                    f"cannot open review result output {target}: {exc}"
+                ) from exc
+
+            opened_stat = os.fstat(descriptor)
+            self._validate_regular_file(target, opened_stat)
+            if (
+                opened_stat.st_ino != target_stat.st_ino
+                or opened_stat.st_dev != target_stat.st_dev
+            ):
+                raise ReviewResultValidationError(
+                    f"review result output was replaced between stat and open: {target}"
+                )
+            if opened_stat.st_size > MAX_REVIEW_RESULT_BYTES:
+                raise ReviewResultValidationError(
+                    f"review result output exceeds {MAX_REVIEW_RESULT_BYTES} bytes: {target}"
+                )
+            try:
+                raw_bytes = os.read(descriptor, MAX_REVIEW_RESULT_BYTES + 1)
+            except OSError as exc:
+                raise ReviewResultValidationError(
+                    f"cannot read review result output {target}: {exc}"
+                ) from exc
+            if len(raw_bytes) > MAX_REVIEW_RESULT_BYTES:
+                raise ReviewResultValidationError(
+                    f"review result output exceeds {MAX_REVIEW_RESULT_BYTES} bytes: {target}"
+                )
+            if len(raw_bytes) != opened_stat.st_size:
+                raise ReviewResultValidationError(
+                    f"review result output changed while being read: {target}"
+                )
+            return raw_bytes
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
+    def _validate_regular_file(target: Path, target_stat: os.stat_result) -> None:
+        if stat.S_ISLNK(target_stat.st_mode):
+            raise ReviewResultValidationError(
+                f"review result output must not be a symlink: {target}"
+            )
+        if not stat.S_ISREG(target_stat.st_mode):
+            raise ReviewResultValidationError(
+                f"review result output must be a regular file: {target}"
+            )
+
+    def _parse_result(self, raw_bytes: bytes) -> ReviewResult:
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ReviewResultValidationError(
+                f"review result output is not valid UTF-8: {exc}"
+            ) from exc
+
+        try:
+            payload = json.loads(
+                text,
+                object_pairs_hook=self._object_pairs_without_duplicates,
+                parse_constant=self._reject_nonstandard_number,
+            )
+        except (_DuplicateReviewJsonKey, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            raise ReviewResultValidationError(
+                f"review result output is not valid JSON: {exc}"
+            ) from exc
+
+        self._validate_json_depth(payload)
+        if not isinstance(payload, dict):
+            raise ReviewResultValidationError(
+                "review result top-level value must be an object"
+            )
+        self._require_exact_keys(
+            payload,
+            {"schema_version", "status", "findings"},
+            "review result",
+        )
+
+        schema_version = payload["schema_version"]
+        if schema_version != REVIEW_RESULT_SCHEMA_VERSION:
+            raise ReviewResultValidationError(
+                f"review result schema_version must be {REVIEW_RESULT_SCHEMA_VERSION!r}"
+            )
+        status = payload["status"]
+        if not isinstance(status, str) or status not in {"no_findings", "findings_present"}:
+            raise ReviewResultValidationError(
+                "review result status must be 'no_findings' or 'findings_present'"
+            )
+        raw_findings = payload["findings"]
+        if not isinstance(raw_findings, list):
+            raise ReviewResultValidationError("review result findings must be an array")
+        if len(raw_findings) > MAX_REVIEW_FINDINGS:
+            raise ReviewResultValidationError(
+                f"review result contains more than {MAX_REVIEW_FINDINGS} findings"
+            )
+
+        findings: list[ReviewFinding] = []
+        seen_ids: set[str] = set()
+        for index, raw_finding in enumerate(raw_findings):
+            if not isinstance(raw_finding, dict):
+                raise ReviewResultValidationError(
+                    f"review result finding {index} must be an object"
+                )
+            self._require_exact_keys(
+                raw_finding,
+                {"id", "description"},
+                f"review result finding {index}",
+            )
+            finding_id = raw_finding["id"]
+            description = raw_finding["description"]
+            if not isinstance(finding_id, str) or not finding_id:
+                raise ReviewResultValidationError(
+                    f"review result finding {index} id must be a non-empty string"
+                )
+            if not isinstance(description, str) or not description:
+                raise ReviewResultValidationError(
+                    f"review result finding {index} description must be a non-empty string"
+                )
+            finding_id_bytes = self._utf8_length(
+                finding_id,
+                f"review result finding {index} id",
+            )
+            if finding_id_bytes > MAX_REVIEW_FINDING_ID_BYTES:
+                raise ReviewResultValidationError(
+                    f"review result finding {index} id exceeds "
+                    f"{MAX_REVIEW_FINDING_ID_BYTES} UTF-8 bytes"
+                )
+            description_bytes = self._utf8_length(
+                description,
+                f"review result finding {index} description",
+            )
+            if description_bytes > MAX_REVIEW_FINDING_DESCRIPTION_BYTES:
+                raise ReviewResultValidationError(
+                    f"review result finding {index} description exceeds "
+                    f"{MAX_REVIEW_FINDING_DESCRIPTION_BYTES} UTF-8 bytes"
+                )
+            if finding_id in seen_ids:
+                raise ReviewResultValidationError(
+                    f"review result contains duplicate finding id: {finding_id}"
+                )
+            seen_ids.add(finding_id)
+            findings.append(ReviewFinding(id=finding_id, description=description))
+
+        if status == "no_findings" and findings:
+            raise ReviewResultValidationError(
+                "review result no_findings status requires an empty findings array"
+            )
+        if status == "findings_present" and not findings:
+            raise ReviewResultValidationError(
+                "review result findings_present status requires at least one finding"
+            )
+
+        canonical_payload = {
+            "schema_version": REVIEW_RESULT_SCHEMA_VERSION,
+            "findings": [
+                {"id": finding.id, "description": finding.description}
+                for finding in findings
+            ],
+        }
+        try:
+            canonical_bytes = json.dumps(
+                canonical_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise ReviewResultValidationError(
+                f"review result canonical findings are not valid UTF-8: {exc}"
+            ) from exc
+        if len(canonical_bytes) > MAX_CANONICAL_REVIEW_FINDINGS_BYTES:
+            raise ReviewResultValidationError(
+                "canonical review findings exceed "
+                f"{MAX_CANONICAL_REVIEW_FINDINGS_BYTES} bytes"
+            )
+
+        return ReviewResult(
+            schema_version=schema_version,
+            status=status,
+            findings=tuple(findings),
+            canonical_findings_json=canonical_bytes.decode("utf-8"),
+        )
+
+    @staticmethod
+    def _object_pairs_without_duplicates(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise _DuplicateReviewJsonKey(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    @staticmethod
+    def _reject_nonstandard_number(value: str) -> None:
+        raise ValueError(f"non-standard JSON number: {value}")
+
+    @staticmethod
+    def _validate_json_depth(value: object) -> None:
+        pending: list[tuple[object, int]] = [(value, 0)]
+        while pending:
+            current, depth = pending.pop()
+            if depth > MAX_REVIEW_JSON_DEPTH:
+                raise ReviewResultValidationError(
+                    f"review result JSON exceeds {MAX_REVIEW_JSON_DEPTH} levels"
+                )
+            if isinstance(current, dict):
+                pending.extend((child, depth + 1) for child in current.values())
+            elif isinstance(current, list):
+                pending.extend((child, depth + 1) for child in current)
+
+    @staticmethod
+    def _require_exact_keys(
+        payload: Mapping[str, object],
+        expected: set[str],
+        label: str,
+    ) -> None:
+        actual = set(payload)
+        missing = expected - actual
+        unknown = actual - expected
+        if missing:
+            raise ReviewResultValidationError(
+                f"{label} is missing required field(s): {', '.join(sorted(missing))}"
+            )
+        if unknown:
+            raise ReviewResultValidationError(
+                f"{label} contains unknown field(s): {', '.join(sorted(unknown))}"
+            )
+
+    @staticmethod
+    def _utf8_length(value: str, label: str) -> int:
+        try:
+            return len(value.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ReviewResultValidationError(
+                f"{label} is not valid UTF-8: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _path_exists_or_is_symlink(path: Path) -> bool:
+        return path.exists() or path.is_symlink()
+
+    def _validate_existing_scope(self, scope: Path) -> None:
+        try:
+            scope_stat = scope.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ReviewResultValidationError(
+                f"cannot inspect reviewer scope {scope}: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(scope_stat.st_mode):
+            raise ReviewResultValidationError(
+                f"reviewer scope must be a directory: {scope}"
+            )
+
+    def _validate_contained_path(self, path: Path, label: str) -> Path:
+        try:
+            candidate = Path(path).absolute()
+            root = self.artifact_root.absolute()
+            if root.is_symlink():
+                raise ReviewResultValidationError(
+                    f"artifact root must not be a symlink: {root}"
+                )
+            root_canonical = root.resolve(strict=False)
+            candidate_canonical = candidate.resolve(strict=False)
+            try:
+                candidate_canonical.relative_to(root_canonical)
+            except ValueError as exc:
+                raise ReviewResultValidationError(
+                    f"{label} escapes artifact root: {candidate}"
+                ) from exc
+            self._reject_symlink_components(root, candidate, label)
+            return candidate
+        except ReviewResultValidationError:
+            raise
+        except (OSError, RuntimeError) as exc:
+            raise ReviewResultValidationError(
+                f"cannot validate {label} path {path}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _reject_symlink_components(root: Path, path: Path, label: str) -> None:
+        if root.is_symlink():
+            raise ReviewResultValidationError(
+                f"artifact root must not be a symlink: {root}"
+            )
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise ReviewResultValidationError(
+                f"{label} is not below artifact root: {path}"
+            ) from exc
+        current = root
+        for component in relative.parts:
+            current = current / component
+            try:
+                if current.is_symlink():
+                    raise ReviewResultValidationError(
+                        f"{label} contains a symlinked component: {path}"
+                    )
+            except OSError as exc:
+                raise ReviewResultValidationError(
+                    f"cannot inspect {label} component {current}: {exc}"
+                ) from exc
 
 
 def freeze_json_value(value: object) -> object:
@@ -1034,6 +1731,8 @@ class WorkflowRunner:
         allow_plan_check_external_send: bool = False,
         plan_check_required: bool = False,
         runner_registry: Mapping[str, RunnerConfig] | RunnerResolver | None = None,
+        implementation_step_factory: ImplementationStepFactory | None = None,
+        review_result_loader: ReviewResultLoader | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.workdir = workdir
@@ -1047,6 +1746,7 @@ class WorkflowRunner:
         self.dry_run = dry_run
         self.allow_plan_check_external_send = allow_plan_check_external_send
         self.plan_check_required = plan_check_required
+        self.implementation_step_factory = implementation_step_factory or ImplementationStepFactory()
 
         if isinstance(runner_registry, RunnerResolver):
             self.runner_resolver = runner_registry
@@ -1071,6 +1771,7 @@ class WorkflowRunner:
         self.issue_cache_dir = self.artifact_dir / ".issue-cache"
         for d in [self.kelpie_dir, self.artifact_dir, self.intent_dir, self.checks_dir, self.prompt_cache_dir, self.issue_cache_dir]:
             d.mkdir(parents=True, exist_ok=True)
+        self.review_result_loader = review_result_loader or ReviewResultLoader(self.artifact_dir)
         self.instruction_targets = self.stage_instruction_files()
         try:
             self.hook_config = HookConfig.load(
@@ -1126,48 +1827,464 @@ class WorkflowRunner:
     def run_phase(self, phase: str) -> None:
         self.run_step(self.build_step_spec_for_phase(phase))
 
+    def preflight_implementation_item_subpipelines(
+        self,
+        snapshot: WorkItemsSnapshot,
+    ) -> tuple[tuple[ResolvedStep, ...], ...]:
+        """Resolve every potential role step without starting its lifecycle.
+
+        The returned values are useful to callers that want to inspect the
+        resolved contract, but this method deliberately does not call
+        ``run_step`` or create any item-scoped artifact.  A placeholder review
+        context is supplied only to make the fix spec fully resolvable; it is
+        never treated as an actual reviewer verdict.
+        """
+        if not isinstance(snapshot, WorkItemsSnapshot):
+            raise TypeError("snapshot must be a WorkItemsSnapshot")
+
+        resolved_items: list[tuple[ResolvedStep, ...]] = []
+        seen_scopes: set[Path] = set()
+        for item in snapshot.items:
+            resolved_steps: list[ResolvedStep] = []
+            for step in self.implementation_step_factory.potential_steps(item):
+                virtual_context: dict[str, str] = {
+                    "$loop_item": item.canonical_json,
+                }
+                if "$review_findings" in (step.inputs or []):
+                    virtual_context["$review_findings"] = EMPTY_CANONICAL_REVIEW_FINDINGS_JSON
+
+                resolved = self.step_resolver.resolve(
+                    step,
+                    virtual_context=virtual_context,
+                )
+                resolved_scope = resolved.artifact_dir.resolve(strict=False)
+                if resolved_scope in seen_scopes:
+                    raise ValueError(
+                        "Implementation subpipeline artifact scope collision: "
+                        f"{resolved.artifact_dir.relative_to(self.workdir)}"
+                    )
+                seen_scopes.add(resolved_scope)
+                resolved_steps.append(resolved)
+            resolved_items.append(tuple(resolved_steps))
+        return tuple(resolved_items)
+
+    # Keep the shorter name available for callers that address this operation
+    # as an implementation-loop preflight.
+    preflight_implementation_items = preflight_implementation_item_subpipelines
+
+    def _implementation_scope_reference(self, scope: Path) -> str:
+        """Return the artifact-root-relative name stored in loop status."""
+        self._assert_artifact_path_contained(scope)
+        try:
+            return str(scope.relative_to(self.artifact_dir))
+        except ValueError as exc:
+            raise ValueError(f"Implementation scope is outside artifact root: {scope}") from exc
+
+    def _start_implementation_role(
+        self,
+        status: dict[str, object],
+        item: WorkItemSnapshot,
+        *,
+        run_id: str,
+        role: str,
+        iteration: int,
+        last_review_scope: str | None = None,
+    ) -> None:
+        """Persist the role boundary before invoking its common step runner."""
+        self.transition_implementation_loop_item(
+            status,
+            item.position,
+            "running",
+            role=role,
+            iteration=iteration,
+            run_id=run_id,
+            last_review_scope=last_review_scope,
+        )
+        status["current_item"] = item.id
+        self.write_implementation_loop_status(status)
+
+    def _record_implementation_item_failure(
+        self,
+        status: dict[str, object],
+        item: WorkItemSnapshot,
+        *,
+        run_id: str,
+        role: str,
+        iteration: int,
+        reason: str,
+        primary: BaseException,
+        last_review_scope: str | None = None,
+    ) -> None:
+        """Record a terminal item failure without replacing its primary error."""
+        error = (
+            None
+            if reason == "safety_limit_reached"
+            else self.sanitize_implementation_loop_error(primary)
+        )
+        try:
+            self.transition_implementation_loop_item(
+                status,
+                item.position,
+                "failed",
+                error=error,
+                reason=reason,
+                role=role,
+                iteration=iteration,
+                run_id=run_id,
+                last_review_scope=last_review_scope,
+            )
+            self.transition_implementation_loop_overall(status, "failed")
+            self.write_implementation_loop_status(status)
+        except BaseException as recording_error:
+            self.note_secondary_implementation_loop_error(primary, recording_error)
+
+    def _run_implementation_step(
+        self,
+        status: dict[str, object],
+        item: WorkItemSnapshot,
+        *,
+        run_id: str,
+        role: str,
+        iteration: int,
+        step: StepSpec,
+        virtual_context: Mapping[str, str],
+        last_review_scope: str | None = None,
+    ) -> None:
+        """Run one role step and classify every runner/lifecycle exception."""
+        self._start_implementation_role(
+            status,
+            item,
+            run_id=run_id,
+            role=role,
+            iteration=iteration,
+            last_review_scope=last_review_scope,
+        )
+        try:
+            self.run_step(step, virtual_context=virtual_context)
+        except BaseException as exc:
+            self._record_implementation_item_failure(
+                status,
+                item,
+                run_id=run_id,
+                role=role,
+                iteration=iteration,
+                reason="execution_failed",
+                primary=exc,
+                last_review_scope=last_review_scope,
+            )
+            raise
+
+    def _run_implementation_reviewer(
+        self,
+        status: dict[str, object],
+        item: WorkItemSnapshot,
+        *,
+        run_id: str,
+        iteration: int,
+    ) -> tuple[ReviewResult, str]:
+        """Run a reviewer and load its dedicated result only after success."""
+        step = self.implementation_step_factory.reviewer(item, iteration)
+        reviewer_scope = self.resolve_artifact_scope(step)
+        reviewer_scope_ref = self._implementation_scope_reference(reviewer_scope)
+        self._start_implementation_role(
+            status,
+            item,
+            run_id=run_id,
+            role="reviewer",
+            iteration=iteration,
+            last_review_scope=reviewer_scope_ref,
+        )
+
+        try:
+            expectation = self.review_result_loader.prepare_target(reviewer_scope)
+        except ReviewResultValidationError as exc:
+            self._record_implementation_item_failure(
+                status,
+                item,
+                run_id=run_id,
+                role="reviewer",
+                iteration=iteration,
+                reason="invalid_review_output",
+                primary=exc,
+                last_review_scope=reviewer_scope_ref,
+            )
+            raise
+        except BaseException as exc:
+            self._record_implementation_item_failure(
+                status,
+                item,
+                run_id=run_id,
+                role="reviewer",
+                iteration=iteration,
+                reason="execution_failed",
+                primary=exc,
+                last_review_scope=reviewer_scope_ref,
+            )
+            raise
+
+        try:
+            self.run_step(
+                step,
+                virtual_context={"$loop_item": item.canonical_json},
+            )
+        except BaseException as exc:
+            # A result left behind by a failed runner must never override the
+            # lifecycle failure, so loading happens only in the success path.
+            self._record_implementation_item_failure(
+                status,
+                item,
+                run_id=run_id,
+                role="reviewer",
+                iteration=iteration,
+                reason="execution_failed",
+                primary=exc,
+                last_review_scope=reviewer_scope_ref,
+            )
+            raise
+
+        try:
+            result = self.review_result_loader.load(
+                expectation,
+                run_id=run_id,
+                item_id=item.id,
+                iteration=iteration,
+            )
+            if not isinstance(result, ReviewResult):
+                raise ReviewResultValidationError(
+                    "review result loader returned an unsupported result type"
+                )
+            if result.status == "no_findings" and result.findings:
+                raise ReviewResultValidationError(
+                    "review result no_findings status has findings"
+                )
+            if result.status == "findings_present" and not result.findings:
+                raise ReviewResultValidationError(
+                    "review result findings_present status has no findings"
+                )
+            if result.status not in {"no_findings", "findings_present"}:
+                raise ReviewResultValidationError(
+                    "review result has an unsupported status"
+                )
+            return result, reviewer_scope_ref
+        except ReviewResultValidationError as exc:
+            self._record_implementation_item_failure(
+                status,
+                item,
+                run_id=run_id,
+                role="reviewer",
+                iteration=iteration,
+                reason="invalid_review_output",
+                primary=exc,
+                last_review_scope=reviewer_scope_ref,
+            )
+            raise
+        except BaseException as exc:
+            self._record_implementation_item_failure(
+                status,
+                item,
+                run_id=run_id,
+                role="reviewer",
+                iteration=iteration,
+                reason="execution_failed",
+                primary=exc,
+                last_review_scope=reviewer_scope_ref,
+            )
+            raise
+
+    def _finish_implementation_item(
+        self,
+        status: dict[str, object],
+        item: WorkItemSnapshot,
+        *,
+        run_id: str,
+        reason: str,
+        role: str,
+        iteration: int,
+        last_review_scope: str | None,
+    ) -> None:
+        self.transition_implementation_loop_item(
+            status,
+            item.position,
+            "succeeded",
+            reason=reason,
+            role=role,
+            iteration=iteration,
+            run_id=run_id,
+            last_review_scope=last_review_scope,
+        )
+        status["current_item"] = None
+        self.write_implementation_loop_status(status)
+
+    def run_implementation_item_subpipeline(
+        self,
+        item: WorkItemSnapshot,
+        status: dict[str, object],
+        run_id: str | None = None,
+    ) -> None:
+        """Run the fixed coder/reviewer/fix/reviewer pipeline for one item."""
+        if not isinstance(item, WorkItemSnapshot):
+            raise TypeError("item must be a WorkItemSnapshot")
+        if not isinstance(status, dict):
+            raise TypeError("status must be a dictionary")
+        status_run_id = status.get("run_id")
+        if run_id is None:
+            run_id = status_run_id if isinstance(status_run_id, str) else None
+        if not isinstance(run_id, str):
+            raise ValueError("Implementation loop status is missing a valid run_id")
+        run_id = self._validate_implementation_loop_run_id(run_id)
+
+        if self.dry_run:
+            empty_findings = EMPTY_CANONICAL_REVIEW_FINDINGS_JSON
+            planned_steps = (
+                (
+                    self.implementation_step_factory.coder(item),
+                    "coder",
+                    0,
+                    {"$loop_item": item.canonical_json},
+                ),
+                (
+                    self.implementation_step_factory.reviewer(item, 0),
+                    "reviewer",
+                    0,
+                    {"$loop_item": item.canonical_json},
+                ),
+                (
+                    self.implementation_step_factory.fix(item, 1),
+                    "fix",
+                    1,
+                    {
+                        "$loop_item": item.canonical_json,
+                        "$review_findings": empty_findings,
+                    },
+                ),
+                (
+                    self.implementation_step_factory.reviewer(item, 1),
+                    "reviewer",
+                    1,
+                    {"$loop_item": item.canonical_json},
+                ),
+            )
+            last_review_scope: str | None = None
+            for step, role, iteration, virtual_context in planned_steps:
+                scope = self.resolve_artifact_scope(step)
+                scope_reference = self._implementation_scope_reference(scope)
+                if role == "reviewer":
+                    last_review_scope = scope_reference
+                self._run_implementation_step(
+                    status,
+                    item,
+                    run_id=run_id,
+                    role=role,
+                    iteration=iteration,
+                    step=step,
+                    virtual_context=virtual_context,
+                    last_review_scope=last_review_scope,
+                )
+            self.transition_implementation_loop_item(
+                status,
+                item.position,
+                "planned",
+                reason="dry_run",
+                role="reviewer",
+                iteration=1,
+                run_id=run_id,
+                last_review_scope=last_review_scope,
+            )
+            status["current_item"] = None
+            self.write_implementation_loop_status(status)
+            return
+
+        coder_step = self.implementation_step_factory.coder(item)
+        self._run_implementation_step(
+            status,
+            item,
+            run_id=run_id,
+            role="coder",
+            iteration=0,
+            step=coder_step,
+            virtual_context={"$loop_item": item.canonical_json},
+        )
+
+        first_review, first_review_scope = self._run_implementation_reviewer(
+            status,
+            item,
+            run_id=run_id,
+            iteration=0,
+        )
+        if first_review.status == "no_findings":
+            self._finish_implementation_item(
+                status,
+                item,
+                run_id=run_id,
+                reason="no_findings",
+                role="reviewer",
+                iteration=0,
+                last_review_scope=first_review_scope,
+            )
+            return
+
+        fix_step = self.implementation_step_factory.fix(item, MAX_IMPLEMENTATION_FIX_ATTEMPTS)
+        self._run_implementation_step(
+            status,
+            item,
+            run_id=run_id,
+            role="fix",
+            iteration=MAX_IMPLEMENTATION_FIX_ATTEMPTS,
+            step=fix_step,
+            virtual_context={
+                "$loop_item": item.canonical_json,
+                "$review_findings": first_review.canonical_findings_json,
+            },
+            last_review_scope=first_review_scope,
+        )
+
+        second_review, second_review_scope = self._run_implementation_reviewer(
+            status,
+            item,
+            run_id=run_id,
+            iteration=MAX_IMPLEMENTATION_FIX_ATTEMPTS,
+        )
+        if second_review.status == "no_findings":
+            self._finish_implementation_item(
+                status,
+                item,
+                run_id=run_id,
+                reason="fixed",
+                role="reviewer",
+                iteration=MAX_IMPLEMENTATION_FIX_ATTEMPTS,
+                last_review_scope=second_review_scope,
+            )
+            return
+
+        safety_limit = ImplementationSafetyLimitReached(
+            f"Implementation review findings remain after {MAX_IMPLEMENTATION_FIX_ATTEMPTS} "
+            f"fix attempt for item '{item.id}'"
+        )
+        self._record_implementation_item_failure(
+            status,
+            item,
+            run_id=run_id,
+            role="reviewer",
+            iteration=MAX_IMPLEMENTATION_FIX_ATTEMPTS,
+            reason="safety_limit_reached",
+            primary=safety_limit,
+            last_review_scope=second_review_scope,
+        )
+        raise safety_limit
+
     def run_implementation_items(self) -> None:
-        """Run implementation once for each validated work item in input order."""
+        """Run the fixed subpipeline for each validated work item in order."""
         with self.implementation_loop_lock():
             snapshot = self.load_implementation_items_snapshot()
+            self.preflight_implementation_item_subpipelines(snapshot)
             status = self.build_implementation_loop_status(snapshot)
             self.write_implementation_loop_status(status)
+            run_id = status.get("run_id")
+            if not isinstance(run_id, str):
+                raise ValueError("Implementation loop status is missing a valid run_id")
 
             for item in snapshot.items:
-                self.transition_implementation_loop_item(status, item.position, "running")
-                status["current_item"] = item.id
-                self.write_implementation_loop_status(status)
-
-                step = StepSpec(
-                    name="implementation_coding",
-                    phase="implementation",
-                    inputs=["$loop_item"],
-                    context_id="work-items",
-                    artifact_subdir=item.id,
-                )
-                try:
-                    self.run_step(
-                        step,
-                        virtual_context={"$loop_item": item.canonical_json},
-                    )
-                except BaseException as exc:
-                    self.transition_implementation_loop_item(
-                        status,
-                        item.position,
-                        "failed",
-                        error=self.sanitize_implementation_loop_error(exc),
-                    )
-                    self.transition_implementation_loop_overall(status, "failed")
-                    try:
-                        self.write_implementation_loop_status(status)
-                    except BaseException as recording_error:
-                        self.note_secondary_implementation_loop_error(exc, recording_error)
-                    raise
-
-                terminal_status = "planned" if self.dry_run else "succeeded"
-                self.transition_implementation_loop_item(status, item.position, terminal_status)
-                status["current_item"] = None
-                self.write_implementation_loop_status(status)
+                self.run_implementation_item_subpipeline(item, status, run_id)
 
             self.transition_implementation_loop_overall(
                 status,
@@ -1317,13 +2434,64 @@ class WorkflowRunner:
             except OSError:
                 pass
 
+    @staticmethod
+    def _validate_implementation_loop_run_id(run_id: object) -> str:
+        if not isinstance(run_id, str) or not PATH_SEGMENT_PATTERN.fullmatch(run_id):
+            raise ValueError("implementation loop run_id must be a path-safe non-empty string")
+        return run_id
+
+    @staticmethod
+    def _validate_implementation_loop_role(role: object) -> str:
+        if not isinstance(role, str) or role not in IMPLEMENTATION_LOOP_ROLES:
+            raise ValueError(
+                "implementation loop role must be one of: "
+                + ", ".join(sorted(IMPLEMENTATION_LOOP_ROLES))
+            )
+        return role
+
+    @staticmethod
+    def _validate_implementation_loop_item_id(item_id: object) -> str:
+        if not isinstance(item_id, str) or not PATH_SEGMENT_PATTERN.fullmatch(item_id):
+            raise ValueError("implementation loop item id must be a path-safe non-empty string")
+        return item_id
+
+    @staticmethod
+    def _validate_implementation_loop_iteration(iteration: object) -> int:
+        if isinstance(iteration, bool) or not isinstance(iteration, int) or not 0 <= iteration <= 9999:
+            raise ValueError("implementation loop iteration must be an integer between 0 and 9999")
+        return iteration
+
+    @classmethod
+    def implementation_loop_attempt_id(
+        cls,
+        run_id: str,
+        item_id: str,
+        iteration: int,
+        role: str,
+    ) -> str:
+        """Build the stable identity used for one item role attempt."""
+        validated_run_id = cls._validate_implementation_loop_run_id(run_id)
+        validated_item_id = cls._validate_implementation_loop_item_id(item_id)
+        validated_iteration = cls._validate_implementation_loop_iteration(iteration)
+        validated_role = cls._validate_implementation_loop_role(role)
+        return f"{validated_run_id}:{validated_item_id}:{validated_iteration:04d}:{validated_role}"
+
+    # Keep an explicit verb available to callers that use the helper as a
+    # constructor rather than as a value named after the loop itself.
+    make_implementation_loop_attempt_id = implementation_loop_attempt_id
+
     def build_implementation_loop_status(
         self,
         snapshot: WorkItemsSnapshot,
+        *,
+        run_id: str | None = None,
     ) -> dict[str, object]:
+        selected_run_id = self._validate_implementation_loop_run_id(
+            uuid.uuid4().hex if run_id is None else run_id
+        )
         return {
             "schema_version": IMPLEMENTATION_LOOP_STATUS_SCHEMA_VERSION,
-            "run_id": uuid.uuid4().hex,
+            "run_id": selected_run_id,
             "mode": "dry-run" if self.dry_run else "execute",
             "overall_status": "running",
             "current_item": None,
@@ -1340,6 +2508,11 @@ class WorkflowRunner:
                     "payload_sha256": item.payload_sha256,
                     "artifact_scope": f"work-items/{item.id}",
                     "status": "not_run",
+                    "reason": None,
+                    "current_role": None,
+                    "current_iteration": None,
+                    "attempt_id": None,
+                    "last_review_scope": None,
                     "error": None,
                 }
                 for item in snapshot.items
@@ -1362,6 +2535,12 @@ class WorkflowRunner:
         new_status: str,
         *,
         error: dict[str, str] | None = None,
+        reason: str | None = None,
+        role: str | None = None,
+        iteration: int | None = None,
+        run_id: str | None = None,
+        attempt_id: str | None = None,
+        last_review_scope: str | None = None,
     ) -> None:
         if new_status not in IMPLEMENTATION_LOOP_ITEM_STATUSES:
             raise ValueError(f"Unsupported implementation loop item status: {new_status}")
@@ -1371,10 +2550,15 @@ class WorkflowRunner:
         item = items[item_index]
         if not isinstance(item, dict):
             raise ValueError("Invalid implementation loop item record")
+        item_id = self._validate_implementation_loop_item_id(item.get("id"))
         current_status = item.get("status")
         allowed = {
             "not_run": {"running"},
-            "running": {"succeeded", "failed", "planned"},
+            # A work item remains running while the controller advances from
+            # coder to reviewer to fixer.  The role metadata below makes
+            # those same-status transitions observable and resumable by
+            # later workflow code.
+            "running": {"running", "succeeded", "failed", "planned"},
             "succeeded": set(),
             "failed": set(),
             "planned": set(),
@@ -1384,7 +2568,134 @@ class WorkflowRunner:
                 f"Invalid implementation loop item transition: "
                 f"{current_status} -> {new_status}"
             )
+
+        for field_name in (
+            "reason",
+            "current_role",
+            "current_iteration",
+            "attempt_id",
+            "last_review_scope",
+        ):
+            item.setdefault(field_name, None)
+
+        status_run_id = status.get("run_id")
+        if status_run_id is not None:
+            status_run_id = self._validate_implementation_loop_run_id(status_run_id)
+        if run_id is not None:
+            run_id = self._validate_implementation_loop_run_id(run_id)
+            if status_run_id is not None and run_id != status_run_id:
+                raise ValueError("implementation loop attempt run_id does not match status")
+        else:
+            run_id = status_run_id
+
+        if role is not None:
+            role = self._validate_implementation_loop_role(role)
+        if iteration is not None:
+            iteration = self._validate_implementation_loop_iteration(iteration)
+        if role is not None or iteration is not None:
+            if role is None or iteration is None:
+                raise ValueError("implementation loop role and iteration must be provided together")
+            if run_id is None:
+                raise ValueError("implementation loop role metadata requires a run_id")
+
+        if attempt_id is not None and (
+            not isinstance(attempt_id, str) or not attempt_id
+        ):
+            raise ValueError("implementation loop attempt_id must be a non-empty string")
+        if last_review_scope is not None:
+            if not isinstance(last_review_scope, str):
+                raise ValueError("implementation loop last_review_scope must be a string")
+            self._validate_relative_path_value(
+                last_review_scope,
+                "implementation loop last_review_scope",
+            )
+
+        if new_status == "running":
+            if reason is not None:
+                raise ValueError("running implementation loop items cannot have a terminal reason")
+            if role is not None and iteration is not None:
+                expected_attempt_id = self.implementation_loop_attempt_id(
+                    str(run_id),
+                    item_id,
+                    iteration,
+                    role,
+                )
+                if attempt_id is not None and attempt_id != expected_attempt_id:
+                    raise ValueError(
+                        "implementation loop attempt_id does not match role metadata"
+                    )
+                attempt_id = expected_attempt_id
+                item["current_role"] = role
+                item["current_iteration"] = iteration
+                item["attempt_id"] = attempt_id
+            elif attempt_id is not None:
+                raise ValueError(
+                    "implementation loop attempt_id requires role and iteration metadata"
+                )
+            item["status"] = new_status
+            item["reason"] = None
+            item["error"] = None
+            if last_review_scope is not None:
+                item["last_review_scope"] = last_review_scope
+            return
+
+        allowed_reasons = IMPLEMENTATION_LOOP_TERMINAL_REASON_BY_STATUS[new_status]
+        if reason is None:
+            # The pre-v5 item loop had no reviewer verdict to classify a
+            # successful coder-only item.  Preserve that legacy transition
+            # while requiring a reason whenever the v5 controller supplies
+            # one.  Planned and failed states always have an unambiguous
+            # default classification.
+            if new_status == "planned":
+                reason = "dry_run"
+            elif new_status == "failed":
+                reason = "execution_failed"
+        if reason is not None and reason not in allowed_reasons:
+            raise ValueError(
+                f"Unsupported implementation loop terminal reason for {new_status}: {reason}"
+            )
+        if new_status in {"succeeded", "planned"} and error is not None:
+            raise ValueError(
+                f"Implementation loop {new_status} transition cannot include an error"
+            )
+        if reason == "safety_limit_reached" and error is not None:
+            raise ValueError("safety_limit_reached must not include an execution error")
+        if reason in {"execution_failed", "invalid_review_output"} and error is None:
+            raise ValueError(f"{reason} requires a sanitized error")
+
+        effective_role = role
+        if effective_role is None and isinstance(item.get("current_role"), str):
+            effective_role = item["current_role"]
+        effective_iteration = iteration
+        if effective_iteration is None and isinstance(item.get("current_iteration"), int):
+            effective_iteration = item["current_iteration"]
+        if effective_role is not None or effective_iteration is not None:
+            if effective_role is None or effective_iteration is None:
+                raise ValueError(
+                    "implementation loop role and iteration metadata must be complete"
+                )
+            if run_id is None:
+                raise ValueError("implementation loop attempt metadata requires a run_id")
+            expected_attempt_id = self.implementation_loop_attempt_id(
+                str(run_id),
+                item_id,
+                effective_iteration,
+                effective_role,
+            )
+            if attempt_id is not None and attempt_id != expected_attempt_id:
+                raise ValueError(
+                    "implementation loop attempt_id does not match role metadata"
+                )
+            attempt_id = expected_attempt_id
+
         item["status"] = new_status
+        item["reason"] = reason
+        item["current_role"] = None
+        item["current_iteration"] = effective_iteration
+        if attempt_id is not None:
+            item["attempt_id"] = attempt_id
+        if last_review_scope is not None:
+            item["last_review_scope"] = last_review_scope
         item["error"] = error
 
     @staticmethod
@@ -1630,11 +2941,27 @@ class WorkflowRunner:
         result: StepExecutionResult,
     ) -> None:
         _ = result
-        self.evaluate_phase_outcome(
-            resolved.phase,
-            resolved.artifact_dir,
-            step_name=resolved.spec.name,
-        )
+        required_artifacts: tuple[str, ...] | None = None
+        if resolved.spec.name in {"implementation_coder", "implementation_fix"}:
+            required_artifacts = ("06-implementation-notes.md",)
+        elif resolved.spec.name == "implementation_reviewer":
+            # The reviewer result is loaded by the fixed controller after the
+            # lifecycle outcome.  Leaving it out here preserves the distinct
+            # invalid_review_output classification for a missing result.
+            required_artifacts = ()
+        if required_artifacts is None:
+            self.evaluate_phase_outcome(
+                resolved.phase,
+                resolved.artifact_dir,
+                step_name=resolved.spec.name,
+            )
+        else:
+            self.evaluate_phase_outcome(
+                resolved.phase,
+                resolved.artifact_dir,
+                step_name=resolved.spec.name,
+                required_artifacts=required_artifacts,
+            )
 
     def finalize_plan_comprehension_step(
         self,
@@ -1723,6 +3050,7 @@ class WorkflowRunner:
         phase: str,
         artifact_dir: Path,
         step_name: str | None = None,
+        required_artifacts: Iterable[str] | None = None,
     ) -> PhaseOutcome:
         path = self.phase_outcome_path(phase, artifact_dir, step_name=step_name)
         if not path.exists():
@@ -1732,7 +3060,11 @@ class WorkflowRunner:
             if not isinstance(raw, dict):
                 raise ValueError("phase outcome must be a JSON object")
             outcome = PhaseOutcome.from_dict(raw, expected_phase=phase)
-            validate_outcome_artifacts(artifact_dir, outcome)
+            validate_outcome_artifacts(
+                artifact_dir,
+                outcome,
+                required_artifacts=required_artifacts,
+            )
         except (json.JSONDecodeError, ValueError) as exc:
             raise SystemExit(f"Invalid phase outcome for '{phase}': {exc}") from exc
         evidence_digests = {
@@ -2299,10 +3631,20 @@ class WorkflowRunner:
             phase=resolved_phase,
             step_name=step.name,
         )
-        if step.prompt_file is not None:
+        # Role specs carry their factory defaults explicitly.  Keep configured
+        # phase/step overrides above those defaults, while retaining the
+        # historical rule that an arbitrary StepSpec value wins for all other
+        # steps.
+        role_default_prompt = IMPLEMENTATION_STEP_TO_PROMPT.get(step.name)
+        if step.prompt_file is not None and step.prompt_file != role_default_prompt:
             resolved.prompt_file = step.prompt_file
-        if step.skill_file is not None:
+        elif resolved.prompt_file is None:
+            resolved.prompt_file = role_default_prompt
+        role_default_skill = IMPLEMENTATION_STEP_TO_SKILL.get(step.name)
+        if step.skill_file is not None and step.skill_file != role_default_skill:
             resolved.skill_file = step.skill_file
+        elif resolved.skill_file is None:
+            resolved.skill_file = role_default_skill
         self.validate_runner_file_overrides(resolved)
         return resolved
 
@@ -2348,6 +3690,8 @@ class WorkflowRunner:
                 )
             if any(not isinstance(value, str) for value in context.values()):
                 raise ValueError("Virtual context values must be strings")
+            if "$review_findings" in context:
+                self._validate_review_findings_input(context["$review_findings"])
 
         providers: dict[str, Callable[[], str]] = {
             "$issue": self.read_issue_text,
@@ -2368,6 +3712,18 @@ class WorkflowRunner:
                         raise ValueError(
                             "Virtual input '$loop_item' requested but no loop item context is available."
                         )
+            elif selector == "$review_findings":
+                if context is None:
+                    raise ValueError(
+                        "Virtual input '$review_findings' requested but no explicit "
+                        "review findings context is available."
+                    )
+                value = context.get("$review_findings")
+                if value is None:
+                    raise ValueError(
+                        "Virtual input '$review_findings' requested but no review "
+                        "findings context is available."
+                    )
             elif selector in providers:
                 value = providers[selector]()
             else:
@@ -2375,17 +3731,38 @@ class WorkflowRunner:
             if not isinstance(value, str):
                 value = str(value)
             original_length = len(value)
-            is_complete_loop_item = selector == "$loop_item" and context is not None
-            truncated = False if is_complete_loop_item else original_length > MAX_VIRTUAL_INPUT_LENGTH
+            is_complete_context_input = (
+                selector in {"$loop_item", "$review_findings"}
+                and context is not None
+            )
+            truncated = (
+                False
+                if is_complete_context_input
+                else original_length > MAX_VIRTUAL_INPUT_LENGTH
+            )
             resolved.append(
                 ResolvedInput(
                     selector=selector,
-                    value=value if is_complete_loop_item else value[:MAX_VIRTUAL_INPUT_LENGTH],
+                    value=value if is_complete_context_input else value[:MAX_VIRTUAL_INPUT_LENGTH],
                     truncated=truncated,
                     original_length=original_length,
                 )
             )
         return tuple(resolved)
+
+    @staticmethod
+    def _validate_review_findings_input(value: str) -> None:
+        try:
+            value_bytes = value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                "Virtual input '$review_findings' must contain valid UTF-8 text"
+            ) from exc
+        if len(value_bytes) > MAX_REVIEW_FINDINGS_INPUT_BYTES:
+            raise ValueError(
+                "Virtual input '$review_findings' exceeds "
+                f"{MAX_REVIEW_FINDINGS_INPUT_BYTES} UTF-8 bytes"
+            )
 
     def resolve_virtual_inputs(
         self,

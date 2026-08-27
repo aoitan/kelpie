@@ -25,6 +25,20 @@
         "review_fix_loop": {
           "command_template": ["codex", "exec", "--model", "gpt-5.6-sol", "--dangerously-bypass-approvals-and-sandbox", "-"]
         }
+      },
+      "step_overrides": {
+        "implementation_coder": {
+          "prompt_file": "prompts/06_implementation_coder.md",
+          "skill_file": "skills/implementation-coder/SKILL.md"
+        },
+        "implementation_reviewer": {
+          "prompt_file": "prompts/06_implementation_reviewer.md",
+          "skill_file": "skills/implementation-reviewer/SKILL.md"
+        },
+        "implementation_fix": {
+          "prompt_file": "prompts/06_implementation_fix.md",
+          "skill_file": "skills/implementation-fixer/SKILL.md"
+        }
       }
     },
     "copilot": {
