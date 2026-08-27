@@ -51,6 +51,9 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 │   ├── 04_solution_design.md
 │   ├── 05_work_breakdown.md
 │   ├── 06_implementation.md
+│   ├── 06_implementation_coder.md
+│   ├── 06_implementation_fix.md
+│   ├── 06_implementation_reviewer.md
 │   ├── 07_review_fix_loop.md
 │   └── 08_pull_request.md
 ├── scripts/
@@ -62,6 +65,9 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 │   └── run_issue_workflow_in_container.sh
 └── skills/
     ├── implementation/
+    ├── implementation-coder/
+    ├── implementation-fixer/
+    ├── implementation-reviewer/
     ├── prototype-planning/
     ├── prototyping/
     ├── pull-request/
@@ -111,6 +117,54 @@ resultを `plan-check/iterations/NNNN/attempts/` に保存します。retry後�
 各工程は`advance` / `pause` / `fail` / `complete`の構造化outcomeを出力します。
 hookやCLIの非0終了は運用障害、`pause`は工程固有の判断・入力待ちとして区別されます。
 機械checkの失敗をLLMの`advance`で上書きすることはできません。
+
+### implementation item loop (v5)
+
+`implementation` phase の `work_items.json` は、itemごとに固定された
+`coder -> reviewer(0000)` を実行します。reviewer が `findings_present` を返したときだけ
+`fix(0001) -> reviewer(0001)` を追加で実行し、再reviewが `no_findings` なら `fixed` として完了します。
+fixの回数は1回に固定され、再reviewにもfindingが残る場合は成功にせず
+`failed / safety_limit_reached` で停止します。itemの失敗は従来どおりfail-fastで、後続itemは
+`not_run` のままです。
+
+各潜在stepの入力・出力とartifact scopeは次のとおりです。
+
+| step | iteration | scope | inputs | output |
+|---|---:|---|---|---|
+| `implementation_coder` | `0000` | `work-items/<item-id>/iterations/0000/coder/` | `$loop_item` | `06-implementation-notes.md` |
+| `implementation_reviewer` | `0000` | `work-items/<item-id>/iterations/0000/reviewer/` | `$loop_item` | `review-result.json` |
+| `implementation_fix` | `0001` | `work-items/<item-id>/iterations/0001/fix/` | `$loop_item`, `$review_findings` | `06-implementation-notes.md` |
+| `implementation_reviewer` | `0001` | `work-items/<item-id>/iterations/0001/reviewer/` | `$loop_item` | `review-result.json` |
+
+`review-result.json` は phase outcome と分離された v5 の最小契約です。
+top-level field は次の3つだけで、未知field・重複ID・不正JSON・symlinkや特殊ファイルの出力は
+fail-closedで `invalid_review_output` になります。
+
+```json
+{
+  "schema_version": "1.0",
+  "status": "findings_present",
+  "findings": [
+    {"id": "F-001", "description": "具体的な修正要求"}
+  ]
+}
+```
+
+`status=no_findings` は空配列、`status=findings_present` は1件以上を要求します。
+review fileは256 KiB以下、findingは100件以下、idは128 UTF-8 bytes以下、descriptionは8192 bytes以下、
+fixへ渡すcanonicalな `$review_findings` は128 KiB以下です。controllerはreviewer実行直前に固定出力を
+不在確認し、正常終了後に一度だけ検証・読み込みます。CLI / hook / check / phase outcomeの失敗は
+`execution_failed` として扱い、review findingや不正出力に丸めません。
+
+loop全体の `implementation-loop-status.json` は schema `2.0` で、各itemの
+`reason`、`current_role`、`current_iteration`、`attempt_id`、`last_review_scope` を記録します。
+terminal reasonは `no_findings`、`fixed`、`execution_failed`、`invalid_review_output`、
+`safety_limit_reached`、`dry_run` に限定されます。`$review_findings` はcontrollerが明示的に渡した
+canonical dataだけを解決し、環境変数fallbackはありません。
+
+`--dry-run` ではreview結果を推測せず、4つの潜在stepのprompt・intent・checkを各scopeへ作り、item / loopを
+`planned / dry_run` として記録します。汎用workflow configやloop DSL、可変反復、時間・token budget、
+自動resume、human gate、Epic #10の完全なreview schemaはこの固定subpipelineの対象外です。
 
 ### 固定評価ループ
 
@@ -599,6 +653,20 @@ python3 scripts/run_issue_workflow.py \
         "review_fix_loop": {
           "command_template": ["codex", "exec", "--model", "gpt-5.6-sol", "--full-auto", "-"]
         }
+      },
+      "step_overrides": {
+        "implementation_coder": {
+          "prompt_file": "prompts/06_implementation_coder.md",
+          "skill_file": "skills/implementation-coder/SKILL.md"
+        },
+        "implementation_reviewer": {
+          "prompt_file": "prompts/06_implementation_reviewer.md",
+          "skill_file": "skills/implementation-reviewer/SKILL.md"
+        },
+        "implementation_fix": {
+          "prompt_file": "prompts/06_implementation_fix.md",
+          "skill_file": "skills/implementation-fixer/SKILL.md"
+        }
       }
     },
     "copilot": {
@@ -639,13 +707,17 @@ plan dataはstdinで渡します。
 - `file`
   prompt ファイルを自前オプションで読む CLI 向けです。`{prompt_file}` を `command_template` に埋め込めます。
 
-各 runner には省略可能な `phase_overrides` を追加できます。override 対象は `command_template`、`prompt_mode`、`prompt_file`、`skill_file` です。
+各 runner には省略可能な `phase_overrides` と `step_overrides` を追加できます。override 対象は `command_template`、`prompt_mode`、`prompt_file`、`skill_file` です。
 
 - `phase_overrides` がない場合は runner 直下の設定を使います。
 - 対象 phase に override がない場合も runner 直下の設定を使います。
 - `phase_overrides.<phase>` には `command_template`、`prompt_mode`、`prompt_file`、`skill_file` を書けます。その他の key は設定読み込み時にエラーになります。
 - phase key は `prototype_planning` のような underscore 形式を推奨します。`review-fix-loop` のような hyphen 形式も受け付けますが、未知 phase は設定読み込み時にエラーになります。
 - 解決順序は base 値を読み、その後 `phase_overrides.<phase>` の各フィールドがあれば個別に上書きします。`prompt_file` と `skill_file` を指定すると、そのフェーズのデフォルトプロンプト/スキルファイルを置き換えられます。
+- `step_overrides.<step>` は `plan_refinement`、`implementation_coder`、`implementation_reviewer`、`implementation_fix` を受け付けます。stepごとの command、prompt mode、prompt、skillを phase と独立して上書きできます。
+- 解決順序は base → phase override → step override です。implementation roleのprompt/skillを未指定にした場合は、role固有の同梱assetが使われ、汎用 `implementation` assetへ暗黙fallbackしません。
+- implementation roleの `StepSpec.runner_name` に登録済みrunner名を指定すると、coder / reviewer / fixを別runnerへ分けられます。未指定なら `--runner` で選んだrunnerを使います。
+- 既存の `run_phase()` と `plan_refinement` の解決規則は変わりません。step overrideの未知keyや未知stepは設定読み込み時にエラーになります。
 
 使える埋め込み値は次です。
 
@@ -709,6 +781,13 @@ CLI ごとに自動で読む instruction file 名が異なることと、対象�
             .issue-cache/
             checks/
             intent-records/
+            implementation-loop-status.json  # implementation item loop, schema 2.0
+            work_items.json
+            work-items/<item-id>/iterations/
+              0000/coder/
+              0000/reviewer/
+              0001/fix/
+              0001/reviewer/
     file/
       local/
         issue-xx/

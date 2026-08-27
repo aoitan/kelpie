@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
 
 
 DECISIONS = {"advance", "pause", "fail", "complete"}
@@ -218,9 +219,19 @@ def safe_artifact_path(artifact_root: Path, relative_path: str) -> Path:
     return path
 
 
-def validate_outcome_artifacts(artifact_root: Path, outcome: PhaseOutcome) -> None:
+def validate_outcome_artifacts(
+    artifact_root: Path,
+    outcome: PhaseOutcome,
+    *,
+    required_artifacts: Iterable[str] | None = None,
+) -> None:
     if outcome.decision != "fail":
-        for relative_path in PHASE_REQUIRED_ARTIFACTS[outcome.phase]:
+        required = (
+            PHASE_REQUIRED_ARTIFACTS[outcome.phase]
+            if required_artifacts is None
+            else tuple(required_artifacts)
+        )
+        for relative_path in required:
             path = safe_artifact_path(artifact_root, relative_path)
             if not path.is_file():
                 raise ValueError(
