@@ -740,6 +740,7 @@ class WorkflowHookExecutionTests(unittest.TestCase):
         self.assertFalse(mock_check.call_args.kwargs["allow_external_send"])
         self.assertEqual(state["status"], "running")
         self.assertEqual(state["reason_code"], "advisory_check_unavailable")
+        self.assertIsNone(state["resume_condition"])
         self.assertEqual(state["plan_check_policy"], "advisory")
         print_mock.assert_any_call(
             "Warning: plan comprehension external send was not permitted; advancing "
