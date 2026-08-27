@@ -240,7 +240,11 @@ install.bat
 - Node.js 22
 - `uv`
 - Poetry 2.2.0
-- Rust 1.85 / Cargo / rustfmt
+- Rust 1.88.0 / Cargo / rustfmt / Clippy
+- llm-veil の full design lint 用 Cargo CLI
+  - `cargo-deny` 0.20.2
+  - `cargo-machete` 0.9.2
+  - `cargo-modules` 0.25.0
 - Java 21
 - Swift 6.2.4 / SourceKitten 0.37.3（project-analyzer-mcp の Swift 連携テスト用）
 - Kotlin/Gradle、音声解析、ネイティブ拡張向けのビルド依存
