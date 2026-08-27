@@ -1314,7 +1314,7 @@ class WorkflowRunner:
                 os.close(descriptor)
             try:
                 lock_path.unlink()
-            except FileNotFoundError:
+            except OSError:
                 pass
 
     def build_implementation_loop_status(
@@ -1699,7 +1699,10 @@ class WorkflowRunner:
                 directory_fd = None
             if directory_fd is not None:
                 try:
-                    os.fsync(directory_fd)
+                    try:
+                        os.fsync(directory_fd)
+                    except OSError:
+                        pass
                 finally:
                     os.close(directory_fd)
         finally:
