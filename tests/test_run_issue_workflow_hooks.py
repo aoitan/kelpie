@@ -778,7 +778,7 @@ class WorkflowHookExecutionTests(unittest.TestCase):
         self.assertEqual(state["reason_code"], "plan_check_waived")
         self.assertEqual(state["plan_check_policy"], "required")
 
-    def test_plan_comprehension_without_external_opt_in_does_not_require_agy(self) -> None:
+    def test_advisory_plan_comprehension_without_external_opt_in_advances_with_warning(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmpdir:
             workdir = Path(tmpdir) / "target-repo"
@@ -802,6 +802,55 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 else:
                     os.environ["KELPIE_CONFIG_HOME"] = old_config_home
 
+            with (
+                patch(
+                    "scripts.run_issue_workflow.run_plan_check",
+                    return_value={"status": "approval_required"},
+                ) as mock_check,
+                patch("builtins.print") as print_mock,
+            ):
+                runner.plan_comprehension_check()
+
+            state = json.loads(
+                (runner.artifact_dir / "workflow-state.json").read_text(encoding="utf-8")
+            )
+
+        mock_check.assert_called_once()
+        self.assertFalse(mock_check.call_args.kwargs["allow_external_send"])
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["reason_code"], "advisory_check_unavailable")
+        self.assertIsNone(state["resume_condition"])
+        self.assertEqual(state["plan_check_policy"], "advisory")
+        print_mock.assert_any_call(
+            "Warning: plan comprehension external send was not permitted; advancing "
+            "without treating the probe as a no-findings signal."
+        )
+
+    def test_required_plan_comprehension_without_external_opt_in_pauses(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "target-repo"
+            workdir.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="custom", command_template=["custom-cli"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="required-plan-check-no-send",
+                    dry_run=False,
+                    plan_check_required=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
             with patch(
                 "scripts.run_issue_workflow.run_plan_check",
                 return_value={"status": "approval_required"},
@@ -809,8 +858,21 @@ class WorkflowHookExecutionTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "approval_required"):
                     runner.plan_comprehension_check()
 
+            state = json.loads(
+                (runner.artifact_dir / "workflow-state.json").read_text(encoding="utf-8")
+            )
+            outcome = json.loads(
+                (runner.artifact_dir / state["outcome_path"]).read_text(encoding="utf-8")
+            )
+
         mock_check.assert_called_once()
         self.assertFalse(mock_check.call_args.kwargs["allow_external_send"])
+        self.assertEqual(state["status"], "paused")
+        self.assertEqual(state["reason_code"], "external_send_approval_required")
+        self.assertEqual(outcome["decision"], "pause")
+        self.assertEqual(outcome["reason_code"], "external_send_approval_required")
+        self.assertIn("external plan-check send was not permitted", outcome["summary"])
+        self.assertIn("Allow", outcome["resume_condition"])
 
     def test_run_phase_delegates_to_run_step(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

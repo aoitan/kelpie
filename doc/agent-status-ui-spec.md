@@ -190,8 +190,9 @@ terminal な `success`、`error` と、人間待ちの `waiting` は時間経過
 plan comprehension checkでは、`unresolved_findings`を計画内容の判断待ち、
 `invalid_output`をrequiredなprobeプロトコル失敗として別表示する。前者はfindingの
 解消・承認を、後者はprobeのretryまたは明示的なwaiveをresume条件とする。optionalな
-probeのschema-invalidは`advisory_check_unavailable`としてadvanceし、no-findingsとは
-表示しない。
+probeのschema-invalidや外部送信不可は`advisory_check_unavailable`としてadvanceし、
+no-findingsとは表示しない。requiredなprobeで外部送信が許可されていない場合は
+`external_send_approval_required`として停止する。
 
 既存 `PhaseOutcome` の reason code と resume condition はこの原則をほぼ満たしている。
 
