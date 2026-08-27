@@ -1829,16 +1829,23 @@ class WorkflowRunner:
                     "Warning: advisory check unavailable; advancing without treating the probe "
                     "as a no-findings signal."
                 )
-        elif status == "approval_required" and not self.plan_check_required:
-            summary = (
-                "Plan comprehension advisory was unavailable because external plan-check send "
-                "was not permitted; the workflow advanced without treating the probe as a "
-                "no-findings signal."
-            )
-            print(
-                "Warning: plan comprehension external send was not permitted; advancing "
-                "without treating the probe as a no-findings signal."
-            )
+        elif status == "approval_required":
+            if self.plan_check_required:
+                summary = (
+                    "Plan comprehension stopped because external plan-check send was not "
+                    "permitted; allow external send or explicitly waive the required check "
+                    "before continuing."
+                )
+            else:
+                summary = (
+                    "Plan comprehension advisory was unavailable because external plan-check send "
+                    "was not permitted; the workflow advanced without treating the probe as a "
+                    "no-findings signal."
+                )
+                print(
+                    "Warning: plan comprehension external send was not permitted; advancing "
+                    "without treating the probe as a no-findings signal."
+                )
         outcome = PhaseOutcome(
             schema_version="1.0",
             phase="plan_comprehension_check",

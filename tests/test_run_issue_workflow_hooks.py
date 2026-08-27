@@ -791,6 +791,7 @@ class WorkflowHookExecutionTests(unittest.TestCase):
         self.assertEqual(state["reason_code"], "external_send_approval_required")
         self.assertEqual(outcome["decision"], "pause")
         self.assertEqual(outcome["reason_code"], "external_send_approval_required")
+        self.assertIn("external plan-check send was not permitted", outcome["summary"])
         self.assertIn("Allow", outcome["resume_condition"])
 
     def test_run_phase_delegates_to_run_step(self) -> None:
