@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 from html import escape
 import json
 import os
@@ -12,9 +13,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
 
 try:
@@ -724,6 +727,17 @@ class HookConfig:
 
 VIRTUAL_INPUT_TOKENS = frozenset({"$issue", "$repo_instructions", "$loop_item"})
 MAX_VIRTUAL_INPUT_LENGTH = 2000
+MAX_IMPLEMENTATION_LOOP_SOURCE_BYTES = 1024 * 1024
+MAX_IMPLEMENTATION_LOOP_ITEMS = 100
+MAX_IMPLEMENTATION_LOOP_ITEM_BYTES = 64 * 1024
+IMPLEMENTATION_LOOP_STATUS_SCHEMA_VERSION = "1.0"
+IMPLEMENTATION_LOOP_ITEM_STATUSES = frozenset({
+    "not_run",
+    "running",
+    "succeeded",
+    "failed",
+    "planned",
+})
 STEP_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 PATH_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SUPPORTED_STEP_POST_ACTIONS = frozenset({"write_work_items_artifact"})
@@ -779,19 +793,56 @@ class StepExecutionResult:
     plan_result: dict[str, object] | None = None
 
 
+@dataclass(frozen=True)
+class WorkItemSnapshot:
+    """Immutable execution input for one implementation item."""
+
+    id: str
+    position: int
+    payload: Mapping[str, object]
+    canonical_json: str
+    payload_sha256: str
+
+
+@dataclass(frozen=True)
+class WorkItemsSnapshot:
+    """One-read, validated snapshot of the implementation work-items file."""
+
+    source_path: Path
+    source_sha256: str
+    items: tuple[WorkItemSnapshot, ...]
+
+
+def freeze_json_value(value: object) -> object:
+    """Recursively freeze JSON data held by a work-item snapshot."""
+    if isinstance(value, dict):
+        return MappingProxyType({key: freeze_json_value(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(freeze_json_value(item) for item in value)
+    return value
+
+
 class StepResolver:
     """Resolve step metadata before the execution lifecycle creates artifacts."""
 
     def __init__(self, workflow: "WorkflowRunner") -> None:
         self.workflow = workflow
 
-    def resolve(self, step: StepSpec) -> ResolvedStep:
+    def resolve(
+        self,
+        step: StepSpec,
+        *,
+        virtual_context: Mapping[str, str] | None = None,
+    ) -> ResolvedStep:
         phase = self.workflow.validate_step_spec(step)
         runner = self.workflow.resolve_runner_for_step(step, phase=phase)
         artifact_dir = self.workflow.resolve_artifact_scope(step)
         prompt_path = artifact_dir / ".generated-prompts" / f"{step.name}.prompt.md"
         self.workflow.validate_prompt_cache_path(prompt_path)
-        inputs = self.workflow.resolve_step_inputs(step.inputs or [])
+        inputs = self.workflow.resolve_step_inputs(
+            step.inputs or [],
+            virtual_context=virtual_context,
+        )
 
         prompt_text = self.workflow.compose_phase_prompt(
             phase,
@@ -1064,7 +1115,7 @@ class WorkflowRunner:
         self.run_phase("plan_comprehension_check")
 
     def implementation(self) -> None:
-        self.run_phase("implementation")
+        self.run_implementation_items()
 
     def review_fix_loop(self) -> None:
         self.run_phase("review_fix_loop")
@@ -1074,6 +1125,305 @@ class WorkflowRunner:
 
     def run_phase(self, phase: str) -> None:
         self.run_step(self.build_step_spec_for_phase(phase))
+
+    def run_implementation_items(self) -> None:
+        """Run implementation once for each validated work item in input order."""
+        with self.implementation_loop_lock():
+            snapshot = self.load_implementation_items_snapshot()
+            status = self.build_implementation_loop_status(snapshot)
+            self.write_implementation_loop_status(status)
+
+            for item in snapshot.items:
+                self.transition_implementation_loop_item(status, item.position, "running")
+                status["current_item"] = item.id
+                self.write_implementation_loop_status(status)
+
+                step = StepSpec(
+                    name="implementation_coding",
+                    phase="implementation",
+                    inputs=["$loop_item"],
+                    context_id="work-items",
+                    artifact_subdir=item.id,
+                )
+                try:
+                    self.run_step(
+                        step,
+                        virtual_context={"$loop_item": item.canonical_json},
+                    )
+                except BaseException as exc:
+                    self.transition_implementation_loop_item(
+                        status,
+                        item.position,
+                        "failed",
+                        error=self.sanitize_implementation_loop_error(exc),
+                    )
+                    self.transition_implementation_loop_overall(status, "failed")
+                    try:
+                        self.write_implementation_loop_status(status)
+                    except BaseException as recording_error:
+                        self.note_secondary_implementation_loop_error(exc, recording_error)
+                    raise
+
+                terminal_status = "planned" if self.dry_run else "succeeded"
+                self.transition_implementation_loop_item(status, item.position, terminal_status)
+                status["current_item"] = None
+                self.write_implementation_loop_status(status)
+
+            self.transition_implementation_loop_overall(
+                status,
+                "planned" if self.dry_run else "succeeded",
+            )
+            status["current_item"] = None
+            self.write_implementation_loop_status(status)
+
+    def load_implementation_items_snapshot(self) -> WorkItemsSnapshot:
+        """Read, validate, and freeze work_items.json without creating scopes."""
+        source_path = self.work_items_json_path()
+        self._assert_artifact_path_contained(source_path)
+        self._reject_symlink_components(self.artifact_dir, source_path)
+        if not source_path.is_file():
+            raise ValueError(f"Missing implementation work items: {source_path.relative_to(self.workdir)}")
+
+        source_bytes = source_path.read_bytes()
+        if len(source_bytes) > MAX_IMPLEMENTATION_LOOP_SOURCE_BYTES:
+            raise ValueError(
+                "Implementation work_items.json exceeds the "
+                f"{MAX_IMPLEMENTATION_LOOP_SOURCE_BYTES}-byte limit"
+            )
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        try:
+            source_text = source_bytes.decode("utf-8")
+            payload = json.loads(source_text)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid implementation work_items.json: {exc}") from exc
+
+        validation_error = validate_work_items_payload(payload)
+        if validation_error is not None:
+            raise ValueError(f"Invalid implementation work_items.json: {validation_error}")
+
+        assert isinstance(payload, dict)
+        tasks = payload["tasks"]
+        assert isinstance(tasks, list)
+        if len(tasks) > MAX_IMPLEMENTATION_LOOP_ITEMS:
+            raise ValueError(
+                "Implementation work_items.json contains more than "
+                f"{MAX_IMPLEMENTATION_LOOP_ITEMS} tasks"
+            )
+
+        status_path = self.implementation_loop_status_path()
+        self._assert_artifact_path_contained(status_path)
+        self._reject_symlink_components(self.artifact_dir, status_path)
+        if status_path.exists():
+            raise RuntimeError(
+                "Implementation loop already has a status artifact: "
+                f"{status_path.relative_to(self.workdir)}"
+            )
+
+        work_items_root = self.artifact_dir / "work-items"
+        self._assert_artifact_path_contained(work_items_root)
+        self._reject_symlink_components(self.artifact_dir, work_items_root)
+        if work_items_root.exists() and not work_items_root.is_dir():
+            raise RuntimeError(
+                "Implementation work item artifact root is not a directory: "
+                f"{work_items_root.relative_to(self.workdir)}"
+            )
+
+        seen_ids: set[str] = set()
+        snapshots: list[WorkItemSnapshot] = []
+        for position, task in enumerate(tasks):
+            assert isinstance(task, dict)
+            item_id = task["id"]
+            assert isinstance(item_id, str)
+            self._validate_relative_path_value(
+                item_id,
+                "implementation work item id",
+                single_segment=True,
+            )
+            if item_id in seen_ids:
+                raise ValueError(f"Duplicate implementation work item id: {item_id}")
+            seen_ids.add(item_id)
+
+            canonical_json = json.dumps(
+                task,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            canonical_bytes = canonical_json.encode("utf-8")
+            if len(canonical_bytes) > MAX_IMPLEMENTATION_LOOP_ITEM_BYTES:
+                raise ValueError(
+                    f"Implementation work item '{item_id}' exceeds the "
+                    f"{MAX_IMPLEMENTATION_LOOP_ITEM_BYTES}-byte limit"
+                )
+
+            item_scope = self.artifact_dir / "work-items" / item_id
+            self._assert_artifact_path_contained(item_scope)
+            self._reject_symlink_components(self.artifact_dir, item_scope)
+            if item_scope.exists():
+                raise RuntimeError(
+                    "Implementation work item artifact scope already exists: "
+                    f"{item_scope.relative_to(self.workdir)}"
+                )
+
+            frozen_payload = freeze_json_value(task)
+            assert isinstance(frozen_payload, Mapping)
+            snapshots.append(
+                WorkItemSnapshot(
+                    id=item_id,
+                    position=position,
+                    payload=frozen_payload,
+                    canonical_json=canonical_json,
+                    payload_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
+                )
+            )
+
+        return WorkItemsSnapshot(
+            source_path=source_path,
+            source_sha256=source_sha256,
+            items=tuple(snapshots),
+        )
+
+    def implementation_loop_status_path(self) -> Path:
+        return self.artifact_dir / "implementation-loop-status.json"
+
+    def implementation_loop_lock_path(self) -> Path:
+        return self.artifact_dir / ".implementation-loop.lock"
+
+    @contextmanager
+    def implementation_loop_lock(self) -> Iterable[None]:
+        """Hold the implementation loop lock without removing stale locks."""
+        lock_path = self.implementation_loop_lock_path()
+        self._assert_artifact_path_contained(lock_path)
+        self._reject_symlink_components(self.artifact_dir, lock_path)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exc:
+            raise RuntimeError(
+                "Implementation loop is already locked: "
+                f"{lock_path.relative_to(self.workdir)}"
+            ) from exc
+
+        try:
+            os.write(descriptor, f"pid={os.getpid()}\n".encode("utf-8"))
+            os.close(descriptor)
+            descriptor = None
+            yield
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+
+    def build_implementation_loop_status(
+        self,
+        snapshot: WorkItemsSnapshot,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": IMPLEMENTATION_LOOP_STATUS_SCHEMA_VERSION,
+            "run_id": uuid.uuid4().hex,
+            "mode": "dry-run" if self.dry_run else "execute",
+            "overall_status": "running",
+            "current_item": None,
+            "source": {
+                "path": str(snapshot.source_path.relative_to(self.artifact_dir)),
+                "sha256": snapshot.source_sha256,
+                "item_count": len(snapshot.items),
+            },
+            "order": [item.id for item in snapshot.items],
+            "items": [
+                {
+                    "id": item.id,
+                    "position": item.position,
+                    "payload_sha256": item.payload_sha256,
+                    "artifact_scope": f"work-items/{item.id}",
+                    "status": "not_run",
+                    "error": None,
+                }
+                for item in snapshot.items
+            ],
+        }
+
+    def write_implementation_loop_status(self, status: Mapping[str, object]) -> None:
+        path = self.implementation_loop_status_path()
+        self._assert_artifact_path_contained(path)
+        self._reject_symlink_components(self.artifact_dir, path)
+        self.atomic_write_text(
+            path,
+            json.dumps(status, indent=2, ensure_ascii=False) + "\n",
+        )
+
+    def transition_implementation_loop_item(
+        self,
+        status: dict[str, object],
+        item_index: int,
+        new_status: str,
+        *,
+        error: dict[str, str] | None = None,
+    ) -> None:
+        if new_status not in IMPLEMENTATION_LOOP_ITEM_STATUSES:
+            raise ValueError(f"Unsupported implementation loop item status: {new_status}")
+        items = status.get("items")
+        if not isinstance(items, list) or not 0 <= item_index < len(items):
+            raise ValueError("Invalid implementation loop item index")
+        item = items[item_index]
+        if not isinstance(item, dict):
+            raise ValueError("Invalid implementation loop item record")
+        current_status = item.get("status")
+        allowed = {
+            "not_run": {"running"},
+            "running": {"succeeded", "failed", "planned"},
+            "succeeded": set(),
+            "failed": set(),
+            "planned": set(),
+        }
+        if new_status not in allowed.get(current_status, set()):
+            raise ValueError(
+                f"Invalid implementation loop item transition: "
+                f"{current_status} -> {new_status}"
+            )
+        item["status"] = new_status
+        item["error"] = error
+
+    @staticmethod
+    def transition_implementation_loop_overall(
+        status: dict[str, object],
+        new_status: str,
+    ) -> None:
+        if new_status not in {"succeeded", "failed", "planned"}:
+            raise ValueError(f"Unsupported implementation loop overall status: {new_status}")
+        current_status = status.get("overall_status")
+        if current_status != "running":
+            raise ValueError(
+                f"Invalid implementation loop overall transition: "
+                f"{current_status} -> {new_status}"
+            )
+        status["overall_status"] = new_status
+
+    @staticmethod
+    def sanitize_implementation_loop_error(exc: BaseException) -> dict[str, str]:
+        message = str(exc).strip() or type(exc).__name__
+        return {
+            "type": type(exc).__name__,
+            "message": message[:512],
+        }
+
+    @staticmethod
+    def note_secondary_implementation_loop_error(
+        primary: BaseException,
+        secondary: BaseException,
+    ) -> None:
+        message = (
+            "implementation loop status recording failed after primary error: "
+            f"{type(secondary).__name__}: {str(secondary).strip() or type(secondary).__name__}"
+        )
+        try:
+            primary.add_note(message)
+        except Exception:
+            pass
+        print(message, file=sys.stderr)
 
     def run_single_change(self, request: SingleChangeRequest) -> IterationResult:
         """Execute exactly one opt-in single-change iteration.
@@ -1204,9 +1554,18 @@ class WorkflowRunner:
     run_convergence_loop = run_convergence
     converge = run_convergence
 
-    def run_step(self, step: StepSpec) -> None:
+    def run_step(
+        self,
+        step: StepSpec,
+        *,
+        virtual_context: Mapping[str, str] | None = None,
+    ) -> None:
         print(f"\n=== Running step: {step.name} ===")
-        resolved = self.step_resolver.resolve(step)
+        resolved_context = None if virtual_context is None else dict(virtual_context)
+        resolved = self.step_resolver.resolve(
+            step,
+            virtual_context=resolved_context,
+        )
         executor = self.step_executors.get(resolved.executor_key)
         outcome_handler = self.step_outcome_handlers.get(resolved.executor_key)
         if executor is None or outcome_handler is None:
@@ -1334,6 +1693,18 @@ class WorkflowRunner:
                 temporary_path = Path(temporary.name)
             os.replace(temporary_path, path)
             temporary_path = None
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+            except OSError:
+                directory_fd = None
+            if directory_fd is not None:
+                try:
+                    try:
+                        os.fsync(directory_fd)
+                    except OSError:
+                        pass
+                finally:
+                    os.close(directory_fd)
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
@@ -1958,9 +2329,26 @@ class WorkflowRunner:
             if self._path_has_symlink(canonical_root, candidate):
                 raise ValueError(f"Invalid {field_name}: symlinked files are not allowed")
 
-    def resolve_step_inputs(self, inputs: list[str]) -> tuple[ResolvedInput, ...]:
+    def resolve_step_inputs(
+        self,
+        inputs: list[str],
+        *,
+        virtual_context: Mapping[str, str] | None = None,
+    ) -> tuple[ResolvedInput, ...]:
         self._validate_input_selectors(inputs)
-        loop_item = os.environ.get("KELPIE_LOOP_ITEM")
+        context = None if virtual_context is None else dict(virtual_context)
+        if context is not None:
+            if any(not isinstance(key, str) for key in context):
+                raise ValueError("Virtual context keys must be strings")
+            unsupported_keys = set(context) - VIRTUAL_INPUT_TOKENS
+            if unsupported_keys:
+                raise ValueError(
+                    "Unsupported virtual context keys: "
+                    + ", ".join(sorted(unsupported_keys))
+                )
+            if any(not isinstance(value, str) for value in context.values()):
+                raise ValueError("Virtual context values must be strings")
+
         providers: dict[str, Callable[[], str]] = {
             "$issue": self.read_issue_text,
             "$repo_instructions": self.render_instruction_file_notes,
@@ -1968,11 +2356,18 @@ class WorkflowRunner:
         resolved: list[ResolvedInput] = []
         for selector in inputs:
             if selector == "$loop_item":
-                if loop_item is None:
-                    raise ValueError(
-                        "Virtual input '$loop_item' requested but no loop item context is available."
-                    )
-                value = loop_item
+                if context is None:
+                    value = os.environ.get("KELPIE_LOOP_ITEM")
+                    if value is None:
+                        raise ValueError(
+                            "Virtual input '$loop_item' requested but no loop item context is available."
+                        )
+                else:
+                    value = context.get("$loop_item")
+                    if value is None:
+                        raise ValueError(
+                            "Virtual input '$loop_item' requested but no loop item context is available."
+                        )
             elif selector in providers:
                 value = providers[selector]()
             else:
@@ -1980,22 +2375,28 @@ class WorkflowRunner:
             if not isinstance(value, str):
                 value = str(value)
             original_length = len(value)
-            truncated = original_length > MAX_VIRTUAL_INPUT_LENGTH
+            is_complete_loop_item = selector == "$loop_item" and context is not None
+            truncated = False if is_complete_loop_item else original_length > MAX_VIRTUAL_INPUT_LENGTH
             resolved.append(
                 ResolvedInput(
                     selector=selector,
-                    value=value[:MAX_VIRTUAL_INPUT_LENGTH],
+                    value=value if is_complete_loop_item else value[:MAX_VIRTUAL_INPUT_LENGTH],
                     truncated=truncated,
                     original_length=original_length,
                 )
             )
         return tuple(resolved)
 
-    def resolve_virtual_inputs(self, inputs: list[str]) -> dict[str, str]:
+    def resolve_virtual_inputs(
+        self,
+        inputs: list[str],
+        *,
+        virtual_context: Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
         """Compatibility view of resolved inputs for existing callers."""
         return {
             item.selector: item.value
-            for item in self.resolve_step_inputs(inputs)
+            for item in self.resolve_step_inputs(inputs, virtual_context=virtual_context)
         }
 
     def render_resolved_inputs(
@@ -2458,15 +2859,19 @@ Phase outcome path rules:
         phase_order = {name: i for i, name in enumerate(PHASES)}
         current_index = phase_order[phase]
         effective_artifact_dir = artifact_dir or self.artifact_dir
+        artifact_sources = [self.artifact_dir]
+        if effective_artifact_dir != self.artifact_dir:
+            artifact_sources.append(effective_artifact_dir)
         contents: list[str] = []
         for i, prior_phase in enumerate(PHASES):
             if i >= current_index:
                 break
-            artifact_files = sorted(effective_artifact_dir.glob(f"*{self.phase_prefix(prior_phase)}*"))
-            for file in artifact_files:
-                if file.is_file():
-                    body = file.read_text(encoding="utf-8", errors="replace")
-                    contents.append(f"## {file.name}\n\n{body}")
+            for source_dir in artifact_sources:
+                artifact_files = sorted(source_dir.glob(f"*{self.phase_prefix(prior_phase)}*"))
+                for file in artifact_files:
+                    if file.is_file():
+                        body = file.read_text(encoding="utf-8", errors="replace")
+                        contents.append(f"## {file.name}\n\n{body}")
         if not contents:
             return "(none)"
         return "\n\n".join(contents)
