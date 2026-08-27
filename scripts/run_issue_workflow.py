@@ -1778,6 +1778,17 @@ class WorkflowRunner:
             if self.plan_check_required
             else None
         )
+        external_send_decision = "pause" if self.plan_check_required else "advance"
+        external_send_reason = (
+            "external_send_approval_required"
+            if self.plan_check_required
+            else "advisory_check_unavailable"
+        )
+        external_send_resume = (
+            "Allow the external-safe plan-check send."
+            if self.plan_check_required
+            else None
+        )
         mapping = {
             "completed_no_change": ("advance", "completed_no_change", None),
             "completed_refined": ("advance", "completed_refined", None),
@@ -1793,9 +1804,9 @@ class WorkflowRunner:
             ),
             "invalid_output": (invalid_output_decision, invalid_output_reason, invalid_output_resume),
             "approval_required": (
-                "pause",
-                "external_send_approval_required",
-                "Allow the external-safe plan-check send.",
+                external_send_decision,
+                external_send_reason,
+                external_send_resume,
             ),
         }
         decision, reason_code, resume_condition = mapping.get(
@@ -1818,6 +1829,16 @@ class WorkflowRunner:
                     "Warning: advisory check unavailable; advancing without treating the probe "
                     "as a no-findings signal."
                 )
+        elif status == "approval_required" and not self.plan_check_required:
+            summary = (
+                "Plan comprehension advisory was unavailable because external plan-check send "
+                "was not permitted; the workflow advanced without treating the probe as a "
+                "no-findings signal."
+            )
+            print(
+                "Warning: plan comprehension external send was not permitted; advancing "
+                "without treating the probe as a no-findings signal."
+            )
         outcome = PhaseOutcome(
             schema_version="1.0",
             phase="plan_comprehension_check",

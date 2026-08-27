@@ -559,7 +559,8 @@ python3 scripts/run_issue_workflow.py \
 - `--allow-plan-check-external-send`
   `external-safe` と分類された計画成果物を
   `plan_comprehension_check` の外部モデルへ送ることを明示的に許可します。
-  未指定時、live checkは送信せず停止します。
+  未指定時、advisory の live check は送信せず、警告を記録して workflow を継続します。
+  `--require-plan-comprehension-check` 指定時は `external_send_approval_required` で停止します。
 - `--require-plan-comprehension-check`
   schema-invalidなplan checkを必須ゲートとして扱い、`invalid_output`で停止します。
   未指定時は、probe unavailableの警告を記録してworkflowを継続します。
