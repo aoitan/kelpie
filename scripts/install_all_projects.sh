@@ -66,6 +66,9 @@ require_command uv
 require_command npm
 require_command poetry
 require_command cargo
+require_command cargo-deny
+require_command cargo-machete
+require_command cargo-modules
 require_command java
 require_command sourcekitten
 
