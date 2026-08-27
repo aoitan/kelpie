@@ -1208,6 +1208,13 @@ class ReviewResultLoader:
 
             opened_stat = os.fstat(descriptor)
             self._validate_regular_file(target, opened_stat)
+            if (
+                opened_stat.st_ino != target_stat.st_ino
+                or opened_stat.st_dev != target_stat.st_dev
+            ):
+                raise ReviewResultValidationError(
+                    f"review result output was replaced between stat and open: {target}"
+                )
             if opened_stat.st_size > MAX_REVIEW_RESULT_BYTES:
                 raise ReviewResultValidationError(
                     f"review result output exceeds {MAX_REVIEW_RESULT_BYTES} bytes: {target}"
