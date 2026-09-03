@@ -15,18 +15,21 @@ PHASE_REASON_CODES = {
         "scope_undefined",
         "success_criteria_undefined",
         "artifact_invalid",
+        "execution_error",
     },
     "prototyping": {
         "evidence_collected",
         "experiment_not_executable",
         "required_input_unavailable",
         "artifact_invalid",
+        "execution_error",
     },
     "red_team_review": {
         "risks_recorded",
         "critical_risk_requires_decision",
         "authority_required",
         "artifact_invalid",
+        "execution_error",
     },
     "solution_design": {
         "design_ready",
@@ -35,11 +38,13 @@ PHASE_REASON_CODES = {
         "dependency_approval_required",
         "permission_change_required",
         "artifact_invalid",
+        "execution_error",
     },
     "work_breakdown": {
         "work_items_ready",
         "unresolved_design_dependency",
         "artifact_invalid",
+        "execution_error",
     },
     "plan_comprehension_check": {
         "completed_no_change",
@@ -58,6 +63,7 @@ PHASE_REASON_CODES = {
         "required_permission_unavailable",
         "required_tests_unresolved",
         "artifact_invalid",
+        "execution_error",
     },
     "review_fix_loop": {
         "review_converged",
@@ -65,6 +71,7 @@ PHASE_REASON_CODES = {
         "max_iterations_reached",
         "required_checks_unresolved",
         "artifact_invalid",
+        "execution_error",
     },
     "pull_request": {
         "pr_draft_ready",
@@ -72,6 +79,7 @@ PHASE_REASON_CODES = {
         "external_publish_approval_required",
         "artifact_invalid",
         "external_operation_failed",
+        "execution_error",
     },
 }
 REASON_DECISIONS = {
@@ -113,6 +121,7 @@ REASON_DECISIONS = {
     "external_publish_approval_required": {"pause"},
     "external_operation_failed": {"fail"},
     "artifact_invalid": {"fail"},
+    "execution_error": {"fail"},
 }
 PHASE_REQUIRED_ARTIFACTS = {
     "prototype_planning": ("01-prototype-planning.md",),
@@ -261,7 +270,7 @@ def persist_phase_outcome(
     outcome: PhaseOutcome,
     *,
     state_metadata: dict[str, object] | None = None,
-) -> None:
+) -> Path:
     payload = asdict(outcome)
     payload["evidence_refs"] = list(outcome.evidence_refs)
     history_dir = artifact_root / "phase-outcomes" / outcome.phase
@@ -292,3 +301,4 @@ def persist_phase_outcome(
         json.dumps(workflow_status, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    return history_path
