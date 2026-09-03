@@ -3191,11 +3191,23 @@ class WorkflowRunner:
             + ", ".join(str(action) for action in request_payload["available_actions"])
         )
         print("Example resume command:")
-        print("  " + self.intervention_resume_command(str(request_payload["available_actions"][0])))
+        print(
+            "  "
+            + self.intervention_resume_command(
+                str(request_payload["available_actions"][0]),
+                artifact_dir=effective_artifact_dir,
+            )
+        )
         return request_path
 
-    def intervention_resume_command(self, action: str) -> str:
-        run_dir = str(self.artifact_dir.relative_to(self.workdir))
+    def intervention_resume_command(
+        self,
+        action: str,
+        *,
+        artifact_dir: Path | None = None,
+    ) -> str:
+        effective_artifact_dir = artifact_dir or self.artifact_dir
+        run_dir = str(effective_artifact_dir.relative_to(self.workdir))
         command = [
             "python3",
             str(self.repo_root / "scripts" / "run_issue_workflow.py"),

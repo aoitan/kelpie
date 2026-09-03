@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,6 +27,7 @@ from scripts.run_issue_workflow import (
     main,
     resolve_run_dir,
 )
+from scripts.workflow_outcomes import PhaseOutcome
 
 
 class HumanInterventionPolicyTests(unittest.TestCase):
@@ -195,6 +198,47 @@ class WorkflowRunnerHumanInterventionTests(unittest.TestCase):
             self.assertEqual(state["status"], "failed")
             self.assertEqual(state["reason_code"], "artifact_invalid")
             self.assertEqual(request["available_actions"], ["retry", "reopen", "abort"])
+
+    def test_scoped_request_prints_scoped_run_dir_in_resume_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"KELPIE_CONFIG_HOME": str(Path(tmpdir) / "empty-config")}):
+                runner = self.make_runner(tmpdir, task_label="scoped-request")
+                artifact_dir = runner.artifact_dir / "work-items" / "WI-01"
+                runner.prepare_artifact_scope(artifact_dir)
+                outcome_path = runner.phase_outcome_path("review_fix_loop", artifact_dir)
+                outcome_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "phase": "review_fix_loop",
+                            "decision": "pause",
+                            "reason_code": "high_severity_unresolved",
+                            "summary": "A high severity finding remains.",
+                            "evidence_refs": [],
+                            "resume_condition": "Resolve the finding.",
+                            "artifact_digests": {},
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                outcome = PhaseOutcome.from_dict(
+                    json.loads(outcome_path.read_text(encoding="utf-8")),
+                    expected_phase="review_fix_loop",
+                )
+                stdout = io.StringIO()
+
+                with redirect_stdout(stdout):
+                    runner.write_human_intervention_request(
+                        outcome,
+                        outcome_path,
+                        artifact_dir=artifact_dir,
+                    )
+
+            self.assertIn(
+                f"--run-dir {artifact_dir.relative_to(runner.workdir)}",
+                stdout.getvalue(),
+            )
 
 
 class RunDirectoryTests(unittest.TestCase):
