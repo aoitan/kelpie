@@ -17,6 +17,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
@@ -40,6 +41,17 @@ try:
         ConvergenceOrchestrator,
         ConvergenceRequest,
         ConvergenceRunResult,
+    )
+    from scripts.human_intervention import (
+        ACTIONS_REQUIRING_PROMPT,
+        HumanIntervention,
+        INTERVENTION_ACTIONS,
+        build_request_payload,
+        build_response_payload,
+        dump_payload,
+        validate_action_for_request,
+        validate_prompt,
+        validate_request_payload,
     )
     from scripts.workflow_outcomes import (
         PHASE_REASON_CODES,
@@ -69,6 +81,17 @@ except ModuleNotFoundError:
         ConvergenceRequest,
         ConvergenceRunResult,
     )
+    from human_intervention import (
+        ACTIONS_REQUIRING_PROMPT,
+        HumanIntervention,
+        INTERVENTION_ACTIONS,
+        build_request_payload,
+        build_response_payload,
+        dump_payload,
+        validate_action_for_request,
+        validate_prompt,
+        validate_request_payload,
+    )
     from workflow_outcomes import (
         PHASE_REASON_CODES,
         PhaseOutcome,
@@ -90,6 +113,10 @@ PHASES = [
     "review_fix_loop",
     "pull_request",
 ]
+
+
+class PhaseOutcomeStop(SystemExit):
+    """A deliberate phase pause/failure that must not be reclassified as execution error."""
 
 PHASE_TO_PROMPT = {
     "prototype_planning": "prompts/01_prototype_planning.md",
@@ -1730,6 +1757,9 @@ class WorkflowRunner:
         dry_run: bool = False,
         allow_plan_check_external_send: bool = False,
         plan_check_required: bool = False,
+        artifact_dir: Path | None = None,
+        resume_intervention: HumanIntervention | None = None,
+        reuse_issue_cache: bool = False,
         runner_registry: Mapping[str, RunnerConfig] | RunnerResolver | None = None,
         implementation_step_factory: ImplementationStepFactory | None = None,
         review_result_loader: ReviewResultLoader | None = None,
@@ -1746,6 +1776,8 @@ class WorkflowRunner:
         self.dry_run = dry_run
         self.allow_plan_check_external_send = allow_plan_check_external_send
         self.plan_check_required = plan_check_required
+        self.resume_intervention = resume_intervention
+        self.reuse_issue_cache = reuse_issue_cache
         self.implementation_step_factory = implementation_step_factory or ImplementationStepFactory()
 
         if isinstance(runner_registry, RunnerResolver):
@@ -1763,7 +1795,11 @@ class WorkflowRunner:
         if self.kelpie_dir.is_symlink():
             raise ValueError(f"Symlinked kelpie directory is not allowed: {self.kelpie_dir}")
         self.ensure_kelpie_dir()
-        self.artifact_dir = self.compute_artifact_dir()
+        self.artifact_dir = (
+            self.resolve_explicit_artifact_dir(artifact_dir)
+            if artifact_dir is not None
+            else self.compute_artifact_dir()
+        )
         self._reject_symlink_components(self.workdir, self.artifact_dir)
         self.intent_dir = self.artifact_dir / "intent-records"
         self.checks_dir = self.artifact_dir / "checks"
@@ -1771,6 +1807,7 @@ class WorkflowRunner:
         self.issue_cache_dir = self.artifact_dir / ".issue-cache"
         for d in [self.kelpie_dir, self.artifact_dir, self.intent_dir, self.checks_dir, self.prompt_cache_dir, self.issue_cache_dir]:
             d.mkdir(parents=True, exist_ok=True)
+        self.write_run_manifest()
         self.review_result_loader = review_result_loader or ReviewResultLoader(self.artifact_dir)
         self.instruction_targets = self.stage_instruction_files()
         try:
@@ -2882,22 +2919,34 @@ class WorkflowRunner:
         if executor is None or outcome_handler is None:
             raise ValueError(f"Unsupported step executor: {resolved.executor_key}")
 
-        with self.step_scope_lock(resolved.artifact_dir, resolved.spec.name):
-            self.prepare_resolved_step(resolved)
-            self.run_pre_checks(
-                resolved.phase,
-                artifact_dir=resolved.artifact_dir,
-                step_name=resolved.spec.name,
-            )
-            execution_result = executor(resolved)
-            self.run_step_post_actions(resolved.spec, artifact_dir=resolved.artifact_dir)
-            self.run_post_checks(
-                resolved.phase,
-                artifact_dir=resolved.artifact_dir,
-                step_name=resolved.spec.name,
-            )
+        try:
+            with self.step_scope_lock(resolved.artifact_dir, resolved.spec.name):
+                self.prepare_resolved_step(resolved)
+                self.run_pre_checks(
+                    resolved.phase,
+                    artifact_dir=resolved.artifact_dir,
+                    step_name=resolved.spec.name,
+                )
+                execution_result = executor(resolved)
+                self.run_step_post_actions(resolved.spec, artifact_dir=resolved.artifact_dir)
+                self.run_post_checks(
+                    resolved.phase,
+                    artifact_dir=resolved.artifact_dir,
+                    step_name=resolved.spec.name,
+                )
+                if not self.dry_run:
+                    outcome_handler(resolved, execution_result)
+        except PhaseOutcomeStop:
+            raise
+        except SystemExit as exc:
             if not self.dry_run:
-                outcome_handler(resolved, execution_result)
+                self.record_execution_failure(
+                    resolved.phase,
+                    resolved.artifact_dir,
+                    str(exc),
+                    step_name=resolved.spec.name,
+                )
+            raise
 
     def prepare_resolved_step(self, resolved: ResolvedStep) -> None:
         """Create and persist prepared artifacts after all read-only resolution."""
@@ -3045,6 +3094,384 @@ class WorkflowRunner:
         prefix = self.artifact_prefix(phase, step_name=step_name)
         return artifact_dir / f"{prefix}phase-outcome.json"
 
+    def _resume_state_metadata(self) -> dict[str, object]:
+        if self.resume_intervention is None:
+            return {}
+        return {
+            "intervention_request_id": self.resume_intervention.request_id,
+            "intervention_action": self.resume_intervention.action,
+            "intervention_response_path": self.resume_intervention.response_ref,
+            "intervention_prompt_path": self.resume_intervention.prompt_ref,
+            "intervention_status": "consumed",
+        }
+
+    @staticmethod
+    def _next_intervention_index(directory: Path) -> int:
+        indices = []
+        for path in directory.glob("*.json"):
+            try:
+                indices.append(int(path.stem))
+            except ValueError:
+                continue
+        return max(indices, default=0) + 1
+
+    def update_workflow_state(
+        self,
+        artifact_dir: Path,
+        updates: Mapping[str, object],
+    ) -> None:
+        state_path = artifact_dir / "workflow-state.json"
+        self._assert_artifact_path_contained(state_path)
+        self._reject_symlink_components(self.artifact_dir, state_path)
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"Cannot update workflow state: invalid JSON: {exc}") from exc
+            if not isinstance(state, dict):
+                raise SystemExit("Cannot update workflow state: expected a JSON object")
+        else:
+            state = {}
+        state.update(updates)
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.atomic_write_text(
+            state_path,
+            json.dumps(state, indent=2, ensure_ascii=False) + "\n",
+        )
+
+    def write_human_intervention_request(
+        self,
+        outcome: PhaseOutcome,
+        outcome_path: Path,
+        *,
+        artifact_dir: Path | None = None,
+    ) -> Path:
+        if outcome.decision not in {"pause", "fail"}:
+            raise ValueError("human intervention request requires a pause or fail outcome")
+        effective_artifact_dir = artifact_dir or self.artifact_dir
+        requests_dir = effective_artifact_dir / "human-interventions" / "requests"
+        self.prepare_artifact_scope(requests_dir)
+        index = self._next_intervention_index(requests_dir)
+        request_path = requests_dir / f"{index:04d}.json"
+        request_id = f"intervention-{index:04d}"
+        request_payload = build_request_payload(
+            request_id=request_id,
+            phase=outcome.phase,
+            decision=outcome.decision,
+            reason_code=outcome.reason_code,
+            summary=outcome.summary,
+            resume_condition=outcome.resume_condition,
+            outcome_path=str(outcome_path.relative_to(effective_artifact_dir)),
+            outcome_sha256=sha256_file(outcome_path),
+            evidence_refs=list(outcome.evidence_refs),
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self.atomic_write_text(request_path, dump_payload(request_payload))
+        request_ref = str(request_path.relative_to(effective_artifact_dir))
+        request_sha256 = sha256_file(request_path)
+        self.update_workflow_state(
+            effective_artifact_dir,
+            {
+                "intervention_request_id": request_id,
+                "intervention_request_path": request_ref,
+                "intervention_request_sha256": request_sha256,
+                "intervention_kind": request_payload["intervention_kind"],
+                "owner_phase": request_payload["owner_phase"],
+                "available_actions": request_payload["available_actions"],
+                "intervention_status": "pending",
+            },
+        )
+        print(
+            f"Human intervention required for '{outcome.phase}' "
+            f"({outcome.reason_code})."
+        )
+        print(f"Intervention request: {request_path.relative_to(self.workdir)}")
+        print(
+            "Available actions: "
+            + ", ".join(str(action) for action in request_payload["available_actions"])
+        )
+        print("Example resume command:")
+        print(
+            "  "
+            + self.intervention_resume_command(
+                str(request_payload["available_actions"][0]),
+                artifact_dir=effective_artifact_dir,
+            )
+        )
+        return request_path
+
+    def intervention_resume_command(
+        self,
+        action: str,
+        *,
+        artifact_dir: Path | None = None,
+    ) -> str:
+        effective_artifact_dir = artifact_dir or self.artifact_dir
+        run_dir = str(effective_artifact_dir.relative_to(self.workdir))
+        command = [
+            "python3",
+            str(self.repo_root / "scripts" / "run_issue_workflow.py"),
+            "--workdir",
+            str(self.workdir),
+            "--run-dir",
+            run_dir,
+            "--runner",
+            self.runner_config.name,
+            "--resume",
+            "--resume-action",
+            action,
+            "--resume-prompt-file",
+            "./feedback.md",
+        ]
+        return shlex.join(command)
+
+    def _persist_outcome(
+        self,
+        artifact_dir: Path,
+        outcome: PhaseOutcome,
+        *,
+        state_metadata: Mapping[str, object] | None = None,
+    ) -> Path:
+        metadata = self._resume_state_metadata()
+        if state_metadata:
+            metadata.update(state_metadata)
+        history_path = persist_phase_outcome(
+            artifact_dir,
+            outcome,
+            state_metadata=dict(metadata) if metadata else None,
+        )
+        if outcome.decision in {"pause", "fail"}:
+            self.write_human_intervention_request(
+                outcome,
+                history_path,
+                artifact_dir=artifact_dir,
+            )
+        return history_path
+
+    def record_artifact_invalid_failure(
+        self,
+        phase: str,
+        artifact_dir: Path,
+        detail: str,
+        *,
+        step_name: str | None = None,
+    ) -> PhaseOutcome:
+        summary_detail = detail.strip() or "The phase did not produce a valid outcome."
+        if len(summary_detail) > 2000:
+            summary_detail = summary_detail[:1997] + "..."
+        outcome = PhaseOutcome(
+            schema_version="1.0",
+            phase=phase,
+            decision="fail",
+            reason_code="artifact_invalid",
+            summary=f"Phase output is invalid: {summary_detail}",
+            evidence_refs=(),
+            resume_condition=None,
+            artifact_digests={},
+        )
+        self._persist_outcome(artifact_dir, outcome)
+        return outcome
+
+    def record_execution_failure(
+        self,
+        phase: str,
+        artifact_dir: Path,
+        detail: str,
+        *,
+        step_name: str | None = None,
+    ) -> PhaseOutcome:
+        _ = step_name
+        summary_detail = detail.strip() or "The phase runner stopped before producing an outcome."
+        if len(summary_detail) > 2000:
+            summary_detail = summary_detail[:1997] + "..."
+        outcome = PhaseOutcome(
+            schema_version="1.0",
+            phase=phase,
+            decision="fail",
+            reason_code="execution_error",
+            summary=f"Phase execution stopped before a valid outcome: {summary_detail}",
+            evidence_refs=(),
+            resume_condition=None,
+            artifact_digests={},
+        )
+        self._persist_outcome(artifact_dir, outcome)
+        return outcome
+
+    def read_workflow_state(self, artifact_dir: Path | None = None) -> dict[str, object]:
+        effective_artifact_dir = artifact_dir or self.artifact_dir
+        path = effective_artifact_dir / "workflow-state.json"
+        self._assert_artifact_path_contained(path)
+        self._reject_symlink_components(self.artifact_dir, path)
+        if not path.exists():
+            raise SystemExit(f"Workflow state not found at {path}")
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Invalid workflow state at {path}: {exc}") from exc
+        if not isinstance(state, dict):
+            raise SystemExit(f"Invalid workflow state at {path}: expected a JSON object")
+        return state
+
+    def _load_intervention_request(
+        self,
+        state: Mapping[str, object],
+    ) -> tuple[Path, dict[str, object]]:
+        request_ref = state.get("intervention_request_path")
+        if not isinstance(request_ref, str) or not request_ref:
+            outcome_ref = state.get("outcome_path")
+            phase = state.get("phase")
+            if not isinstance(outcome_ref, str) or not isinstance(phase, str):
+                raise SystemExit(
+                    "Cannot accept human intervention: workflow state has no valid outcome reference"
+                )
+            try:
+                outcome_path = safe_artifact_path(self.artifact_dir, outcome_ref)
+                raw_outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+                if not isinstance(raw_outcome, dict):
+                    raise ValueError("phase outcome must be a JSON object")
+                outcome = PhaseOutcome.from_dict(raw_outcome, expected_phase=phase)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                raise SystemExit(
+                    f"Cannot accept human intervention: invalid paused outcome: {exc}"
+                ) from exc
+            self.write_human_intervention_request(
+                outcome,
+                outcome_path,
+                artifact_dir=self.artifact_dir,
+            )
+            state = self.read_workflow_state()
+            request_ref = state.get("intervention_request_path")
+
+        if not isinstance(request_ref, str) or not request_ref:
+            raise SystemExit("Cannot accept human intervention: request path is missing")
+        try:
+            request_path = safe_artifact_path(self.artifact_dir, request_ref)
+            self._reject_symlink_components(self.artifact_dir, request_path)
+            raw_request = json.loads(request_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_request, dict):
+                raise ValueError("human intervention request must be a JSON object")
+            request = validate_request_payload(raw_request)
+            expected_request_sha256 = state.get("intervention_request_sha256")
+            actual_request_sha256 = sha256_file(request_path)
+            if expected_request_sha256 is not None and expected_request_sha256 != actual_request_sha256:
+                raise ValueError("human intervention request digest does not match workflow state")
+            outcome_path = safe_artifact_path(
+                self.artifact_dir,
+                str(request["outcome_path"]),
+            )
+            if not outcome_path.is_file():
+                raise ValueError("the outcome referenced by the intervention request is missing")
+            if sha256_file(outcome_path) != request["outcome_sha256"]:
+                raise ValueError("the intervention request refers to a changed outcome")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise SystemExit(f"Cannot accept human intervention: {exc}") from exc
+        return request_path, request
+
+    def record_human_intervention(
+        self,
+        state: Mapping[str, object],
+        action: str,
+        prompt: str | None = None,
+        target_phase: str | None = None,
+    ) -> HumanIntervention | None:
+        request_path, request = self._load_intervention_request(state)
+        try:
+            normalized_action = validate_action_for_request(request, action)
+            normalized_prompt = validate_prompt(prompt)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if normalized_action in ACTIONS_REQUIRING_PROMPT and normalized_prompt is None:
+            raise SystemExit(
+                f"Action '{normalized_action}' requires a prompt. "
+                "Use --resume-prompt, --resume-prompt-file, or --resume-prompt-stdin."
+            )
+        if target_phase is not None and normalized_action != "reopen":
+            raise SystemExit("--resume-phase can only be used with --resume-action reopen")
+
+        responses_dir = self.artifact_dir / "human-interventions" / "responses"
+        self.prepare_artifact_scope(responses_dir)
+        index = self._next_intervention_index(responses_dir)
+        response_id = f"response-{index:04d}"
+        prompt_ref: str | None = None
+        prompt_sha256: str | None = None
+        if normalized_prompt is not None:
+            prompt_path = responses_dir / f"{index:04d}.md"
+            self._reject_symlink_components(self.artifact_dir, prompt_path)
+            self.atomic_write_text(prompt_path, normalized_prompt + "\n")
+            try:
+                os.chmod(prompt_path, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                pass
+            prompt_ref = str(prompt_path.relative_to(self.artifact_dir))
+            prompt_sha256 = sha256_file(prompt_path)
+
+        request_sha256 = sha256_file(request_path)
+        request_phase = str(request["phase"])
+        owner_phase = str(request["owner_phase"])
+        requested_target_phase = target_phase or owner_phase
+        if requested_target_phase not in PHASES:
+            raise SystemExit(
+                f"Cannot accept human intervention: unsupported target phase {requested_target_phase!r}"
+            )
+        if normalized_action == "reopen" and PHASES.index(requested_target_phase) > PHASES.index(request_phase):
+            raise SystemExit(
+                "Cannot reopen a later phase; choose the paused phase or an earlier phase"
+            )
+        response_payload = build_response_payload(
+            response_id=response_id,
+            request_id=str(request["request_id"]),
+            phase=request_phase,
+            target_phase=requested_target_phase,
+            action=normalized_action,
+            prompt_ref=prompt_ref,
+            prompt_sha256=prompt_sha256,
+            request_sha256=request_sha256,
+            actor="local-user",
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        response_path = responses_dir / f"{index:04d}.json"
+        self.atomic_write_text(response_path, dump_payload(response_payload))
+        response_ref = str(response_path.relative_to(self.artifact_dir))
+        self.update_workflow_state(
+            self.artifact_dir,
+            {
+                "intervention_response_path": response_ref,
+                "intervention_action": normalized_action,
+                "intervention_prompt_path": prompt_ref,
+                "intervention_status": "aborted"
+                if normalized_action == "abort"
+                else "accepted",
+                "owner_phase": requested_target_phase,
+                "intervention_target_phase": requested_target_phase,
+                **(
+                    {
+                        "status": "aborted",
+                        "decision": "fail",
+                        "resume_condition": None,
+                    }
+                    if normalized_action == "abort"
+                    else {}
+                ),
+            },
+        )
+        if normalized_action == "abort":
+            print(f"Workflow aborted by local human intervention: {response_ref}")
+            return None
+
+        target_phase = requested_target_phase if normalized_action == "reopen" else request_phase
+        intervention = HumanIntervention(
+            request_id=str(request["request_id"]),
+            phase=target_phase,
+            owner_phase=owner_phase,
+            action=normalized_action,
+            prompt=normalized_prompt,
+            prompt_ref=prompt_ref,
+            response_ref=response_ref,
+        )
+        self.resume_intervention = intervention
+        print(f"Accepted human intervention '{normalized_action}' for phase '{target_phase}'.")
+        return intervention
+
     def evaluate_phase_outcome(
         self,
         phase: str,
@@ -3054,7 +3481,14 @@ class WorkflowRunner:
     ) -> PhaseOutcome:
         path = self.phase_outcome_path(phase, artifact_dir, step_name=step_name)
         if not path.exists():
-            raise SystemExit(f"Phase '{phase}' did not create required outcome: {path.relative_to(self.workdir)}")
+            detail = f"Phase '{phase}' did not create required outcome: {path.relative_to(self.workdir)}"
+            self.record_artifact_invalid_failure(
+                phase,
+                artifact_dir,
+                detail,
+                step_name=step_name,
+            )
+            raise PhaseOutcomeStop(detail)
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
@@ -3066,7 +3500,14 @@ class WorkflowRunner:
                 required_artifacts=required_artifacts,
             )
         except (json.JSONDecodeError, ValueError) as exc:
-            raise SystemExit(f"Invalid phase outcome for '{phase}': {exc}") from exc
+            detail = f"Invalid phase outcome for '{phase}': {exc}"
+            self.record_artifact_invalid_failure(
+                phase,
+                artifact_dir,
+                detail,
+                step_name=step_name,
+            )
+            raise PhaseOutcomeStop(detail) from exc
         evidence_digests = {
             reference.split("#", 1)[0]: sha256_file(
                 safe_artifact_path(artifact_dir, reference.split("#", 1)[0])
@@ -3083,15 +3524,29 @@ class WorkflowRunner:
             resume_condition=outcome.resume_condition,
             artifact_digests={**outcome.artifact_digests, **evidence_digests},
         )
-        persist_phase_outcome(artifact_dir, outcome)
-        if outcome.decision == "pause":
-            raise SystemExit(f"Workflow paused in phase '{phase}': {outcome.reason_code}")
-        if outcome.decision == "fail":
-            raise SystemExit(f"Workflow failed in phase '{phase}': {outcome.reason_code}")
         if phase == "pull_request" and outcome.decision != "complete":
-            raise SystemExit("Pull request phase must finish with decision 'complete'")
+            detail = "Pull request phase must finish with decision 'complete'"
+            self.record_artifact_invalid_failure(
+                phase,
+                artifact_dir,
+                detail,
+                step_name=step_name,
+            )
+            raise PhaseOutcomeStop(detail)
         if phase != "pull_request" and outcome.decision == "complete":
-            raise SystemExit(f"Only pull_request may return decision 'complete', got '{phase}'")
+            detail = f"Only pull_request may return decision 'complete', got '{phase}'"
+            self.record_artifact_invalid_failure(
+                phase,
+                artifact_dir,
+                detail,
+                step_name=step_name,
+            )
+            raise PhaseOutcomeStop(detail)
+        self._persist_outcome(artifact_dir, outcome)
+        if outcome.decision == "pause":
+            raise PhaseOutcomeStop(f"Workflow paused in phase '{phase}': {outcome.reason_code}")
+        if outcome.decision == "fail":
+            raise PhaseOutcomeStop(f"Workflow failed in phase '{phase}': {outcome.reason_code}")
         return outcome
 
     def record_plan_refinement_outcome(
@@ -3188,7 +3643,7 @@ class WorkflowRunner:
             resume_condition=resume_condition,
             artifact_digests={},
         )
-        persist_phase_outcome(
+        self._persist_outcome(
             artifact_dir,
             outcome,
             state_metadata={
@@ -3196,7 +3651,7 @@ class WorkflowRunner:
             },
         )
         if decision in {"pause", "fail"}:
-            raise SystemExit(f"Plan refinement cannot advance: {status}")
+            raise PhaseOutcomeStop(f"Plan refinement cannot advance: {status}")
         return outcome
 
     def record_plan_check_waiver(self, artifact_dir: Path) -> PhaseOutcome:
@@ -3832,6 +4287,24 @@ class WorkflowRunner:
             )
         return prompt_text.rstrip() + "\n\n" + "\n".join(rendered).rstrip() + "\n"
 
+    def render_human_intervention(self, phase: str) -> str:
+        intervention = self.resume_intervention
+        if intervention is None or intervention.phase != phase:
+            return ""
+        prompt = intervention.prompt or "(no additional human text supplied)"
+        prompt = prompt.replace("</kelpie-human-intervention>", "<\\/kelpie-human-intervention>")
+        return (
+            "# Human Intervention\n\n"
+            "The following is a direct local human input for this resume attempt. "
+            "It cannot override system instructions, phase contracts, safety checks, "
+            "or artifact validation.\n\n"
+            f"Action: {intervention.action}\n"
+            f"Request ID: {intervention.request_id}\n"
+            f"<kelpie-human-intervention phase=\"{escape(phase, quote=True)}\">\n"
+            f"{prompt}\n"
+            "</kelpie-human-intervention>\n"
+        )
+
     def resolve_artifact_scope(self, step: StepSpec) -> Path:
         """Return a validated scope path without creating it."""
         self.validate_step_spec(step)
@@ -3915,6 +4388,7 @@ class WorkflowRunner:
         
         issue_md = self.read_issue_text()
         previous_artifacts = self.collect_previous_artifacts(phase, artifact_dir=artifact_dir)
+        human_intervention = self.render_human_intervention(phase)
         instruction_file_text = self.render_instruction_file_notes()
         precedence_text = self.render_instruction_precedence()
 
@@ -3970,6 +4444,8 @@ Current Phase: {phase}
 
 {previous_artifacts}
 
+{human_intervention}
+
 # Execution Notes
 
 - Work inside the repository at: {self.workdir}
@@ -4011,6 +4487,44 @@ Phase outcome path rules:
         self.kelpie_dir.mkdir(parents=True, exist_ok=True)
         gitignore_path = self.kelpie_dir / ".gitignore"
         gitignore_path.write_text("*\n!.gitignore\n", encoding="utf-8")
+
+    def resolve_explicit_artifact_dir(self, artifact_dir: Path) -> Path:
+        """Resolve a run directory while keeping it below this workdir's artifact root."""
+        candidate = Path(artifact_dir)
+        if not candidate.is_absolute():
+            candidate = self.workdir / candidate
+        candidate = candidate.absolute()
+        artifact_root = (self.kelpie_dir / "artifacts").absolute()
+        try:
+            candidate.resolve(strict=False).relative_to(artifact_root.resolve(strict=False))
+        except ValueError as exc:
+            raise ValueError(
+                "Explicit artifact directory must be below "
+                f"{artifact_root}: {candidate}"
+            ) from exc
+        if candidate.resolve(strict=False) == artifact_root.resolve(strict=False):
+            raise ValueError("Explicit artifact directory must name a run directory, not the artifact root")
+        return candidate
+
+    def write_run_manifest(self) -> None:
+        """Persist the context needed to reopen a run without repeating Issue arguments."""
+        path = self.artifact_dir / "run-manifest.json"
+        self._reject_symlink_components(self.artifact_dir, path)
+        if path.exists():
+            return
+        payload = {
+            "schema_version": "1.0",
+            "workflow_id": str(self.artifact_dir.relative_to(self.workdir)),
+            "workdir": str(self.workdir),
+            "issue_number": self.issue_number,
+            "issue_source": self.issue_source,
+            "github_repo": self.github_repo,
+            "include_issue_comments": self.include_issue_comments,
+            "task_label": self.task_label,
+            "runner": self.runner_config.name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
     def compute_artifact_dir(self) -> Path:
         artifact_root = self.kelpie_dir / "artifacts"
@@ -4137,19 +4651,27 @@ Phase outcome path rules:
         issue_path = self.issue_cache_dir / "issue.json"
         comments_path = self.issue_cache_dir / "issue_comments.json"
 
-        issue_data = self.run_gh_json(
-            [
-                "gh",
-                "issue",
-                "view",
-                self.issue_number,
-                "--repo",
-                self.github_repo,
-                "--json",
-                "number,title,body,state,labels,assignees,author,url",
-            ],
-            issue_path,
-        )
+        if self.reuse_issue_cache and issue_path.is_file():
+            try:
+                issue_data = json.loads(issue_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SystemExit(f"Failed to read cached GitHub issue context: {exc}") from exc
+            if not isinstance(issue_data, dict):
+                raise SystemExit("Failed to read cached GitHub issue context: expected a JSON object")
+        else:
+            issue_data = self.run_gh_json(
+                [
+                    "gh",
+                    "issue",
+                    "view",
+                    self.issue_number,
+                    "--repo",
+                    self.github_repo,
+                    "--json",
+                    "number,title,body,state,labels,assignees,author,url",
+                ],
+                issue_path,
+            )
 
         lines: list[str] = []
         lines.append(f"# GitHub Issue #{issue_data.get('number', self.issue_number)}: {issue_data.get('title', '')}")
@@ -4176,20 +4698,31 @@ Phase outcome path rules:
         lines.append(issue_data.get("body") or "(empty)")
 
         if self.include_issue_comments:
-            comments = self.run_gh_json(
-                [
-                    "gh",
-                    "issue",
-                    "view",
-                    self.issue_number,
-                    "--repo",
-                    self.github_repo,
-                    "--comments",
-                    "--json",
-                    "comments",
-                ],
-                comments_path,
-            ).get("comments", [])
+            if self.reuse_issue_cache and comments_path.is_file():
+                try:
+                    cached_comments = json.loads(comments_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise SystemExit(f"Failed to read cached GitHub issue comments: {exc}") from exc
+                if not isinstance(cached_comments, dict):
+                    raise SystemExit(
+                        "Failed to read cached GitHub issue comments: expected a JSON object"
+                    )
+                comments = cached_comments.get("comments", [])
+            else:
+                comments = self.run_gh_json(
+                    [
+                        "gh",
+                        "issue",
+                        "view",
+                        self.issue_number,
+                        "--repo",
+                        self.github_repo,
+                        "--comments",
+                        "--json",
+                        "comments",
+                    ],
+                    comments_path,
+                ).get("comments", [])
             lines.append("")
             lines.append("## Comments")
             lines.append("")
@@ -4640,16 +5173,85 @@ Phase outcome path rules:
         )
 
 
+def resolve_run_dir(workdir: Path, raw_path: str) -> Path:
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = workdir / candidate
+    candidate = candidate.absolute()
+    artifact_root = (workdir / ".kelpie" / "artifacts").absolute()
+    try:
+        candidate.resolve(strict=False).relative_to(artifact_root.resolve(strict=False))
+    except ValueError as exc:
+        raise SystemExit(
+            f"--run-dir must point below {artifact_root}; got {candidate}"
+        ) from exc
+    if candidate.resolve(strict=False) == artifact_root.resolve(strict=False):
+        raise SystemExit("--run-dir must name a run artifact directory, not .kelpie/artifacts")
+    return candidate
+
+
+def load_run_manifest(run_dir: Path) -> dict[str, object]:
+    path = run_dir / "run-manifest.json"
+    if not path.exists():
+        return {}
+    if path.is_symlink():
+        raise SystemExit(f"Cannot use symlinked run manifest: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Cannot load run manifest at {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise SystemExit(f"Cannot load run manifest at {path}: expected a JSON object")
+    if raw.get("schema_version") not in {None, "1.0"}:
+        raise SystemExit(f"Unsupported run manifest schema at {path}: {raw.get('schema_version')}")
+    return raw
+
+
+def manifest_value(
+    manifest: Mapping[str, object],
+    key: str,
+    expected_type: type,
+) -> object | None:
+    value = manifest.get(key)
+    if value is not None and not isinstance(value, expected_type):
+        raise SystemExit(f"Run manifest field '{key}' must be {expected_type.__name__}")
+    return value
+
+
+def read_resume_prompt(args: argparse.Namespace) -> str | None:
+    sources = [
+        args.resume_prompt is not None,
+        args.resume_prompt_file is not None,
+        args.resume_prompt_stdin,
+    ]
+    if sum(sources) > 1:
+        raise SystemExit(
+            "Choose only one of --resume-prompt, --resume-prompt-file, or "
+            "--resume-prompt-stdin"
+        )
+    if args.resume_prompt is not None:
+        return args.resume_prompt
+    if args.resume_prompt_file is not None:
+        path = Path(args.resume_prompt_file).expanduser()
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(f"Cannot read --resume-prompt-file {path}: {exc}") from exc
+    if args.resume_prompt_stdin:
+        return sys.stdin.read()
+    return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run multi-phase issue workflow through a CLI agent.")
     parser.add_argument("--repo-root", default=".", help="Template directory containing AGENTS.md, prompts, skills.")
     parser.add_argument("--workdir", required=True, help="Target repository to operate on.")
     parser.add_argument("--issue", help="Issue number, for example 12 or 012.")
-    parser.add_argument("--issue-source", choices=["github", "file", "none"], default="github", help="Where to load the issue from.")
+    parser.add_argument("--issue-source", choices=["github", "file", "none"], default=None, help="Where to load the issue from.")
     parser.add_argument("--github-repo", help="GitHub repository in owner/name format. Required when --issue-source github.")
     parser.add_argument("--include-issue-comments", action="store_true", help="Include GitHub issue comments in the prompt context.")
     parser.add_argument("--task-label", help="Artifact label to use when running without an issue, for example refactor-auth-flow.")
-    parser.add_argument("--runner", required=True, help="Runner key from runner config JSON.")
+    parser.add_argument("--runner", help="Runner key from runner config JSON. Reused from --run-dir manifest when omitted.")
     parser.add_argument(
         "--runner-config",
         default="examples/runner_config.json",
@@ -4676,7 +5278,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume by re-running the phase recorded as paused in workflow-state.json.",
+        help="Resume by re-running the phase recorded as paused or failed in workflow-state.json.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        help="Existing run artifact directory for --resume; avoids repeating Issue arguments.",
+    )
+    parser.add_argument(
+        "--resume-action",
+        "--intervention-action",
+        dest="resume_action",
+        choices=INTERVENTION_ACTIONS,
+        help="Local human action to apply before resuming the paused/failed phase.",
+    )
+    parser.add_argument(
+        "--resume-phase",
+        "--intervention-phase",
+        dest="resume_phase",
+        choices=PHASES,
+        help="Earlier phase to reopen when --resume-action reopen is selected.",
+    )
+    parser.add_argument(
+        "--resume-prompt",
+        "--intervention-prompt",
+        dest="resume_prompt",
+        help="Short local human instruction to include in the next phase prompt.",
+    )
+    parser.add_argument(
+        "--resume-prompt-file",
+        "--intervention-prompt-file",
+        dest="resume_prompt_file",
+        help="Read the local human instruction from a file; preferred for multi-line input.",
+    )
+    parser.add_argument(
+        "--resume-prompt-stdin",
+        "--intervention-prompt-stdin",
+        dest="resume_prompt_stdin",
+        action="store_true",
+        help="Read the local human instruction from stdin.",
     )
     parser.add_argument(
         "--allow-plan-check-external-send",
@@ -4708,8 +5347,47 @@ def main() -> None:
     args = parse_args()
     if args.waive_plan_comprehension_check and not args.resume:
         raise SystemExit("--waive-plan-comprehension-check requires --resume")
+    if args.run_dir and not args.resume:
+        raise SystemExit("--run-dir requires --resume")
+    if args.resume_action and not args.resume:
+        raise SystemExit("--resume-action requires --resume")
+    if (
+        (args.resume_prompt is not None or args.resume_prompt_file is not None or args.resume_prompt_stdin)
+        and not args.resume
+    ):
+        raise SystemExit("Resume prompt options require --resume")
+    if args.waive_plan_comprehension_check and args.resume_action:
+        raise SystemExit("--waive-plan-comprehension-check cannot be combined with --resume-action")
+    if args.resume_phase and args.resume_action != "reopen":
+        raise SystemExit("--resume-phase requires --resume-action reopen")
+    resume_prompt = read_resume_prompt(args)
+    if resume_prompt is not None and not args.resume_action:
+        raise SystemExit("A resume prompt requires --resume-action")
     repo_root = Path(args.repo_root).resolve()
     workdir = Path(args.workdir).resolve()
+    run_dir = resolve_run_dir(workdir, args.run_dir) if args.run_dir else None
+    manifest = load_run_manifest(run_dir) if run_dir is not None else {}
+
+    manifest_issue = manifest_value(manifest, "issue_number", str)
+    manifest_issue_source = manifest_value(manifest, "issue_source", str)
+    manifest_github_repo = manifest_value(manifest, "github_repo", str)
+    manifest_task_label = manifest_value(manifest, "task_label", str)
+    manifest_runner = manifest_value(manifest, "runner", str)
+    issue_number = args.issue if args.issue is not None else manifest_issue
+    issue_source = args.issue_source or manifest_issue_source
+    if issue_source is None:
+        issue_source = "github" if issue_number is not None else "none"
+    github_repo = args.github_repo or manifest_github_repo
+    task_label = args.task_label or manifest_task_label
+    runner_name = args.runner or manifest_runner
+    if runner_name is None:
+        raise SystemExit("--runner is required unless --run-dir contains run-manifest.json")
+    include_issue_comments = args.include_issue_comments
+    if not include_issue_comments:
+        manifest_comments = manifest.get("include_issue_comments")
+        if manifest_comments is not None and not isinstance(manifest_comments, bool):
+            raise SystemExit("Run manifest field 'include_issue_comments' must be boolean")
+        include_issue_comments = bool(manifest_comments)
 
     runner_config_path = Path(args.runner_config)
     if not runner_config_path.is_absolute():
@@ -4722,35 +5400,33 @@ def main() -> None:
     runner_config = load_runner_config(
         runner_config_path,
         bundled_runner_config_path,
-        args.runner,
+        runner_name,
     )
     instruction_staging_config = InstructionStagingConfig.from_json(instruction_staging_config_path)
     runner = WorkflowRunner(
         repo_root=repo_root,
         workdir=workdir,
-        issue_number=str(args.issue) if args.issue is not None else None,
+        issue_number=str(issue_number) if issue_number is not None else None,
         runner_config=runner_config,
         instruction_staging_config=instruction_staging_config,
-        issue_source=args.issue_source,
-        github_repo=args.github_repo,
-        include_issue_comments=args.include_issue_comments,
-        task_label=args.task_label,
+        issue_source=issue_source,
+        github_repo=github_repo,
+        include_issue_comments=include_issue_comments,
+        task_label=task_label,
         dry_run=args.dry_run,
         allow_plan_check_external_send=args.allow_plan_check_external_send,
         plan_check_required=args.require_plan_comprehension_check,
+        artifact_dir=run_dir,
+        reuse_issue_cache=args.resume,
     )
     start_phase = args.from_phase
     if args.resume:
-        state_path = runner.artifact_dir / "workflow-state.json"
-        if not state_path.exists():
-            raise SystemExit(f"Cannot resume: workflow state not found at {state_path}")
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"Cannot resume: invalid workflow state: {exc}") from exc
-        if state.get("status") != "paused" or state.get("phase") not in PHASES:
-            raise SystemExit("Cannot resume: workflow is not in a valid paused phase")
+        state = runner.read_workflow_state()
+        if state.get("status") not in {"paused", "failed"} or state.get("phase") not in PHASES:
+            raise SystemExit("Cannot resume: workflow is not in a valid paused or failed phase")
         paused_phase = str(state["phase"])
+        if state.get("status") == "failed" and not args.resume_action and not args.waive_plan_comprehension_check:
+            raise SystemExit("Cannot resume a failed workflow without --resume-action retry or reopen")
         if state.get("plan_check_policy") == "required":
             runner.plan_check_required = True
         if args.waive_plan_comprehension_check:
@@ -4767,8 +5443,22 @@ def main() -> None:
             if next_phase_index > PHASES.index(args.to_phase):
                 return
             start_phase = PHASES[next_phase_index]
+        elif args.resume_action:
+            intervention = runner.record_human_intervention(
+                state,
+                args.resume_action,
+                resume_prompt,
+                target_phase=args.resume_phase,
+            )
+            if args.resume_action == "abort":
+                return
+            if intervention is None:
+                raise SystemExit("Human intervention did not produce a resumable action")
+            start_phase = intervention.phase
         else:
             start_phase = paused_phase
+    elif args.resume_action:
+        raise SystemExit("--resume-action requires --resume")
     runner.run(slice_phases(start_phase, args.to_phase))
 
 

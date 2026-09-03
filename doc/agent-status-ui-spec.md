@@ -17,7 +17,7 @@ Kelpie には `workflow-state.json` と phase outcome 履歴がある。
 
 `workflow-state.json` は現在、phase outcome 確定時に以下を記録する。
 
-- `status`: `running` / `paused` / `failed` / `completed`
+- `status`: `running` / `paused` / `failed` / `completed` / `aborted`
 - `phase`
 - `decision`
 - `reason_code`
@@ -52,7 +52,7 @@ workflow 状態と action だけを表示する。
 
 ## 4. 表示状態
 
-UI の正規状態は以下の 6 種類とする。
+UI の正規状態は以下の 7 種類とする。
 
 | UI 状態 | 意味 | 介入 | 表示優先度 |
 | --- | --- | --- | --- |
@@ -61,6 +61,7 @@ UI の正規状態は以下の 6 種類とする。
 | `waiting` | 人間または外部条件を待って停止中 | 必要または条件次第 | 最重要 |
 | `success` | 対象 workflow が正常完了 | 不要 | 通常 |
 | `error` | 対応が必要な失敗 | 必要 | 最重要 |
+| `aborted` | 人間が明示的に停止した状態 | 不要（再開は任意） | 重要 |
 | `unknown` | データ欠損、未知 schema、更新途絶等により判断不能 | 要確認 | 重要 |
 
 既存 runner 状態との対応は以下とする。
@@ -72,6 +73,7 @@ UI の正規状態は以下の 6 種類とする。
 | `paused` | `waiting` |
 | `completed` | `success` |
 | `failed` | `error` |
+| `aborted` | `aborted` |
 | 欠損、未対応値、stale 判定 | `unknown` |
 
 `unknown` を `idle` にフォールバックしてはならない。異常な監視状態を正常な待機と誤認するためである。
@@ -101,6 +103,20 @@ kelpie  ✕ error    implementation: artifact_invalid
 5. action
 
 `waiting` と `error` では、reason code を action より優先してよい。
+
+waiting/errorでは、status snapshotに含まれる`available_actions`、
+`intervention_request_path`、`resume_condition`を詳細表示へ渡す。UIは自由記述チャットを
+常設せず、reasonに応じたactionを選び、複数行の指示を入力して再開する。最小の操作は
+次の3つである。
+
+```text
+[request changes]  [reopen]  [abort]
+instruction: ______________________________________
+resume: python3 ... --run-dir ... --resume --resume-action ... --resume-prompt-file ...
+```
+
+`approve`は通常の検証を飛ばすforce-continueではなく、承認内容を次の実行へ渡す入力で
+ある。`high_severity_unresolved`ではapproveを表示しない。
 
 詳細表示では次を追加できる。
 
@@ -134,6 +150,9 @@ UI はログを解析せず、runner が atomically に書き換える status sn
 | `resume_condition` | no | waiting からの再開条件 |
 | `started_at` | yes | 経過時間の基点 |
 | `updated_at` | yes | stale 判定の基点 |
+| `available_actions` | no | reasonに応じた人間介入の選択肢 |
+| `intervention_request_path` | no | 現在のローカル介入要求 |
+| `intervention_response_path` | no | 直近の介入応答 |
 
 プロトタイプ用の例:
 

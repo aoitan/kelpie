@@ -3,6 +3,8 @@
 GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工程で順番に実行するためのテンプレートです。
 このリポジトリ自体をコンテナ内にマウントして使う前提で、ワークフロー実行スクリプトと各工程のプロンプト/スキルをまとめています。
 
+全引数、入力ソース、設定、成果物、停止・再開、人間介入、コンテナ運用は [完全利用ガイド](doc/usage-guide.md) を参照してください。
+
 ## 何があるか
 
 - `AGENTS.md`
@@ -37,6 +39,9 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 ├── README.md
 ├── compose.llm.yaml
 ├── compose.local.yaml
+├── doc/
+│   ├── agent-status-ui-spec.md
+│   └── usage-guide.md
 ├── install.bat
 ├── install.sh
 ├── examples/
@@ -58,6 +63,7 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 │   └── 08_pull_request.md
 ├── scripts/
 │   ├── convergence_policy.py
+│   ├── human_intervention.py
 │   ├── install_all_projects.sh
 │   ├── test_all_projects.sh
 │   ├── open_llm_shell_in_container.sh
@@ -116,7 +122,67 @@ resultを `plan-check/iterations/NNNN/attempts/` に保存します。retry後�
 
 各工程は`advance` / `pause` / `fail` / `complete`の構造化outcomeを出力します。
 hookやCLIの非0終了は運用障害、`pause`は工程固有の判断・入力待ちとして区別されます。
+pause、成果物不備、runner実行失敗は、ローカルの人間介入要求として保存されます。
 機械checkの失敗をLLMの`advance`で上書きすることはできません。
+
+## ローカル人間介入と再開
+
+Issueコメントを使わずに、停止したrunのartifact directoryから再開できます。
+通常のrunでは`run-manifest.json`が自動生成されるため、再開時にIssue番号やtask labelを
+繰り返す必要はありません。
+
+```bash
+python3 scripts/run_issue_workflow.py \
+  --workdir /path/to/target-repo \
+  --run-dir .kelpie/artifacts/github/owner/repo/issue-12 \
+  --resume \
+  --resume-action request-changes \
+  --resume-prompt-file ./feedback.md
+```
+
+前工程の成果物を作り直す場合は、`reopen`と対象工程を明示します。
+
+```bash
+python3 scripts/run_issue_workflow.py \
+  --workdir /path/to/target-repo \
+  --run-dir .kelpie/artifacts/manual/local/task-example \
+  --resume \
+  --resume-action reopen \
+  --resume-phase implementation \
+  --resume-prompt "implementation成果物を再生成し、レビュー可能なMDを残す"
+```
+
+人間介入の入力方法は次のいずれか1つです。
+
+- `--resume-prompt TEXT`: 短い指示。shellの履歴に残り得るため、機密情報には使わない。
+- `--resume-prompt-file PATH`: 複数行の指示。通常はこちらを使う。
+- `--resume-prompt-stdin`: stdinから読む。
+
+`--resume-action`には、`request-changes`、`provide-input`、`approve`、`retry`、
+`reopen`、`abort`があります。停止理由によって選択肢は絞られます。例えば
+`high_severity_unresolved`は`request-changes`、`reopen`、`abort`だけで、
+`approve`による強制通過はできません。`approve`も工程をスキップする操作ではなく、
+承認内容を次のphase実行へ渡し、通常のoutcome・artifact検証を受けます。
+
+`--resume`だけを指定した既存の再実行方法も利用できます。`--run-dir`は
+`.kelpie/artifacts/`配下に限定され、指定runの`workflow-state.json`とdigestが一致しない
+古い介入要求は受け付けません。再開時はrun内の`.issue-cache`を優先するため、初回取得済みの
+GitHub IssueならIssue再取得なしで進められます。
+
+介入の監査情報は次に保存されます。
+
+```text
+.kelpie/artifacts/.../issue-xx/
+  run-manifest.json
+  human-interventions/
+    requests/0001.json
+    responses/0001.json
+    responses/0001.md
+```
+
+`responses/*.md`が人間の指示本文、`responses/*.json`がaction・request digest・prompt
+digestです。古いrequestを書き換えて再利用せず、停止ごとに新しいrequestとresponseを
+追加します。
 
 ### implementation item loop (v5)
 
@@ -608,8 +674,18 @@ python3 scripts/run_issue_workflow.py \
 - `--dry-run`
   prompt 生成と実行コマンド表示だけ行い、CLI 呼び出しを省略します。
 - `--resume`
-  artifact directoryの`workflow-state.json`に記録されたpause工程を再実行します。
+  artifact directoryの`workflow-state.json`に記録されたpause/failed工程を再実行します。
   pause後に成果物を変更した場合も、古いoutcomeを再利用せず対象工程を再評価します。
+- `--run-dir`
+  `--resume`対象の既存artifact directoryです。`run-manifest.json`からIssue・task・runnerの
+  文脈を補完できるため、再開時の引数を短くできます。
+- `--resume-action`
+  ローカル人間介入の操作です。`request-changes`、`provide-input`、`approve`、`retry`、
+  `reopen`、`abort`から、停止理由に許されたものを選びます。
+- `--resume-phase`
+  `--resume-action reopen`時に、停止工程またはそれ以前の工程を再開対象にします。
+- `--resume-prompt` / `--resume-prompt-file` / `--resume-prompt-stdin`
+  選択したactionに渡す人間の指示です。同時には1つだけ指定できます。
 - `--allow-plan-check-external-send`
   `external-safe` と分類された計画成果物を
   `plan_comprehension_check` の外部モデルへ送ることを明示的に許可します。
