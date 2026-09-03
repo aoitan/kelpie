@@ -101,7 +101,16 @@ class WorkflowAcceptanceTests(unittest.TestCase):
         execution = json.loads(self.execution_config_path.read_text(encoding="utf-8"))
         combined = dict(planning)
         combined_nodes = list(planning["nodes"]) + list(execution["nodes"])
-        implementation = combined_nodes[6]
+        implementation = next(
+            (
+                node
+                for node in combined_nodes
+                if isinstance(node, dict)
+                and node.get("type") == "loop"
+                and node.get("id") == "implementation"
+            ),
+            None,
+        )
         assert isinstance(implementation, dict)
         source = implementation["source"]
         assert isinstance(source, dict)
