@@ -22,6 +22,28 @@ from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
 
 try:
+    from scripts.pipeline_executor import (
+        FixedSequenceController,
+        LoopController,
+        PipelineExecutor,
+        PipelineRunResult,
+        StepCompletionEvent,
+        StepExecutionRequest,
+        UnsupportedLoopControllerError,
+        prepare_workflow_run,
+    )
+    from scripts.workflow_config import (
+        ArtifactPathGuard,
+        CapabilityRegistry,
+        CapabilityRegistrySnapshot,
+        LoopConfig,
+        WorkflowConfig,
+        WorkflowConfigError,
+        default_capability_registry,
+        load_workflow_config,
+        normalize_workflow_config,
+        validate_workflow_capabilities,
+    )
     from scripts.plan_comprehension import AdjudicationResult, parse_json_payload, run_plan_check
     from scripts.single_change import (
         ActiveTarget,
@@ -43,6 +65,7 @@ try:
     )
     from scripts.workflow_outcomes import (
         PHASE_REASON_CODES,
+        PHASE_REQUIRED_ARTIFACTS,
         PhaseOutcome,
         persist_phase_outcome,
         safe_artifact_path,
@@ -50,6 +73,28 @@ try:
         validate_outcome_artifacts,
     )
 except ModuleNotFoundError:
+    from pipeline_executor import (  # type: ignore
+        FixedSequenceController,
+        LoopController,
+        PipelineExecutor,
+        PipelineRunResult,
+        StepCompletionEvent,
+        StepExecutionRequest,
+        UnsupportedLoopControllerError,
+        prepare_workflow_run,
+    )
+    from workflow_config import (
+        ArtifactPathGuard,
+        CapabilityRegistry,
+        CapabilityRegistrySnapshot,
+        LoopConfig,
+        WorkflowConfig,
+        WorkflowConfigError,
+        default_capability_registry,
+        load_workflow_config,
+        normalize_workflow_config,
+        validate_workflow_capabilities,
+    )
     from plan_comprehension import AdjudicationResult, parse_json_payload, run_plan_check
     from single_change import (
         ActiveTarget,
@@ -71,6 +116,7 @@ except ModuleNotFoundError:
     )
     from workflow_outcomes import (
         PHASE_REASON_CODES,
+        PHASE_REQUIRED_ARTIFACTS,
         PhaseOutcome,
         persist_phase_outcome,
         safe_artifact_path,
@@ -114,6 +160,9 @@ PHASE_TO_SKILL = {
     "review_fix_loop": "skills/review-fix-loop/SKILL.md",
     "pull_request": "skills/pull-request/SKILL.md",
 }
+
+DEFAULT_WORKFLOW_CONFIG_PATH = "workflows/issue-v1.json"
+CONFIGURED_WORKFLOW_STATE_FILENAME = "configured-workflow-state.json"
 
 IMPLEMENTATION_STEP_TO_PROMPT = {
     "implementation_coder": "prompts/06_implementation_coder.md",
@@ -617,6 +666,49 @@ class RunnerResolver:
         return runner.resolve_for_phase_and_step(phase, step_name)
 
 
+class RunnerResolverCapabilityAdapter:
+    """Expose runner names to workflow authority checks without moving command resolution.
+
+    The capability snapshot contains only stable runner IDs and registry
+    metadata.  The actual ``RunnerConfig`` (including its command template) is
+    still resolved by the existing ``RunnerResolver`` when an execution layer
+    explicitly asks for it.
+    """
+
+    def __init__(
+        self,
+        resolver: RunnerResolver,
+        *,
+        capability_registry: CapabilityRegistry | None = None,
+    ) -> None:
+        if not isinstance(resolver, RunnerResolver):
+            raise TypeError("resolver must be a RunnerResolver")
+        if capability_registry is not None and not isinstance(capability_registry, CapabilityRegistry):
+            raise TypeError("capability_registry must be a CapabilityRegistry")
+        self._resolver = resolver
+        self._capability_registry = capability_registry or default_capability_registry()
+
+    @property
+    def resolver(self) -> RunnerResolver:
+        return self._resolver
+
+    @property
+    def capability_registry(self) -> CapabilityRegistry:
+        return self._capability_registry
+
+    def snapshot(self, profile: str) -> CapabilityRegistrySnapshot:
+        # Runner names are copied into metadata only.  No command template is
+        # transferred to the workflow configuration boundary.
+        registry = self._capability_registry.with_runner_ids(self._resolver.runners)
+        return registry.snapshot(profile)
+
+    snapshot_for_profile = snapshot
+
+    def resolve(self, name: str | None, *, phase: str, step_name: str) -> RunnerConfig:
+        """Delegate command resolution to the pre-existing runner resolver."""
+        return self._resolver.resolve(name, phase=phase, step_name=step_name)
+
+
 @dataclass
 class InstructionTarget:
     requested_name: str
@@ -804,6 +896,151 @@ PATH_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SUPPORTED_STEP_POST_ACTIONS = frozenset({"write_work_items_artifact"})
 
 
+@dataclass(frozen=True)
+class LegacyLifecycleBinding:
+    """Trusted mapping from a workflow lifecycle capability to legacy hooks.
+
+    Workflow node IDs are deliberately absent from this object.  The
+    capability identifies the existing phase contract, while the configured
+    node ID remains the step's local execution name and artifact prefix.
+    """
+
+    capability_id: str
+    phase: str
+    runner_step_name: str | None = None
+    role: str | None = None
+    post_actions: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.capability_id, str) or not self.capability_id:
+            raise ValueError("lifecycle capability id must be a non-empty string")
+        if not isinstance(self.phase, str) or self.phase not in PHASES:
+            raise ValueError(f"unsupported legacy lifecycle phase: {self.phase!r}")
+        if self.runner_step_name is not None and (
+            not isinstance(self.runner_step_name, str) or not self.runner_step_name
+        ):
+            raise ValueError("runner_step_name must be a non-empty string when provided")
+        if self.role is not None:
+            if not isinstance(self.role, str) or not self.role:
+                raise ValueError("lifecycle role must be a non-empty string when provided")
+            role_aliases = {
+                "coder": "implementation_coder",
+                "reviewer": "implementation_reviewer",
+                "fix": "implementation_fix",
+                "fixer": "implementation_fix",
+            }
+            object.__setattr__(self, "role", role_aliases.get(self.role, self.role))
+        actions = tuple(self.post_actions)
+        if any(action not in SUPPORTED_STEP_POST_ACTIONS for action in actions):
+            raise ValueError("lifecycle binding contains an unsupported post action")
+        object.__setattr__(self, "post_actions", actions)
+
+    @property
+    def lifecycle_kind(self) -> str:
+        """Compatibility spelling used by adapter callers."""
+        return self.capability_id
+
+
+def _default_legacy_lifecycle_bindings() -> dict[str, LegacyLifecycleBinding]:
+    bindings = {
+        f"kelpie.phase.{phase}.v1": LegacyLifecycleBinding(
+            capability_id=f"kelpie.phase.{phase}.v1",
+            phase=phase,
+            runner_step_name=phase,
+            post_actions=(
+                ("write_work_items_artifact",)
+                if phase == "work_breakdown"
+                else ()
+            ),
+        )
+        for phase in PHASES
+    }
+    for role, phase in (
+        ("implementation_coder", "implementation"),
+        ("implementation_reviewer", "implementation"),
+        ("implementation_fix", "implementation"),
+    ):
+        capability_id = f"kelpie.phase.{role}.v1"
+        bindings[capability_id] = LegacyLifecycleBinding(
+            capability_id=capability_id,
+            phase=phase,
+            runner_step_name=role,
+            role=role,
+        )
+    return bindings
+
+
+LEGACY_LIFECYCLE_BINDINGS = MappingProxyType(_default_legacy_lifecycle_bindings())
+
+
+def resolve_legacy_lifecycle_binding(
+    capability_id: str,
+    *,
+    registry: CapabilityRegistrySnapshot | None = None,
+) -> LegacyLifecycleBinding:
+    """Resolve a registered lifecycle capability to an existing phase.
+
+    The built-in mapping covers the current fixed workflow.  A trusted
+    registry may provide the same mapping as capability metadata for a new
+    lifecycle adapter, but arbitrary config values never become executable
+    phase names or post actions.
+    """
+
+    if not isinstance(capability_id, str) or not capability_id:
+        raise ValueError("lifecycle capability id must be a non-empty string")
+
+    registered = LEGACY_LIFECYCLE_BINDINGS.get(capability_id)
+    if registered is not None:
+        return registered
+
+    if registry is not None:
+        if not isinstance(registry, CapabilityRegistrySnapshot):
+            raise TypeError("registry must be a CapabilityRegistrySnapshot")
+        capability = registry.lifecycles.get(capability_id)
+        if capability is not None:
+            metadata = capability.metadata
+            phase = metadata.get("legacy_phase", metadata.get("phase"))
+            if phase is not None:
+                if not isinstance(phase, str):
+                    raise ValueError(
+                        f"lifecycle metadata phase must be a string: {capability_id}"
+                    )
+                runner_step_name = metadata.get(
+                    "legacy_step_name",
+                    metadata.get("runner_step_name"),
+                )
+                role = metadata.get("legacy_role", metadata.get("role"))
+                raw_actions = metadata.get("post_actions", ())
+                if isinstance(raw_actions, str) or not isinstance(
+                    raw_actions, (list, tuple, set, frozenset)
+                ):
+                    raise ValueError(
+                        f"lifecycle metadata post_actions must be a collection: {capability_id}"
+                    )
+                if runner_step_name is not None and not isinstance(runner_step_name, str):
+                    raise ValueError(
+                        f"lifecycle metadata runner_step_name must be a string: {capability_id}"
+                    )
+                if role is not None and not isinstance(role, str):
+                    raise ValueError(
+                        f"lifecycle metadata role must be a string: {capability_id}"
+                    )
+                return LegacyLifecycleBinding(
+                    capability_id=capability_id,
+                    phase=phase,
+                    runner_step_name=runner_step_name,
+                    role=role,
+                    post_actions=tuple(raw_actions),
+                )
+
+    raise ValueError(
+        f"lifecycle capability has no registered legacy adapter: {capability_id!r}"
+    )
+
+
+lifecycle_binding_for_capability = resolve_legacy_lifecycle_binding
+
+
 @dataclass
 class StepSpec:
     """Declarative input to the generic step execution engine.
@@ -823,6 +1060,18 @@ class StepSpec:
     context_id: str | None = None
     artifact_subdir: str | None = None
     post_actions: list[str] | None = None
+    # The fields below are populated by the configured-workflow adapter.  The
+    # historical fixed workflow leaves them unset, so its public behavior is
+    # unchanged.
+    lifecycle: str | None = None
+    lifecycle_role: str | None = None
+    runner_step_name: str | None = None
+    resolved_input_values: Mapping[str, str] | None = None
+
+    @property
+    def lifecycle_kind(self) -> str | None:
+        """Return the capability ID without coupling it to ``name``."""
+        return self.lifecycle
 
 
 @dataclass(frozen=True)
@@ -1539,6 +1788,7 @@ class StepResolver:
         inputs = self.workflow.resolve_step_inputs(
             step.inputs or [],
             virtual_context=virtual_context,
+            resolved_values=step.resolved_input_values,
         )
 
         prompt_text = self.workflow.compose_phase_prompt(
@@ -1565,6 +1815,827 @@ class StepResolver:
             ),
             prompt_preexisted=prompt_path.is_file(),
         )
+
+
+def _adapter_json_value(value: object) -> object:
+    """Convert a resolved pipeline value into bounded prompt-safe JSON data."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _adapter_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_adapter_json_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return [_adapter_json_value(item) for item in sorted(value, key=repr)]
+    return value
+
+
+def _adapter_input_text(value: object) -> str:
+    """Render a pipeline input without asking a mutable provider a second time."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(
+            _adapter_json_value(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return str(value)
+
+
+class WorkflowRunnerStepExecutionPort:
+    """Bridge a configured step request to the existing ``WorkflowRunner``.
+
+    The runner keeps ownership of prompt composition, runner command
+    resolution, locks, hooks, post-actions, phase checks, and outcomes.  This
+    port only translates the already validated Pipeline Executor request into
+    the legacy ``StepSpec`` shape and translates lifecycle pause/failure into a
+    completion event.  It never derives a lifecycle from a node ID.
+    """
+
+    def __init__(
+        self,
+        workflow: object,
+        *,
+        lifecycle_bindings: Mapping[str, LegacyLifecycleBinding] | None = None,
+        registry: CapabilityRegistrySnapshot | None = None,
+        load_review_results: bool = True,
+    ) -> None:
+        if not callable(getattr(workflow, "run_step", None)):
+            raise TypeError("workflow must expose a callable run_step method")
+        if not hasattr(workflow, "artifact_dir"):
+            raise TypeError("workflow must expose an artifact_dir")
+        if registry is not None and not isinstance(registry, CapabilityRegistrySnapshot):
+            raise TypeError("registry must be a CapabilityRegistrySnapshot")
+        if not isinstance(load_review_results, bool):
+            raise TypeError("load_review_results must be a boolean")
+        configured = dict(LEGACY_LIFECYCLE_BINDINGS)
+        if lifecycle_bindings is not None:
+            for capability_id, binding in lifecycle_bindings.items():
+                if not isinstance(capability_id, str) or not capability_id:
+                    raise ValueError("lifecycle binding keys must be non-empty strings")
+                if not isinstance(binding, LegacyLifecycleBinding):
+                    raise TypeError("lifecycle bindings must contain LegacyLifecycleBinding values")
+                if binding.capability_id != capability_id:
+                    raise ValueError(
+                        "lifecycle binding key does not match its capability id: "
+                        f"{capability_id}"
+                    )
+                configured[capability_id] = binding
+        self.workflow = workflow
+        self.registry = registry
+        self.lifecycle_bindings = MappingProxyType(configured)
+        self.load_review_results = load_review_results
+
+    def lifecycle_binding(self, capability_id: str) -> LegacyLifecycleBinding:
+        configured = self.lifecycle_bindings.get(capability_id)
+        if configured is not None:
+            return configured
+        return resolve_legacy_lifecycle_binding(
+            capability_id,
+            registry=self.registry,
+        )
+
+    resolve_lifecycle = lifecycle_binding
+
+    def _scope_subdir(self, request: StepExecutionRequest) -> str | None:
+        root = Path(self.workflow.artifact_dir).absolute()
+        scope = Path(request.artifact_scope).absolute()
+        try:
+            if scope.resolve(strict=False) != root.resolve(strict=False) and not scope.resolve(
+                strict=False
+            ).is_relative_to(root.resolve(strict=False)):
+                raise ValueError
+            relative = scope.relative_to(root)
+        except (ValueError, OSError, RuntimeError) as exc:
+            raise ValueError(
+                "configured step artifact scope must be below the WorkflowRunner artifact root"
+            ) from exc
+        if relative == Path("."):
+            return None
+        return relative.as_posix()
+
+    def build_step_spec(
+        self,
+        request: StepExecutionRequest,
+    ) -> tuple[StepSpec, dict[str, str], LegacyLifecycleBinding]:
+        """Translate one immutable pipeline request into a legacy step spec."""
+        if not isinstance(request, StepExecutionRequest):
+            raise TypeError("request must be a StepExecutionRequest")
+        binding = self.lifecycle_binding(request.step.lifecycle)
+        resolved_values = {
+            item.source: _adapter_input_text(item.value)
+            for item in request.resolved_inputs
+        }
+        virtual_context = {
+            item.source: resolved_values[item.source]
+            for item in request.resolved_inputs
+            if item.source.startswith("$")
+        }
+        spec = StepSpec(
+            name=request.step.local_id,
+            phase=binding.phase,
+            prompt_file=request.step.prompt,
+            skill_file=request.step.skill,
+            runner_name=request.step.runner,
+            inputs=[item.source for item in request.resolved_inputs],
+            outputs=[output.output.path for output in request.expected_outputs],
+            artifact_subdir=self._scope_subdir(request),
+            post_actions=list(binding.post_actions),
+            lifecycle=request.step.lifecycle,
+            lifecycle_role=binding.role,
+            runner_step_name=binding.runner_step_name,
+            resolved_input_values=resolved_values,
+        )
+        return spec, virtual_context, binding
+
+    to_step_spec = build_step_spec
+
+    def _review_expectation(
+        self,
+        spec: StepSpec,
+    ) -> ReviewOutputExpectation:
+        scope = self.workflow.resolve_artifact_scope(spec)
+        return self.workflow.review_result_loader.prepare_target(scope)
+
+    @staticmethod
+    def _review_iteration(spec: StepSpec) -> int:
+        parts = tuple((spec.artifact_subdir or "").split("/"))
+        try:
+            index = parts.index("iterations")
+            return int(parts[index + 1])
+        except (ValueError, IndexError, TypeError):
+            return 0
+
+    def _read_phase_outcome(
+        self,
+        binding: LegacyLifecycleBinding,
+        spec: StepSpec,
+        *,
+        previous_fingerprint: tuple[int, int, int, int] | None = None,
+    ) -> PhaseOutcome | None:
+        try:
+            path = self.workflow.phase_outcome_path(
+                binding.phase,
+                self.workflow.resolve_artifact_scope(spec),
+                step_name=spec.name,
+            )
+            current_fingerprint = self._phase_outcome_fingerprint(path)
+            if (
+                previous_fingerprint is not None
+                and current_fingerprint == previous_fingerprint
+            ):
+                return None
+            if not path.is_file() or path.is_symlink():
+                return None
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return None
+            outcome = PhaseOutcome.from_dict(raw, expected_phase=binding.phase)
+            if outcome.decision not in {"pause", "fail"}:
+                return None
+            return outcome
+        except (OSError, json.JSONDecodeError, ValueError, RuntimeError):
+            return None
+
+    @staticmethod
+    def _phase_outcome_fingerprint(path: Path) -> tuple[int, int, int, int] | None:
+        try:
+            observed = path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(observed.st_mode):
+            return None
+        return (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+            observed.st_mtime_ns,
+        )
+
+    def execute(self, request: StepExecutionRequest) -> StepCompletionEvent:
+        """Run one request through the complete existing lifecycle."""
+        spec, virtual_context, binding = self.build_step_spec(request)
+        reviewer_expectation: ReviewOutputExpectation | None = None
+        is_reviewer = binding.role == "implementation_reviewer"
+        if is_reviewer and self.load_review_results:
+            reviewer_expectation = self._review_expectation(spec)
+        outcome_path = self.workflow.phase_outcome_path(
+            binding.phase,
+            self.workflow.resolve_artifact_scope(spec),
+            step_name=spec.name,
+        )
+        outcome_fingerprint = self._phase_outcome_fingerprint(outcome_path)
+
+        try:
+            raw_result = self.workflow.run_step(
+                spec,
+                virtual_context=virtual_context,
+            )
+        except SystemExit as exc:
+            # ``WorkflowRunner`` reports persisted phase pause/fail outcomes
+            # through SystemExit.  Preserve the distinction for the generic
+            # executor; runner and hook failures without an outcome continue
+            # to propagate and are classified by the caller.
+            outcome = self._read_phase_outcome(
+                binding,
+                spec,
+                previous_fingerprint=outcome_fingerprint,
+            )
+            if outcome is None:
+                raise
+            status = "paused" if outcome.decision == "pause" else "failed"
+            return StepCompletionEvent(
+                node_instance_id=request.node_instance_id,
+                success=False,
+                status=status,
+                result=outcome,
+                error=exc,
+            )
+
+        result: object = raw_result
+        if is_reviewer and self.load_review_results:
+            if reviewer_expectation is None:  # pragma: no cover - defensive
+                raise ReviewResultValidationError("reviewer output expectation was not prepared")
+            item_id = (
+                request.loop_context.item_id
+                if request.loop_context is not None
+                else "top-level"
+            )
+            result = self.workflow.review_result_loader.load(
+                reviewer_expectation,
+                run_id=request.run_identity,
+                item_id=item_id,
+                iteration=self._review_iteration(spec),
+            )
+        return StepCompletionEvent(
+            node_instance_id=request.node_instance_id,
+            success=True,
+            status="completed",
+            result=result,
+        )
+
+
+# Descriptive aliases make the bridge discoverable to integrations that call
+# the boundary an execution port or a lifecycle adapter.
+WorkflowRunnerExecutionPort = WorkflowRunnerStepExecutionPort
+WorkflowLifecycleAdapter = WorkflowRunnerStepExecutionPort
+StepExecutionAdapter = WorkflowRunnerStepExecutionPort
+
+
+CHARACTERIZATION_LIFECYCLE_STAGES = (
+    "pre",
+    "execute",
+    "post_action",
+    "post_check",
+    "outcome",
+)
+CHARACTERIZATION_OUTCOME_DECISIONS = ("advance", "pause", "fail", "complete")
+
+
+def _characterization_relative_scope(path: Path | str, root: Path | str) -> str:
+    candidate = Path(path).absolute()
+    artifact_root = Path(root).absolute()
+    try:
+        relative = candidate.relative_to(artifact_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"characterization scope is outside the artifact root: {candidate}"
+        ) from exc
+    return "" if relative == Path(".") else relative.as_posix()
+
+
+def _characterization_output_paths(
+    outputs: Iterable[object],
+    scope: Path | str,
+) -> tuple[str, ...]:
+    scope_path = Path(scope).absolute()
+    paths: list[str] = []
+    for output in outputs:
+        path = Path(getattr(output, "path", output)).absolute()
+        try:
+            relative = path.relative_to(scope_path)
+        except ValueError as exc:
+            raise ValueError(
+                f"characterization output is outside its step scope: {path}"
+            ) from exc
+        paths.append(relative.as_posix())
+    return tuple(paths)
+
+
+@dataclass(frozen=True)
+class WorkflowCharacterizationEvent:
+    """Comparable lifecycle contract for legacy and configured workflows.
+
+    The event intentionally contains descriptors rather than runner results.
+    It is suitable for a fake execution port and keeps command resolution and
+    lifecycle policy out of the parity oracle.  ``outcome_decisions`` records
+    the existing outcome/pause boundary; it does not select a route.
+    """
+
+    node_instance_id: str
+    lifecycle: str
+    phase: str
+    runner: str
+    prompt: str
+    skill: str
+    inputs: tuple[str, ...]
+    outputs: tuple[str, ...]
+    artifact_scope: str
+    required_outputs: tuple[str, ...]
+    post_actions: tuple[str, ...] = ()
+    lifecycle_stages: tuple[str, ...] = CHARACTERIZATION_LIFECYCLE_STAGES
+    outcome_decisions: tuple[str, ...] = CHARACTERIZATION_OUTCOME_DECISIONS
+
+    @classmethod
+    def from_request(
+        cls,
+        request: StepExecutionRequest,
+        *,
+        artifact_root: Path | str,
+    ) -> "WorkflowCharacterizationEvent":
+        if not isinstance(request, StepExecutionRequest):
+            raise TypeError("request must be a StepExecutionRequest")
+        binding = resolve_legacy_lifecycle_binding(request.step.lifecycle)
+        outputs = _characterization_output_paths(
+            request.expected_outputs,
+            request.artifact_scope,
+        )
+        return cls(
+            node_instance_id=request.node_instance_id,
+            lifecycle=request.step.lifecycle,
+            phase=binding.phase,
+            runner=request.step.runner,
+            prompt=request.step.prompt,
+            skill=request.step.skill,
+            inputs=tuple(item.source for item in request.resolved_inputs),
+            outputs=outputs,
+            artifact_scope=_characterization_relative_scope(
+                request.artifact_scope,
+                artifact_root,
+            ),
+            required_outputs=outputs,
+            post_actions=binding.post_actions,
+        )
+
+    @classmethod
+    def from_legacy_step(
+        cls,
+        step: StepSpec,
+        *,
+        artifact_root: Path | str,
+        node_instance_id: str | None = None,
+        runner_name: str = "codex",
+        lifecycle: str | None = None,
+        inputs: Iterable[str] | None = None,
+        required_outputs: Iterable[str] | None = None,
+    ) -> "WorkflowCharacterizationEvent":
+        if not isinstance(step, StepSpec):
+            raise TypeError("step must be a StepSpec")
+        phase = step.phase or step.name
+        role_name = step.runner_step_name or step.name
+        effective_lifecycle = lifecycle or step.lifecycle
+        if effective_lifecycle is None:
+            lifecycle_name = role_name if role_name in IMPLEMENTATION_STEP_TO_PROMPT else phase
+            effective_lifecycle = f"kelpie.phase.{lifecycle_name}.v1"
+        binding = resolve_legacy_lifecycle_binding(effective_lifecycle)
+        prompt = step.prompt_file or IMPLEMENTATION_STEP_TO_PROMPT.get(role_name)
+        if prompt is None:
+            prompt = PHASE_TO_PROMPT[phase]
+        skill = step.skill_file or IMPLEMENTATION_STEP_TO_SKILL.get(role_name)
+        if skill is None:
+            skill = PHASE_TO_SKILL[phase]
+        scope_parts = [part for part in (step.context_id, step.artifact_subdir) if part]
+        scope = "/".join(scope_parts)
+        output_paths = tuple(step.outputs or ())
+        effective_inputs = tuple(step.inputs or ()) if inputs is None else tuple(inputs)
+        effective_required = (
+            output_paths if required_outputs is None else tuple(required_outputs)
+        )
+        return cls(
+            node_instance_id=node_instance_id or f"nodes/{step.name}",
+            lifecycle=effective_lifecycle,
+            phase=binding.phase,
+            runner=step.runner_name or runner_name,
+            prompt=prompt,
+            skill=skill,
+            inputs=effective_inputs,
+            outputs=output_paths,
+            artifact_scope=_characterization_relative_scope(
+                Path(artifact_root) / scope,
+                artifact_root,
+            ),
+            required_outputs=effective_required,
+            post_actions=tuple(step.post_actions or ()),
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "node_instance_id": self.node_instance_id,
+            "lifecycle": self.lifecycle,
+            "phase": self.phase,
+            "runner": self.runner,
+            "prompt": self.prompt,
+            "skill": self.skill,
+            "inputs": list(self.inputs),
+            "outputs": list(self.outputs),
+            "artifact_scope": self.artifact_scope,
+            "required_outputs": list(self.required_outputs),
+            "post_actions": list(self.post_actions),
+            "lifecycle_stages": list(self.lifecycle_stages),
+            "outcome_decisions": list(self.outcome_decisions),
+        }
+
+    def contract(self) -> tuple[object, ...]:
+        """Return the stable fields used by the parity comparison."""
+        return (
+            self.node_instance_id,
+            self.lifecycle,
+            self.phase,
+            self.runner,
+            self.prompt,
+            self.skill,
+            self.inputs,
+            self.outputs,
+            self.artifact_scope,
+            self.required_outputs,
+            self.post_actions,
+            self.lifecycle_stages,
+            self.outcome_decisions,
+        )
+
+
+@dataclass(frozen=True)
+class WorkflowParityReport:
+    """Result of comparing ordered lifecycle characterization events."""
+
+    legacy_events: tuple[WorkflowCharacterizationEvent, ...]
+    configured_events: tuple[WorkflowCharacterizationEvent, ...]
+    differences: tuple[str, ...]
+
+    @property
+    def matches(self) -> bool:
+        return not self.differences
+
+    @property
+    def is_match(self) -> bool:
+        return self.matches
+
+    def assert_matches(self) -> None:
+        if not self.matches:
+            raise WorkflowParityError(self)
+
+
+class WorkflowParityError(AssertionError):
+    """Raised when the configured workflow diverges from the legacy oracle."""
+
+    def __init__(self, report: WorkflowParityReport) -> None:
+        self.report = report
+        detail = "\n".join(report.differences)
+        super().__init__(f"workflow characterization parity failed:\n{detail}")
+
+
+def characterize_configured_requests(
+    requests: Iterable[StepExecutionRequest],
+    *,
+    artifact_root: Path | str,
+) -> tuple[WorkflowCharacterizationEvent, ...]:
+    """Convert fake-port requests into ordered, comparable lifecycle events."""
+    return tuple(
+        WorkflowCharacterizationEvent.from_request(
+            request,
+            artifact_root=artifact_root,
+        )
+        for request in requests
+    )
+
+
+characterize_pipeline_requests = characterize_configured_requests
+
+
+def characterize_legacy_workflow(
+    artifact_root: Path | str,
+    *,
+    item_ids: Iterable[str] = (),
+    runner_name: str = "codex",
+    review_status: str | Mapping[str, str] = "no_findings",
+    review_input_source: str = "item-artifact:implementation_reviewer_initial.review",
+) -> tuple[WorkflowCharacterizationEvent, ...]:
+    """Build the fixed-workflow characterization oracle without executing it.
+
+    ``review_status`` selects the two valid legacy implementation routes: a
+    clean initial review, or the one permitted fix followed by a final review.
+    The review artifact selector is the v1 typed equivalent of the legacy
+    ``$review_findings`` context and is kept explicit for parity diagnostics.
+    """
+    item_values = tuple(item_ids)
+    status_by_item: dict[str, str] = {}
+    if isinstance(review_status, str):
+        status_by_item = {item_id: review_status for item_id in item_values}
+    elif isinstance(review_status, Mapping):
+        status_by_item = {
+            item_id: str(review_status.get(item_id, "no_findings"))
+            for item_id in item_values
+        }
+    else:
+        raise TypeError("review_status must be a string or mapping")
+    if any(
+        status not in {"no_findings", "findings_present"}
+        for status in status_by_item.values()
+    ):
+        raise ValueError("review_status must be no_findings or findings_present")
+    for item_id in item_values:
+        if not isinstance(item_id, str) or PATH_SEGMENT_PATTERN.fullmatch(item_id) is None:
+            raise ValueError(f"invalid characterization item id: {item_id!r}")
+
+    events: list[WorkflowCharacterizationEvent] = []
+    factory = ImplementationStepFactory()
+    for phase in PHASES:
+        if phase == "implementation":
+            for position, item_id in enumerate(item_values):
+                payload = {"id": item_id}
+                canonical_json = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                snapshot = WorkItemSnapshot(
+                    id=item_id,
+                    position=position,
+                    payload=payload,
+                    canonical_json=canonical_json,
+                    payload_sha256=hashlib.sha256(canonical_json.encode("utf-8")).hexdigest(),
+                )
+                potential = factory.potential_steps(snapshot)
+                selected_indices = (0, 1)
+                if status_by_item[item_id] == "findings_present":
+                    selected_indices = (0, 1, 2, 3)
+                role_ids = (
+                    "implementation_coder",
+                    "implementation_reviewer_initial",
+                    "implementation_fix",
+                    "implementation_reviewer_final",
+                )
+                for index in selected_indices:
+                    step = potential[index]
+                    events.append(
+                        WorkflowCharacterizationEvent.from_legacy_step(
+                            step,
+                            artifact_root=artifact_root,
+                            node_instance_id=(
+                                f"nodes/implementation/body/{role_ids[index]}@{item_id}"
+                            ),
+                            runner_name=runner_name,
+                            lifecycle=f"kelpie.phase.{step.name}.v1",
+                            inputs=(
+                                ("$loop_item", review_input_source)
+                                if step.name == "implementation_fix"
+                                else tuple(step.inputs or ())
+                            ),
+                        )
+                    )
+            continue
+
+        step = StepSpec(
+            name=phase,
+            phase=phase,
+            inputs=["$issue", "$repo_instructions"],
+            outputs=list(PHASE_REQUIRED_ARTIFACTS[phase]),
+            post_actions=(
+                ["write_work_items_artifact"] if phase == "work_breakdown" else []
+            ),
+        )
+        events.append(
+            WorkflowCharacterizationEvent.from_legacy_step(
+                step,
+                artifact_root=artifact_root,
+                node_instance_id=f"nodes/{phase}",
+                runner_name=runner_name,
+            )
+        )
+    return tuple(events)
+
+
+legacy_characterization_events = characterize_legacy_workflow
+
+
+def compare_workflow_characterization(
+    legacy_events: Iterable[WorkflowCharacterizationEvent],
+    configured_events: Iterable[WorkflowCharacterizationEvent],
+) -> WorkflowParityReport:
+    """Compare ordered events and return every observable parity difference."""
+    legacy = tuple(legacy_events)
+    configured = tuple(configured_events)
+    differences: list[str] = []
+    if len(legacy) != len(configured):
+        differences.append(
+            f"event count differs: legacy={len(legacy)}, configured={len(configured)}"
+        )
+    field_names = (
+        "node_instance_id",
+        "lifecycle",
+        "phase",
+        "runner",
+        "prompt",
+        "skill",
+        "inputs",
+        "outputs",
+        "artifact_scope",
+        "required_outputs",
+        "post_actions",
+        "lifecycle_stages",
+        "outcome_decisions",
+    )
+    for index, (legacy_event, configured_event) in enumerate(zip(legacy, configured)):
+        if legacy_event.contract() == configured_event.contract():
+            continue
+        for field_name in field_names:
+            legacy_value = getattr(legacy_event, field_name)
+            configured_value = getattr(configured_event, field_name)
+            if legacy_value != configured_value:
+                differences.append(
+                    f"event[{index}] {field_name} differs: "
+                    f"legacy={legacy_value!r}, configured={configured_value!r}"
+                )
+    return WorkflowParityReport(
+        legacy_events=legacy,
+        configured_events=configured,
+        differences=tuple(differences),
+    )
+
+
+compare_characterization_events = compare_workflow_characterization
+
+
+def assert_workflow_parity(
+    legacy_events: Iterable[WorkflowCharacterizationEvent],
+    configured_events: Iterable[WorkflowCharacterizationEvent],
+) -> WorkflowParityReport:
+    report = compare_workflow_characterization(legacy_events, configured_events)
+    report.assert_matches()
+    return report
+
+
+class ImplementationReviewController:
+    """Registered compatibility controller for the existing review/fix flow.
+
+    It selects only role steps declared in the supplied loop body.  The
+    generic Pipeline Executor validates those IDs again before execution.  A
+    typed :class:`ReviewResult` is the only transition signal consumed here;
+    convergence, routing, retry, budget, and human-gate policy remain outside
+    this structural compatibility bridge.
+    """
+
+    capability_id = "implementation_review_v1"
+
+    def __init__(
+        self,
+        *,
+        lifecycle_bindings: Mapping[str, LegacyLifecycleBinding] | None = None,
+        registry: CapabilityRegistrySnapshot | None = None,
+    ) -> None:
+        if registry is not None and not isinstance(registry, CapabilityRegistrySnapshot):
+            raise TypeError("registry must be a CapabilityRegistrySnapshot")
+        configured = dict(LEGACY_LIFECYCLE_BINDINGS)
+        if lifecycle_bindings is not None:
+            for capability_id, binding in lifecycle_bindings.items():
+                if not isinstance(binding, LegacyLifecycleBinding):
+                    raise TypeError("lifecycle bindings must contain LegacyLifecycleBinding values")
+                if binding.capability_id != capability_id:
+                    raise ValueError("lifecycle binding key does not match its capability id")
+                configured[capability_id] = binding
+        self.registry = registry
+        self.lifecycle_bindings = MappingProxyType(configured)
+
+    def lifecycle_binding(self, capability_id: str) -> LegacyLifecycleBinding:
+        binding = self.lifecycle_bindings.get(capability_id)
+        if binding is not None:
+            return binding
+        return resolve_legacy_lifecycle_binding(capability_id, registry=self.registry)
+
+    def _role(self, step: object) -> str | None:
+        lifecycle = getattr(step, "lifecycle", None)
+        if not isinstance(lifecycle, str):
+            return None
+        return self.lifecycle_binding(lifecycle).role
+
+    def _role_steps(
+        self,
+        loop: object,
+    ) -> tuple[tuple[object, ...], tuple[object, ...], tuple[object, ...], tuple[object, ...]]:
+        body = tuple(getattr(loop, "body", ()))
+        if not body:
+            raise UnsupportedLoopControllerError(
+                "implementation review controller requires a non-empty body"
+            )
+        grouped: dict[str, list[object]] = {
+            "implementation_coder": [],
+            "implementation_reviewer": [],
+            "implementation_fix": [],
+        }
+        for step in body:
+            role = self._role(step)
+            if role not in grouped:
+                raise UnsupportedLoopControllerError(
+                    "implementation review controller received a body step without "
+                    f"a registered implementation role: {getattr(step, 'local_id', step)!r}"
+                )
+            grouped[role].append(step)
+        coders = tuple(grouped["implementation_coder"])
+        reviewers = tuple(grouped["implementation_reviewer"])
+        fixers = tuple(grouped["implementation_fix"])
+        if len(coders) != 1 or len(reviewers) not in {1, 2} or len(fixers) > 1:
+            raise UnsupportedLoopControllerError(
+                "implementation review controller body must contain one coder, "
+                "one or two reviewers, and at most one fixer"
+            )
+        if len(reviewers) == 2 and len(fixers) != 1:
+            raise UnsupportedLoopControllerError(
+                "two implementation reviewers require one declared fixer"
+            )
+        if len(reviewers) == 1 and fixers:
+            raise UnsupportedLoopControllerError(
+                "an implementation fixer requires an initial and final reviewer"
+            )
+        return coders, reviewers, fixers, body
+
+    def initial_steps(self, loop: object, item: object) -> tuple[str, ...]:
+        _ = item
+        coders, _reviewers, _fixers, _body = self._role_steps(loop)
+        return (getattr(coders[0], "local_id"),)
+
+    @staticmethod
+    def _review_status(event: StepCompletionEvent) -> str:
+        result = event.result
+        if not isinstance(result, ReviewResult):
+            raise ReviewResultValidationError(
+                "implementation review controller requires a validated review result"
+            )
+        return result.status
+
+    def next_steps(
+        self,
+        loop: object,
+        item: object,
+        completed_step: object,
+        event: StepCompletionEvent,
+    ) -> tuple[str, ...]:
+        _ = item
+        if not isinstance(event, StepCompletionEvent):
+            raise UnsupportedLoopControllerError(
+                "implementation review controller requires a StepCompletionEvent"
+            )
+        coders, reviewers, fixers, body = self._role_steps(loop)
+        body_ids = {getattr(step, "local_id", None) for step in body}
+        completed_id = getattr(completed_step, "local_id", None)
+        if completed_id not in body_ids:
+            raise UnsupportedLoopControllerError(
+                "implementation review controller received an undeclared completed step"
+            )
+        role = self._role(completed_step)
+        if role == "implementation_coder":
+            return (getattr(reviewers[0], "local_id"),)
+        if role == "implementation_fix":
+            return (getattr(reviewers[1], "local_id"),)
+        if role != "implementation_reviewer":
+            raise UnsupportedLoopControllerError(
+                "implementation review controller received an unsupported role"
+            )
+
+        reviewer_index = next(
+            (index for index, reviewer in enumerate(reviewers) if reviewer is completed_step),
+            None,
+        )
+        if reviewer_index is None:
+            reviewer_index = next(
+                (
+                    index
+                    for index, reviewer in enumerate(reviewers)
+                    if getattr(reviewer, "local_id", None) == completed_id
+                ),
+                None,
+            )
+        if reviewer_index is None:
+            raise UnsupportedLoopControllerError(
+                "implementation review controller received an undeclared reviewer"
+            )
+        if self._review_status(event) == "no_findings":
+            return ()
+        if reviewer_index == 0 and fixers:
+            return (getattr(fixers[0], "local_id"),)
+        raise ImplementationSafetyLimitReached(
+            "Implementation review findings remain after the registered fix attempt"
+        )
+
+    select_initial_steps = initial_steps
+    select_next_steps = next_steps
+
+
+ImplementationReviewV1Controller = ImplementationReviewController
 
 
 def merge_hook_dicts(base: dict[str, object], override: dict[str, object]) -> dict[str, object]:
@@ -1746,6 +2817,12 @@ class WorkflowRunner:
         self.dry_run = dry_run
         self.allow_plan_check_external_send = allow_plan_check_external_send
         self.plan_check_required = plan_check_required
+        # Configured execution takes one immutable snapshot of these inputs
+        # during preflight.  The legacy prompt composer still asks its
+        # providers for the values on every step, so the cache below prevents
+        # a later issue/source change from silently changing a run identity.
+        self._configured_issue_snapshot: str | None = None
+        self._configured_repo_instructions_snapshot: str | None = None
         self.implementation_step_factory = implementation_step_factory or ImplementationStepFactory()
 
         if isinstance(runner_registry, RunnerResolver):
@@ -1757,6 +2834,7 @@ class WorkflowRunner:
                 registered_runners,
                 default_name=runner_config.name,
             )
+        self.runner_capability_adapter = RunnerResolverCapabilityAdapter(self.runner_resolver)
 
         self.kelpie_dir = self.workdir / ".kelpie"
         self.user_config_dir = Path(os.environ.get("KELPIE_CONFIG_HOME", "~/.config/kelpie")).expanduser()
@@ -1764,6 +2842,7 @@ class WorkflowRunner:
             raise ValueError(f"Symlinked kelpie directory is not allowed: {self.kelpie_dir}")
         self.ensure_kelpie_dir()
         self.artifact_dir = self.compute_artifact_dir()
+        self.artifact_path_guard = ArtifactPathGuard(self.artifact_dir)
         self._reject_symlink_components(self.workdir, self.artifact_dir)
         self.intent_dir = self.artifact_dir / "intent-records"
         self.checks_dir = self.artifact_dir / "checks"
@@ -1791,6 +2870,210 @@ class WorkflowRunner:
             "normal": self.finalize_normal_step,
             "plan_comprehension": self.finalize_plan_comprehension_step,
         }
+
+    def capability_registry_snapshot(self, profile: str) -> CapabilityRegistrySnapshot:
+        """Return a profile-bound view used by configured workflow preflight."""
+        return self.runner_capability_adapter.snapshot(profile)
+
+    def step_execution_port(
+        self,
+        *,
+        lifecycle_bindings: Mapping[str, LegacyLifecycleBinding] | None = None,
+        registry: CapabilityRegistrySnapshot | None = None,
+        load_review_results: bool = True,
+    ) -> WorkflowRunnerStepExecutionPort:
+        """Create the configured-workflow port backed by this runner."""
+        return WorkflowRunnerStepExecutionPort(
+            self,
+            lifecycle_bindings=lifecycle_bindings,
+            registry=registry,
+            load_review_results=load_review_results,
+        )
+
+    pipeline_step_execution_port = step_execution_port
+
+    def configured_pipeline_executor(
+        self,
+        *,
+        lifecycle_bindings: Mapping[str, LegacyLifecycleBinding] | None = None,
+        registry: CapabilityRegistrySnapshot | None = None,
+        load_review_results: bool = True,
+        controllers: Mapping[str, LoopController] | None = None,
+        **kwargs: object,
+    ) -> PipelineExecutor:
+        """Build a Pipeline Executor wired to the existing lifecycle bridge.
+
+        CLI selection remains outside this method (the WB-10 migration gate).
+        Callers explicitly opt into the configured executor and may provide
+        additional trusted controllers for their profile.
+        """
+        configured_controllers = dict(controllers or {})
+        configured_controllers.setdefault(
+            "implementation_review_v1",
+            ImplementationReviewController(
+                lifecycle_bindings=lifecycle_bindings,
+                registry=registry,
+            ),
+        )
+        return PipelineExecutor(
+            self.step_execution_port(
+                lifecycle_bindings=lifecycle_bindings,
+                registry=registry,
+                load_review_results=load_review_results,
+            ),
+            controllers=configured_controllers,
+            **kwargs,
+        )
+
+    make_pipeline_executor = configured_pipeline_executor
+
+    def configured_loop_source_items(
+        self,
+        provider_id: str = "kelpie.work_items.v1",
+    ) -> list[dict[str, object]]:
+        """Read the registered work-item source once for configured preflight.
+
+        The configured workflow may only use source providers that are
+        registered by the workflow capability layer.  The current CLI bridge
+        has one such provider: the validated ``work_items.json`` handoff from
+        the preceding planning workflow.  Returning decoded values here lets
+        ``preflight_workflow_bounds`` freeze the source exactly once without
+        asking the runner to read the file again during execution.
+        """
+
+        if provider_id != "kelpie.work_items.v1":
+            raise ValueError(
+                f"configured workflow source provider is not supported by this CLI: {provider_id}"
+            )
+        source_path = self.work_items_json_path()
+        self._assert_artifact_path_contained(source_path)
+        self._reject_symlink_components(self.artifact_dir, source_path)
+        if not source_path.is_file():
+            raise ValueError(
+                "configured workflow loop source is unavailable; run the "
+                "planning workflow before the execution workflow"
+            )
+        try:
+            raw = source_path.read_bytes()
+        except OSError as exc:
+            raise ValueError(
+                f"configured workflow loop source could not be read: {source_path}"
+            ) from exc
+        if len(raw) > MAX_IMPLEMENTATION_LOOP_SOURCE_BYTES:
+            raise ValueError(
+                "configured workflow work_items.json exceeds the "
+                f"{MAX_IMPLEMENTATION_LOOP_SOURCE_BYTES}-byte limit"
+            )
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"configured workflow work_items.json is invalid: {exc}"
+            ) from exc
+        validation_error = validate_work_items_payload(payload)
+        if validation_error is not None:
+            raise ValueError(
+                "configured workflow work_items.json is invalid: "
+                f"{validation_error}"
+            )
+        assert isinstance(payload, dict)
+        tasks = payload["tasks"]
+        assert isinstance(tasks, list)
+        # ``json.loads`` produced fresh dictionaries; copy the outer list so
+        # callers cannot mutate the payload held by this provider accidentally.
+        return [dict(task) for task in tasks if isinstance(task, dict)]
+
+    def configured_loop_source_providers(
+        self,
+        config: WorkflowConfig,
+    ) -> dict[str, object]:
+        """Build the runtime provider map required by a validated config."""
+
+        if not isinstance(config, WorkflowConfig):
+            raise TypeError("config must be a WorkflowConfig")
+        provider_ids = {
+            node.source.provider
+            for node in config.nodes
+            if isinstance(node, LoopConfig)
+        }
+        providers: dict[str, object] = {}
+        for provider_id in sorted(provider_ids):
+            if provider_id == "kelpie.work_items.v1":
+                providers[provider_id] = self.configured_loop_source_items(provider_id)
+        return providers
+
+    def run_configured_workflow(
+        self,
+        config: WorkflowConfig,
+        *,
+        config_path: Path | str | None = None,
+        resume: bool = False,
+    ) -> PipelineRunResult:
+        """Execute one fully validated external workflow through the common port.
+
+        This is the configured-side CLI boundary.  It deliberately does not
+        call the legacy phase loop, and it persists generic executor state in
+        a separate file because the legacy lifecycle uses
+        ``workflow-state.json`` for phase outcomes.
+        """
+
+        if not isinstance(config, WorkflowConfig):
+            raise TypeError("config must be a WorkflowConfig")
+        if not isinstance(resume, bool):
+            raise TypeError("resume must be a boolean")
+        if self.dry_run and resume:
+            raise ValueError("configured workflow resume is unavailable in dry-run mode")
+
+        registry = self.capability_registry_snapshot(config.profile)
+        providers = self.configured_loop_source_providers(config)
+        issue_snapshot = self.read_issue_text()
+        repo_instructions_snapshot = self.render_instruction_file_notes()
+        previous_issue_snapshot = self._configured_issue_snapshot
+        previous_repo_instructions_snapshot = self._configured_repo_instructions_snapshot
+        self._configured_issue_snapshot = issue_snapshot
+        self._configured_repo_instructions_snapshot = repo_instructions_snapshot
+        try:
+            prepared = prepare_workflow_run(
+                config,
+                repo_root=self.repo_root,
+                artifact_root=self.artifact_dir,
+                registry=registry,
+                providers=providers,
+                runner_configs=self.runner_resolver.runners,
+                issue_snapshot=issue_snapshot,
+                repo_instructions_snapshot=repo_instructions_snapshot,
+                item_namespace="work-items",
+            )
+            state_store = prepared.state_store(filename=CONFIGURED_WORKFLOW_STATE_FILENAME)
+            state = prepared.load_resume_state(state_store) if resume else None
+            executor = self.configured_pipeline_executor(
+                registry=prepared.capability_authorization.snapshot,
+                virtual_inputs={
+                    "$issue": issue_snapshot,
+                    "$repo_instructions": repo_instructions_snapshot,
+                },
+                # Dry-run must enumerate the same declared implementation
+                # body that the legacy dry-run presents.  It has no review
+                # result to feed the compatibility controller, so use the
+                # structural fixed-sequence controller only for rendering.
+                controllers=(
+                    {"implementation_review_v1": FixedSequenceController()}
+                    if self.dry_run
+                    else None
+                ),
+                load_review_results=not self.dry_run,
+                validate_outputs=not self.dry_run,
+                persist_state=not self.dry_run,
+            )
+            return executor.execute(
+                prepared,
+                state=state,
+                state_store=None if self.dry_run else state_store,
+                persist_state=not self.dry_run,
+            )
+        finally:
+            self._configured_issue_snapshot = previous_issue_snapshot
+            self._configured_repo_instructions_snapshot = previous_repo_instructions_snapshot
 
     def run(self, phases: Iterable[str]) -> None:
         for phase in phases:
@@ -2941,10 +4224,27 @@ class WorkflowRunner:
         result: StepExecutionResult,
     ) -> None:
         _ = result
+        lifecycle_role = resolved.spec.lifecycle_role
+        if lifecycle_role is None and resolved.spec.lifecycle is not None:
+            try:
+                lifecycle_role = resolve_legacy_lifecycle_binding(
+                    resolved.spec.lifecycle
+                ).role
+            except (TypeError, ValueError):
+                # A custom adapter may intentionally use a lifecycle with no
+                # legacy role contract.  The generic phase outcome still
+                # applies; only implementation-specific required outputs are
+                # skipped.
+                lifecycle_role = None
         required_artifacts: tuple[str, ...] | None = None
-        if resolved.spec.name in {"implementation_coder", "implementation_fix"}:
+        if lifecycle_role in {"implementation_coder", "implementation_fix"} or (
+            lifecycle_role is None
+            and resolved.spec.name in {"implementation_coder", "implementation_fix"}
+        ):
             required_artifacts = ("06-implementation-notes.md",)
-        elif resolved.spec.name == "implementation_reviewer":
+        elif lifecycle_role == "implementation_reviewer" or (
+            lifecycle_role is None and resolved.spec.name == "implementation_reviewer"
+        ):
             # The reviewer result is loaded by the fixed controller after the
             # lifecycle outcome.  Leaving it out here preserves the distinct
             # invalid_review_output classification for a missing result.
@@ -2977,21 +4277,56 @@ class WorkflowRunner:
         """Reject concurrent writes to one artifact scope, while allowing reruns."""
         self.prepare_artifact_scope(artifact_dir)
         lock_path = artifact_dir / ".step-lock"
+        self._assert_artifact_path_contained(artifact_dir)
+        self._reject_symlink_components(self.artifact_dir, artifact_dir)
+        self._assert_artifact_path_contained(lock_path)
+        self._reject_symlink_components(self.artifact_dir, lock_path)
+        descriptor: int | None = None
         try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            descriptor = os.open(
+                lock_path,
+                os.O_CREAT
+                | os.O_EXCL
+                | os.O_WRONLY
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
         except FileExistsError as exc:
             raise RuntimeError(
                 f"Step scope is already locked: {artifact_dir.relative_to(self.workdir)}"
             ) from exc
+        except OSError as exc:
+            raise ValueError(f"Cannot create step scope lock safely: {lock_path}") from exc
 
         try:
-            os.write(descriptor, f"step={step_name}\npid={os.getpid()}\n".encode("utf-8"))
+            if not isinstance(step_name, str) or not step_name:
+                raise ValueError("step scope lock name must be a non-empty string")
+            lock_contents = f"step={step_name}\npid={os.getpid()}\n".encode("utf-8")
+            view = memoryview(lock_contents)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("step scope lock write made no progress")
+                view = view[written:]
+            os.fsync(descriptor)
             os.close(descriptor)
+            descriptor = None
+            # Recheck immediately before entering the lifecycle.  A caller
+            # that replaced a checked directory with a symlink cannot reach
+            # the runner through this lock boundary.
+            self._assert_artifact_path_contained(artifact_dir)
+            self._reject_symlink_components(self.artifact_dir, artifact_dir)
+            self._assert_artifact_path_contained(lock_path)
+            self._reject_symlink_components(self.artifact_dir, lock_path)
             yield
         finally:
+            if descriptor is not None:
+                os.close(descriptor)
             try:
-                lock_path.unlink()
-            except FileNotFoundError:
+                self.artifact_path_guard.validate(lock_path)
+                if lock_path.is_file() and not lock_path.is_symlink():
+                    lock_path.unlink()
+            except (ArtifactPathSafetyError, FileNotFoundError):
                 pass
 
     def prepare_artifact_scope(self, artifact_dir: Path) -> None:
@@ -3001,27 +4336,33 @@ class WorkflowRunner:
         self._assert_artifact_path_contained(artifact_dir)
         self._reject_symlink_components(self.artifact_dir, artifact_dir)
 
-    @staticmethod
-    def atomic_write_text(path: Path, text: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def atomic_write_text(self, path: Path, text: str) -> None:
+        """Atomically write an artifact after a final root/symlink check."""
+        target = self.artifact_path_guard.validate(path)
+        parent = self.artifact_path_guard.ensure_directory(target.parent)
+        self.artifact_path_guard.validate(parent)
+        self.artifact_path_guard.validate(target)
         temporary_path: Path | None = None
+        descriptor: int | None = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=path.parent,
-                prefix=f".{path.name}.",
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=str(parent),
+                prefix=f".{target.name}.",
                 suffix=".tmp",
-                delete=False,
-            ) as temporary:
+            )
+            temporary_path = Path(temporary_name)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+                descriptor = None
                 temporary.write(text)
                 temporary.flush()
                 os.fsync(temporary.fileno())
-                temporary_path = Path(temporary.name)
-            os.replace(temporary_path, path)
+            self.artifact_path_guard.validate(parent)
+            self.artifact_path_guard.validate(target)
+            os.replace(temporary_path, target)
             temporary_path = None
+            self.artifact_path_guard.validate(target)
             try:
-                directory_fd = os.open(path.parent, os.O_RDONLY)
+                directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             except OSError:
                 directory_fd = None
             if directory_fd is not None:
@@ -3033,6 +4374,8 @@ class WorkflowRunner:
                 finally:
                     os.close(directory_fd)
         finally:
+            if descriptor is not None:
+                os.close(descriptor)
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
 
@@ -3573,9 +4916,21 @@ class WorkflowRunner:
         if not isinstance(phase, str) or phase not in PHASES:
             raise ValueError(f"Unsupported phase for step '{step.name}': {phase}")
 
+        self._validate_optional_string(step.lifecycle, "lifecycle")
+        self._validate_optional_string(step.lifecycle_role, "lifecycle_role")
+        self._validate_optional_string(step.runner_step_name, "runner_step_name")
         self._validate_optional_string(step.prompt_file, "prompt_file")
         self._validate_optional_string(step.skill_file, "skill_file")
         self._validate_optional_string(step.runner_name, "runner_name")
+        if step.resolved_input_values is not None:
+            if not isinstance(step.resolved_input_values, Mapping):
+                raise ValueError("resolved_input_values must be a mapping[str, str]")
+            if any(
+                not isinstance(key, str) or not key
+                or not isinstance(value, str)
+                for key, value in step.resolved_input_values.items()
+            ):
+                raise ValueError("resolved_input_values must be a mapping[str, str]")
         self._validate_list_field(step.inputs, "inputs")
         self._validate_list_field(step.outputs, "outputs")
         self._validate_list_field(step.post_actions, "post_actions")
@@ -3654,21 +5009,22 @@ class WorkflowRunner:
         phase: str | None = None,
     ) -> RunnerConfig:
         resolved_phase = phase or (step.phase or step.name)
-        resolved = self.runner_resolver.resolve(
+        runner_step_name = step.runner_step_name or step.name
+        resolved = self.runner_capability_adapter.resolve(
             step.runner_name,
             phase=resolved_phase,
-            step_name=step.name,
+            step_name=runner_step_name,
         )
         # Role specs carry their factory defaults explicitly.  Keep configured
         # phase/step overrides above those defaults, while retaining the
         # historical rule that an arbitrary StepSpec value wins for all other
         # steps.
-        role_default_prompt = IMPLEMENTATION_STEP_TO_PROMPT.get(step.name)
+        role_default_prompt = IMPLEMENTATION_STEP_TO_PROMPT.get(runner_step_name)
         if step.prompt_file is not None and step.prompt_file != role_default_prompt:
             resolved.prompt_file = step.prompt_file
         elif resolved.prompt_file is None:
             resolved.prompt_file = role_default_prompt
-        role_default_skill = IMPLEMENTATION_STEP_TO_SKILL.get(step.name)
+        role_default_skill = IMPLEMENTATION_STEP_TO_SKILL.get(runner_step_name)
         if step.skill_file is not None and step.skill_file != role_default_skill:
             resolved.skill_file = step.skill_file
         elif resolved.skill_file is None:
@@ -3704,9 +5060,27 @@ class WorkflowRunner:
         inputs: list[str],
         *,
         virtual_context: Mapping[str, str] | None = None,
+        resolved_values: Mapping[str, str] | None = None,
     ) -> tuple[ResolvedInput, ...]:
         self._validate_input_selectors(inputs)
         context = None if virtual_context is None else dict(virtual_context)
+        pre_resolved = None if resolved_values is None else dict(resolved_values)
+        if pre_resolved is not None:
+            if any(
+                not isinstance(key, str)
+                or not key
+                or not isinstance(value, str)
+                for key, value in pre_resolved.items()
+            ):
+                raise ValueError("resolved_values must be a mapping[str, str]")
+            unknown_resolved = set(pre_resolved) - set(inputs)
+            if unknown_resolved:
+                raise ValueError(
+                    "resolved_values contains selectors that are not inputs: "
+                    + ", ".join(sorted(unknown_resolved))
+                )
+            if "$review_findings" in pre_resolved:
+                self._validate_review_findings_input(pre_resolved["$review_findings"])
         if context is not None:
             if any(not isinstance(key, str) for key in context):
                 raise ValueError("Virtual context keys must be strings")
@@ -3727,7 +5101,11 @@ class WorkflowRunner:
         }
         resolved: list[ResolvedInput] = []
         for selector in inputs:
-            if selector == "$loop_item":
+            has_pre_resolved_value = pre_resolved is not None and selector in pre_resolved
+            if has_pre_resolved_value:
+                assert pre_resolved is not None
+                value = pre_resolved[selector]
+            elif selector == "$loop_item":
                 if context is None:
                     value = os.environ.get("KELPIE_LOOP_ITEM")
                     if value is None:
@@ -3760,8 +5138,11 @@ class WorkflowRunner:
                 value = str(value)
             original_length = len(value)
             is_complete_context_input = (
-                selector in {"$loop_item", "$review_findings"}
-                and context is not None
+                has_pre_resolved_value
+                or (
+                    selector in {"$loop_item", "$review_findings"}
+                    and context is not None
+                )
             )
             truncated = (
                 False
@@ -3865,10 +5246,7 @@ class WorkflowRunner:
         return True
 
     def _assert_artifact_path_contained(self, path: Path) -> None:
-        root = self.artifact_dir.resolve()
-        canonical = path.resolve(strict=False)
-        if not self._is_relative_to(canonical, root):
-            raise ValueError(f"Artifact path escapes artifact root: {path}")
+        self.artifact_path_guard.validate(path)
 
     @staticmethod
     def _path_has_symlink(root: Path, path: Path) -> bool:
@@ -3886,8 +5264,9 @@ class WorkflowRunner:
         return False
 
     def _reject_symlink_components(self, root: Path, path: Path) -> None:
-        if self._path_has_symlink(root, path):
-            raise ValueError(f"Symlinked artifact scope component is not allowed: {path}")
+        # Use a guard rooted at the caller-supplied root so the existing
+        # workdir/artifact-dir checks retain their original scope.
+        ArtifactPathGuard(root).validate(path)
 
     def run_step_post_actions(self, step: StepSpec, artifact_dir: Path | None = None) -> None:
         if self.dry_run:
@@ -4087,6 +5466,8 @@ Phase outcome path rules:
         return targets
 
     def render_instruction_file_notes(self) -> str:
+        if self._configured_repo_instructions_snapshot is not None:
+            return self._configured_repo_instructions_snapshot
         lines = [
             f"- Runner: {self.runner_config.name}",
             f"- Source template: {(self.repo_root / self.instruction_staging_config.source)}",
@@ -4118,6 +5499,8 @@ Phase outcome path rules:
         return "\n".join(labels.get(item, f"- {item}") for item in self.instruction_staging_config.precedence or [])
 
     def read_issue_text(self) -> str:
+        if self._configured_issue_snapshot is not None:
+            return self._configured_issue_snapshot
         if self.issue_source == "none":
             return self.read_manual_context_text()
         if self.issue_source == "github":
@@ -4388,6 +5771,9 @@ Phase outcome path rules:
             "prompt_preexisted": prompt_preexisted,
             "status": "prepared",
         }
+        if step is not None and step.lifecycle is not None:
+            payload["lifecycle"] = step.lifecycle
+            payload["lifecycle_role"] = step.lifecycle_role
         self.atomic_write_text(
             path,
             json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
@@ -4640,6 +6026,92 @@ Phase outcome path rules:
         )
 
 
+def _resolve_cli_path(repo_root: Path, value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else repo_root / path
+
+
+def _workflow_runner_ids(config: WorkflowConfig) -> tuple[str, ...]:
+    runner_ids: set[str] = set()
+    for node in config.nodes:
+        if isinstance(node, LoopConfig):
+            steps = node.body
+        else:
+            steps = (node,)
+        runner_ids.update(step.runner for step in steps)
+    return tuple(sorted(runner_ids))
+
+
+def load_runner_configs_for_workflow(
+    config: WorkflowConfig,
+    *,
+    configured_path: Path,
+    bundled_path: Path,
+    default_runner: str,
+) -> dict[str, RunnerConfig]:
+    """Load every runner named by a workflow without moving command resolution.
+
+    The workflow config carries only runner IDs.  This helper builds the
+    resolver input from the existing runner JSON so the configured executor
+    can resolve a per-step runner while keeping command templates outside the
+    workflow IR.
+    """
+
+    if not isinstance(config, WorkflowConfig):
+        raise TypeError("config must be a WorkflowConfig")
+    runner_names = set(_workflow_runner_ids(config))
+    runner_names.add(default_runner)
+    return {
+        runner_name: load_runner_config(
+            configured_path,
+            bundled_path,
+            runner_name,
+        )
+        for runner_name in sorted(runner_names)
+    }
+
+
+def load_configured_workflow_definition(
+    config_path: Path,
+    *,
+    repo_root: Path,
+    runner_config_path: Path,
+    bundled_runner_config_path: Path,
+    default_runner: str,
+) -> tuple[WorkflowConfig, dict[str, RunnerConfig]]:
+    """Load and read-only validate a CLI workflow before creating artifacts."""
+
+    try:
+        config = load_workflow_config(config_path)
+    except (WorkflowConfigError, OSError, ValueError) as exc:
+        raise SystemExit(f"Invalid workflow config: {exc}") from exc
+
+    try:
+        runner_configs = load_runner_configs_for_workflow(
+            config,
+            configured_path=runner_config_path,
+            bundled_path=bundled_runner_config_path,
+            default_runner=default_runner,
+        )
+    except (OSError, RunnerNotFoundError, ValueError) as exc:
+        raise SystemExit(f"Invalid configured workflow runner: {exc}") from exc
+
+    # Repeat the production preflight's structural and authority checks here
+    # before constructing WorkflowRunner.  Its constructor creates the
+    # .kelpie/artifact directories, so invalid config must be rejected first.
+    registry = default_capability_registry().with_runner_ids(runner_configs)
+    try:
+        normalize_workflow_config(config, source_path=config_path)
+        validate_workflow_capabilities(
+            config,
+            registry,
+            repo_root=repo_root,
+        )
+    except (WorkflowConfigError, OSError, ValueError) as exc:
+        raise SystemExit(f"Invalid workflow config: {exc}") from exc
+    return config, runner_configs
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run multi-phase issue workflow through a CLI agent.")
     parser.add_argument("--repo-root", default=".", help="Template directory containing AGENTS.md, prompts, skills.")
@@ -4650,6 +6122,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-issue-comments", action="store_true", help="Include GitHub issue comments in the prompt context.")
     parser.add_argument("--task-label", help="Artifact label to use when running without an issue, for example refactor-auth-flow.")
     parser.add_argument("--runner", required=True, help="Runner key from runner config JSON.")
+    workflow_selection = parser.add_mutually_exclusive_group()
+    workflow_selection.add_argument(
+        "--workflow-config",
+        default=DEFAULT_WORKFLOW_CONFIG_PATH,
+        help=(
+            "Workflow JSON path relative to repo root or absolute. "
+            f"Defaults to {DEFAULT_WORKFLOW_CONFIG_PATH}."
+        ),
+    )
+    workflow_selection.add_argument(
+        "--legacy-workflow",
+        "--use-legacy-workflow",
+        action="store_true",
+        help="Explicitly use the legacy fixed phase workflow instead of external config.",
+    )
     parser.add_argument(
         "--runner-config",
         default="examples/runner_config.json",
@@ -4708,22 +6195,42 @@ def main() -> None:
     args = parse_args()
     if args.waive_plan_comprehension_check and not args.resume:
         raise SystemExit("--waive-plan-comprehension-check requires --resume")
+    if args.waive_plan_comprehension_check and not args.legacy_workflow:
+        raise SystemExit(
+            "--waive-plan-comprehension-check is only supported with --legacy-workflow"
+        )
     repo_root = Path(args.repo_root).resolve()
     workdir = Path(args.workdir).resolve()
 
-    runner_config_path = Path(args.runner_config)
-    if not runner_config_path.is_absolute():
-        runner_config_path = repo_root / runner_config_path
-    instruction_staging_config_path = Path(args.instruction_staging_config)
-    if not instruction_staging_config_path.is_absolute():
-        instruction_staging_config_path = repo_root / instruction_staging_config_path
+    runner_config_path = _resolve_cli_path(repo_root, args.runner_config)
+    instruction_staging_config_path = _resolve_cli_path(
+        repo_root,
+        args.instruction_staging_config,
+    )
 
     bundled_runner_config_path = repo_root / "examples" / "runner_config.json"
-    runner_config = load_runner_config(
-        runner_config_path,
-        bundled_runner_config_path,
-        args.runner,
-    )
+    configured_workflow: WorkflowConfig | None = None
+    configured_runner_registry: dict[str, RunnerConfig] | None = None
+    workflow_config_path: Path | None = None
+    if args.legacy_workflow:
+        runner_config = load_runner_config(
+            runner_config_path,
+            bundled_runner_config_path,
+            args.runner,
+        )
+    else:
+        workflow_config_path = _resolve_cli_path(repo_root, args.workflow_config)
+        configured_workflow, configured_runner_registry = load_configured_workflow_definition(
+            workflow_config_path,
+            repo_root=repo_root,
+            runner_config_path=runner_config_path,
+            bundled_runner_config_path=bundled_runner_config_path,
+            default_runner=args.runner,
+        )
+        try:
+            runner_config = configured_runner_registry[args.runner]
+        except KeyError as exc:  # pragma: no cover - helper always includes the default
+            raise SystemExit(f"Configured workflow runner is not loaded: {args.runner}") from exc
     instruction_staging_config = InstructionStagingConfig.from_json(instruction_staging_config_path)
     runner = WorkflowRunner(
         repo_root=repo_root,
@@ -4738,7 +6245,31 @@ def main() -> None:
         dry_run=args.dry_run,
         allow_plan_check_external_send=args.allow_plan_check_external_send,
         plan_check_required=args.require_plan_comprehension_check,
+        runner_registry=configured_runner_registry,
     )
+
+    if not args.legacy_workflow:
+        assert configured_workflow is not None
+        assert workflow_config_path is not None
+        if args.from_phase != PHASES[0] or args.to_phase != PHASES[-1]:
+            raise SystemExit(
+                "--from-phase/--to-phase select the legacy fixed workflow; "
+                "configured workflows currently execute their declared nodes in full"
+            )
+        try:
+            result = runner.run_configured_workflow(
+                configured_workflow,
+                config_path=workflow_config_path,
+                resume=args.resume,
+            )
+        except (WorkflowConfigError, OSError, ValueError) as exc:
+            raise SystemExit(f"Configured workflow could not start: {exc}") from exc
+        if result.paused:
+            raise SystemExit(f"Configured workflow paused: {result.error or 'resume is required'}")
+        if result.failed:
+            raise SystemExit(f"Configured workflow failed: {result.error or 'execution failed'}")
+        return
+
     start_phase = args.from_phase
     if args.resume:
         state_path = runner.artifact_dir / "workflow-state.json"

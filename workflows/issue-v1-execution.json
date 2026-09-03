@@ -1,0 +1,136 @@
+{
+  "schema_version": "1.0",
+  "id": "kelpie-issue-v1-execution",
+  "profile": "repository_issue",
+  "limits": {
+    "max_loop_items": 100,
+    "max_total_steps": 500
+  },
+  "nodes": [
+    {
+      "type": "loop",
+      "id": "implementation",
+      "source": {
+        "from": "$work_items",
+        "provider": "kelpie.work_items.v1"
+      },
+      "max_items": 100,
+      "controller": "implementation_review_v1",
+      "body": [
+        {
+          "type": "step",
+          "id": "implementation_coder",
+          "lifecycle": "kelpie.phase.implementation_coder.v1",
+          "runner": "codex",
+          "prompt": "prompts/06_implementation_coder.md",
+          "skill": "skills/implementation-coder/SKILL.md",
+          "inputs": [
+            {"name": "item", "from": "$loop_item"}
+          ],
+          "outputs": [
+            {
+              "id": "notes",
+              "kind": "file",
+              "path": "iterations/0000/coder/06-implementation-notes.md"
+            }
+          ],
+          "depends_on": []
+        },
+        {
+          "type": "step",
+          "id": "implementation_reviewer_initial",
+          "lifecycle": "kelpie.phase.implementation_reviewer.v1",
+          "runner": "codex",
+          "prompt": "prompts/06_implementation_reviewer.md",
+          "skill": "skills/implementation-reviewer/SKILL.md",
+          "inputs": [
+            {"name": "item", "from": "$loop_item"}
+          ],
+          "outputs": [
+            {
+              "id": "review",
+              "kind": "file",
+              "path": "iterations/0000/reviewer/review-result.json"
+            }
+          ],
+          "depends_on": ["implementation_coder"]
+        },
+        {
+          "type": "step",
+          "id": "implementation_fix",
+          "lifecycle": "kelpie.phase.implementation_fix.v1",
+          "runner": "codex",
+          "prompt": "prompts/06_implementation_fix.md",
+          "skill": "skills/implementation-fixer/SKILL.md",
+          "inputs": [
+            {"name": "item", "from": "$loop_item"},
+            {
+              "name": "findings",
+              "from": "item-artifact:implementation_reviewer_initial.review"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "notes",
+              "kind": "file",
+              "path": "iterations/0001/fix/06-implementation-notes.md"
+            }
+          ],
+          "depends_on": ["implementation_reviewer_initial"]
+        },
+        {
+          "type": "step",
+          "id": "implementation_reviewer_final",
+          "lifecycle": "kelpie.phase.implementation_reviewer.v1",
+          "runner": "codex",
+          "prompt": "prompts/06_implementation_reviewer.md",
+          "skill": "skills/implementation-reviewer/SKILL.md",
+          "inputs": [
+            {"name": "item", "from": "$loop_item"}
+          ],
+          "outputs": [
+            {
+              "id": "review",
+              "kind": "file",
+              "path": "iterations/0001/reviewer/review-result.json"
+            }
+          ],
+          "depends_on": ["implementation_fix"]
+        }
+      ],
+      "exports": []
+    },
+    {
+      "type": "step",
+      "id": "review_fix_loop",
+      "lifecycle": "kelpie.phase.review_fix_loop.v1",
+      "runner": "codex",
+      "prompt": "prompts/07_review_fix_loop.md",
+      "skill": "skills/review-fix-loop/SKILL.md",
+      "inputs": [
+        {"name": "issue", "from": "$issue"},
+        {"name": "instructions", "from": "$repo_instructions"}
+      ],
+      "outputs": [
+        {"id": "document", "kind": "file", "path": "07-review-fix-loop.md"}
+      ],
+      "depends_on": ["implementation"]
+    },
+    {
+      "type": "step",
+      "id": "pull_request",
+      "lifecycle": "kelpie.phase.pull_request.v1",
+      "runner": "codex",
+      "prompt": "prompts/08_pull_request.md",
+      "skill": "skills/pull-request/SKILL.md",
+      "inputs": [
+        {"name": "issue", "from": "$issue"},
+        {"name": "instructions", "from": "$repo_instructions"}
+      ],
+      "outputs": [
+        {"id": "document", "kind": "file", "path": "08-pr-draft.md"}
+      ],
+      "depends_on": ["review_fix_loop"]
+    }
+  ]
+}
