@@ -348,6 +348,7 @@ class RunDirectoryTests(unittest.TestCase):
                     str(workdir),
                     "--run-dir",
                     str(run_dir),
+                    "--legacy-workflow",
                     "--runner-config",
                     str(runner_config_path),
                     "--resume",

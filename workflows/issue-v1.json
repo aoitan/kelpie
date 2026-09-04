@@ -1,0 +1,108 @@
+{
+  "schema_version": "1.0",
+  "id": "kelpie-issue-v1",
+  "profile": "repository_issue",
+  "limits": {
+    "max_loop_items": 100,
+    "max_total_steps": 500
+  },
+  "nodes": [
+    {
+      "type": "step",
+      "id": "prototype_planning",
+      "lifecycle": "kelpie.phase.prototype_planning.v1",
+      "runner": "codex",
+      "prompt": "prompts/01_prototype_planning.md",
+      "skill": "skills/prototype-planning/SKILL.md",
+      "inputs": [
+        {"name": "issue", "from": "$issue"},
+        {"name": "instructions", "from": "$repo_instructions"}
+      ],
+      "outputs": [
+        {"id": "document", "kind": "file", "path": "01-prototype-planning.md"}
+      ],
+      "depends_on": []
+    },
+    {
+      "type": "step",
+      "id": "prototyping",
+      "lifecycle": "kelpie.phase.prototyping.v1",
+      "runner": "codex",
+      "prompt": "prompts/02_prototyping.md",
+      "skill": "skills/prototyping/SKILL.md",
+      "inputs": [
+        {"name": "issue", "from": "$issue"},
+        {"name": "instructions", "from": "$repo_instructions"}
+      ],
+      "outputs": [
+        {"id": "document", "kind": "file", "path": "02-prototype-summary.md"}
+      ],
+      "depends_on": ["prototype_planning"]
+    },
+    {
+      "type": "step",
+      "id": "red_team_review",
+      "lifecycle": "kelpie.phase.red_team_review.v1",
+      "runner": "codex",
+      "prompt": "prompts/03_red_team_review.md",
+      "skill": "skills/red-team-review/SKILL.md",
+      "inputs": [
+        {"name": "issue", "from": "$issue"},
+        {"name": "instructions", "from": "$repo_instructions"}
+      ],
+      "outputs": [
+        {"id": "document", "kind": "file", "path": "03-red-team-review.md"}
+      ],
+      "depends_on": ["prototyping"]
+    },
+    {
+      "type": "step",
+      "id": "solution_design",
+      "lifecycle": "kelpie.phase.solution_design.v1",
+      "runner": "codex",
+      "prompt": "prompts/04_solution_design.md",
+      "skill": "skills/solution-design/SKILL.md",
+      "inputs": [
+        {"name": "issue", "from": "$issue"},
+        {"name": "instructions", "from": "$repo_instructions"}
+      ],
+      "outputs": [
+        {"id": "document", "kind": "file", "path": "04-solution-design.md"}
+      ],
+      "depends_on": ["red_team_review"]
+    },
+    {
+      "type": "step",
+      "id": "work_breakdown",
+      "lifecycle": "kelpie.phase.work_breakdown.v1",
+      "runner": "codex",
+      "prompt": "prompts/05_work_breakdown.md",
+      "skill": "skills/work-breakdown/SKILL.md",
+      "inputs": [
+        {"name": "issue", "from": "$issue"},
+        {"name": "instructions", "from": "$repo_instructions"}
+      ],
+      "outputs": [
+        {"id": "document", "kind": "file", "path": "05-work-breakdown.md"},
+        {"id": "work_items", "kind": "file", "path": "work_items.json"}
+      ],
+      "depends_on": ["solution_design"]
+    },
+    {
+      "type": "step",
+      "id": "plan_comprehension_check",
+      "lifecycle": "kelpie.phase.plan_comprehension_check.v1",
+      "runner": "codex",
+      "prompt": "prompts/05a_plan_comprehension_check.md",
+      "skill": "skills/plan-comprehension-check/SKILL.md",
+      "inputs": [
+        {"name": "issue", "from": "$issue"},
+        {"name": "instructions", "from": "$repo_instructions"}
+      ],
+      "outputs": [
+        {"id": "document", "kind": "file", "path": "05a-plan-comprehension-check.md"}
+      ],
+      "depends_on": ["work_breakdown"]
+    }
+  ]
+}

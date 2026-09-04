@@ -1,0 +1,68 @@
+{
+  "schema_version": "1.0",
+  "id": "issue-workflow",
+  "profile": "repository_issue",
+  "limits": {
+    "max_loop_items": 10,
+    "max_total_steps": 50
+  },
+  "nodes": [
+    {
+      "type": "step",
+      "id": "plan",
+      "lifecycle": "kelpie.phase.plan.v1",
+      "runner": "codex",
+      "prompt": "prompts/plan.md",
+      "skill": "skills/plan.md",
+      "inputs": [
+        {
+          "name": "issue",
+          "from": "$issue"
+        }
+      ],
+      "outputs": [
+        {
+          "id": "plan",
+          "kind": "file",
+          "path": "plan.md"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "type": "loop",
+      "id": "implementation",
+      "source": {
+        "from": "artifact:plan",
+        "provider": "kelpie.work_items.v1"
+      },
+      "max_items": 10,
+      "controller": "fixed_sequence.v1",
+      "body": [
+        {
+          "type": "step",
+          "id": "coder",
+          "lifecycle": "kelpie.phase.implementation.v1",
+          "runner": "codex",
+          "prompt": "prompts/code.md",
+          "skill": "skills/code.md",
+          "inputs": [
+            {
+              "name": "item",
+              "from": "$loop_item"
+            }
+          ],
+          "outputs": [
+            {
+              "id": "notes",
+              "kind": "file",
+              "path": "06-implementation-notes.md"
+            }
+          ],
+          "depends_on": []
+        }
+      ],
+      "exports": []
+    }
+  ]
+}

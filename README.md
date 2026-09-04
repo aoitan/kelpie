@@ -67,8 +67,13 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 │   ├── install_all_projects.sh
 │   ├── test_all_projects.sh
 │   ├── open_llm_shell_in_container.sh
+│   ├── pipeline_executor.py
 │   ├── run_issue_workflow.py
-│   └── run_issue_workflow_in_container.sh
+│   ├── run_issue_workflow_in_container.sh
+│   └── workflow_config.py
+├── workflows/
+│   ├── issue-v1.json
+│   └── issue-v1-execution.json
 └── skills/
     ├── implementation/
     ├── implementation-coder/
@@ -93,7 +98,7 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 4. `.kelpie/artifacts/.../issue-xx/` または `.kelpie/artifacts/.../task-xxxx/` 配下に prompt キャッシュ、intent record、check ファイルを作る
 5. 指定した CLI を工程順に呼び出す
 
-工程は固定で次の 9 つです。
+工程は次の 9 つですが、`work_items.json` を handoff 境界にして二つの設定へ分かれています。
 
 1. `prototype_planning`
 2. `prototyping`
@@ -104,6 +109,12 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 7. `implementation`
 8. `review_fix_loop`
 9. `pull_request`
+
+既定の `workflows/issue-v1.json` は `plan_comprehension_check` までを実行する計画
+workflow です。`work_breakdown` が生成した `work_items.json` を確認した後、同じ
+artifact directory に対して `--workflow-config workflows/issue-v1-execution.json` を
+明示して implementation、review/fix、pull request を実行します。実行側は既存の
+`work_items.json` を必須の handoff input とし、ない場合は runner を起動せずに停止します。
 
 `plan_comprehension_check` は、実装計画を軽量モデルへ再構成させ、
 source-backedな解釈差分を得た後、通常runnerの強モデルが各findingを
@@ -124,6 +135,79 @@ resultを `plan-check/iterations/NNNN/attempts/` に保存します。retry後�
 hookやCLIの非0終了は運用障害、`pause`は工程固有の判断・入力待ちとして区別されます。
 pause、成果物不備、runner実行失敗は、ローカルの人間介入要求として保存されます。
 機械checkの失敗をLLMの`advance`で上書きすることはできません。
+
+### 設定駆動 workflow v1 (Issue #20)
+
+工程の構造は `workflows/issue-v1.json` と `workflows/issue-v1-execution.json` に定義します。
+CLI は前者を既定で読み込み、別の設定を使う場合は `--workflow-config <path>` を指定します。
+path は `--repo-root` からの相対 path または絶対 path です。設定された workflow は宣言された
+node を最初から最後まで実行します。`--from-phase` / `--to-phase` による部分実行は
+固定 workflow 用なので、設定 workflow で使う場合は拒否されます。
+
+v1 の正本形式は JSON です。最上位には必ず次を置きます。
+
+```json
+{
+  "schema_version": "1.0",
+  "id": "workflow-id",
+  "profile": "repository_issue",
+  "limits": {},
+  "nodes": []
+}
+```
+
+`nodes` には `step` または単一階層の有限 `loop` を置きます。step は
+`lifecycle`、`runner`、`prompt`、`skill`、`inputs`、`outputs`、`depends_on` を持ち、
+loop は `source`、`max_items`、`controller`、`body`、`exports` を持ちます。入力の
+`from` には `$issue`、`$repo_instructions`、loop 内だけで使える `$loop_item` などの
+登録済み virtual input、または型付き artifact reference を指定します。loop body の
+item-scoped output は暗黙に workflow 側へ昇格せず、`exports` で明示した collection
+だけが loop 外から参照できます。
+
+読み込みは次の順で fail-closed に行います。
+
+1. UTF-8、JSON syntax、duplicate key、config byte/depth、`schema_version == "1.0"` を確認
+2. closed schema と厳密な型を確認し、unknown field、policy field、command/callable field を拒否
+3. node/artifact/dependency を immutable な normalized plan へ変換
+4. capability registry、prompt/skill resource、loop source snapshot、limit を検証
+5. artifact namespace、path containment、symlink、namespace collision、run identity を検証
+6. 全検証に成功した plan だけを `PipelineExecutor` と共通 `StepExecutionPort` へ渡す
+
+検証完了前には runner、artifact、lock、state を作成しません。代表的な診断 code は
+`unknown_schema_version`、`unknown_field`、`duplicate_id`、`unknown_capability`、
+`undefined_reference`、`unreachable_dependency`、`dependency_cycle`、
+`resource_limit_exceeded`、`unsafe_path`、`namespace_collision` です。config の
+limit は process hard cap を引き上げられず、loop の item 数、入力/snapshot bytes、
+body と総実行数に有限上限が適用されます。v1 では nested loop、optional/condition/route、
+retry、budget、human gate、任意 command/callable は schema error です。依存は scheduler
+ではなく宣言順への先行制約なので、後ろに宣言された必須 producer は拒否されます。
+
+artifact は logical identity と physical path を分離します。top-level output は
+workflow-scoped scalar、loop body output は item-scoped scalar です。execution workflow の
+implementation loop は `work-items/<item-id>/iterations/<iteration>/<role>/` を使い、
+item ID を namespace に含めて item 間の衝突を防ぎます。output manifest には run/node/item
+identity、kind、freshness、producer が記録され、実行直前にも root containment と symlink
+component を再検査します。directory-fd 相対 I/O はまだ採用していないため、validation と
+use の間の残余 TOCTOU は既知の制約です。
+
+Runner と workflow の責務は分離されています。workflow JSON は runner capability ID
+だけを持ち、command template は `examples/runner_config.json` などの runner 設定を
+`RunnerResolver` が解決します。prompt/skill は registry が許可した repository 内の
+regular Markdown として digest を固定します。workflow config だけで新しい command、
+権限、外部送信を有効化することはできず、外部送信は既存の明示 opt-in の境界に従います。
+
+移行時は標準 JSON と旧固定 workflow の ordered lifecycle event、artifact scope、required
+output、outcome/pause 契約を characterization test で比較します。parity が崩れた場合は
+CLI の切替を進めず、設定エラーを legacy に暗黙 fallback しません。旧実装を明示的に
+選ぶ必要がある場合だけ `--legacy-workflow` を使います。`implementation_review_v1` は
+既存 review/fix の互換 controller に過ぎず、収束判定や verdict route を汎用 Executor
+へ追加するものではありません。それらの policy は Issue #12 の境界です。
+
+設定の横断受入テストは次で実行できます。
+
+```bash
+python -m unittest tests.test_workflow_acceptance
+```
 
 ## ローカル人間介入と再開
 
