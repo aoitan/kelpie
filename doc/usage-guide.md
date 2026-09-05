@@ -252,7 +252,7 @@ python3 scripts/run_issue_workflow.py \
 | --run-dir PATH | 既存の run artifact directory。--resume と併用し、run-manifest.json から文脈を補完 |
 | --resume-action ACTION | 人間介入 action。--intervention-action も同じ意味 |
 | --resume-phase PHASE | reopen 時に再開する phase。--intervention-phase も同じ意味 |
-| --resume-loop-from ITEM_ID | legacy implementation loop を reopen するときの開始 item。`--legacy-workflow --resume-action reopen --resume-phase implementation` と併用 |
+| --resume-loop-from ITEM_ID | legacy implementation loop を reopen するときの開始 item。`--resume --legacy-workflow --resume-action reopen --resume-phase implementation` と併用 |
 | --resume-prompt TEXT | 短い人間指示。--intervention-prompt も同じ意味 |
 | --resume-prompt-file PATH | 人間指示を UTF-8 ファイルから読む。--intervention-prompt-file も同じ意味 |
 | --resume-prompt-stdin | 人間指示を stdin から読む。--intervention-prompt-stdin も同じ意味 |
