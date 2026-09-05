@@ -236,6 +236,28 @@ python3 scripts/run_issue_workflow.py \
   --resume-prompt "implementation成果物を再生成し、レビュー可能なMDを残す"
 ```
 
+既存の implementation loop を `reopen` する場合は、既存 status や `work-items/` を削除せず、
+必要なら `--resume-loop-from ITEM_ID` で再実行開始 item を明示します。例えば、WB-01〜WB-03 が
+成功し、WB-04 が失敗した場合は次のようにします。
+
+```bash
+python3 scripts/run_issue_workflow.py \
+  --workdir /path/to/target-repo \
+  --run-dir .kelpie/artifacts/github/owner/repo/issue-12 \
+  --legacy-workflow \
+  --resume \
+  --resume-action reopen \
+  --resume-phase implementation \
+  --resume-loop-from WB-04 \
+  --resume-prompt-file ./feedback.md
+```
+
+再実行 generation は `implementation-loop-runs/<loop-run-id>/` に作られ、
+`implementation-loop-current.json` が現在の status を指します。省略時は parent status の最初の
+`failed` または `not_run` item を選びます。全 item が成功済みの場合や `work_items.json` の digest が
+変わった場合は、意図しない carry-forward を防ぐため `--resume-loop-from` の明示が必要です。
+旧 status・旧 artifact scope・phase outcome は監査証跡なので、手動削除や置換をしないでください。
+
 人間介入の入力方法は次のいずれか1つです。
 
 - `--resume-prompt TEXT`: 短い指示。shellの履歴に残り得るため、機密情報には使わない。
@@ -306,15 +328,19 @@ fixへ渡すcanonicalな `$review_findings` は128 KiB以下です。controller�
 不在確認し、正常終了後に一度だけ検証・読み込みます。CLI / hook / check / phase outcomeの失敗は
 `execution_failed` として扱い、review findingや不正出力に丸めません。
 
-loop全体の `implementation-loop-status.json` は schema `2.0` で、各itemの
+初回 loop 全体の `implementation-loop-status.json` は schema `2.0` で、各itemの
 `reason`、`current_role`、`current_iteration`、`attempt_id`、`last_review_scope` を記録します。
 terminal reasonは `no_findings`、`fixed`、`execution_failed`、`invalid_review_output`、
 `safety_limit_reached`、`dry_run` に限定されます。`$review_findings` はcontrollerが明示的に渡した
 canonical dataだけを解決し、環境変数fallbackはありません。
 
+implementation loop の reopen generation は schema `3.0` で、parent status の path/digest、
+resume item、carry-forward item、generation 固有の artifact scope を記録します。旧 schema `2.0`
+の status は parent として読み取り専用で扱われます。
+
 `--dry-run` ではreview結果を推測せず、4つの潜在stepのprompt・intent・checkを各scopeへ作り、item / loopを
 `planned / dry_run` として記録します。汎用workflow configやloop DSL、可変反復、時間・token budget、
-自動resume、human gate、Epic #10の完全なreview schemaはこの固定subpipelineの対象外です。
+汎用loopの自動resume、human gate、Epic #10の完全なreview schemaはこの固定subpipelineの対象外です。
 
 ### 固定評価ループ
 
@@ -768,6 +794,9 @@ python3 scripts/run_issue_workflow.py \
   `reopen`、`abort`から、停止理由に許されたものを選びます。
 - `--resume-phase`
   `--resume-action reopen`時に、停止工程またはそれ以前の工程を再開対象にします。
+- `--resume-loop-from ITEM_ID`
+  `reopen` で implementation phase を再入場するときの開始 item。`--resume-action reopen`
+  と `--resume-phase implementation` と併用します。
 - `--resume-prompt` / `--resume-prompt-file` / `--resume-prompt-stdin`
   選択したactionに渡す人間の指示です。同時には1つだけ指定できます。
 - `--allow-plan-check-external-send`
@@ -943,6 +972,10 @@ CLI ごとに自動で読む instruction file 名が異なることと、対象�
             checks/
             intent-records/
             implementation-loop-status.json  # implementation item loop, schema 2.0
+            implementation-loop-current.json # current loop generation pointer
+            implementation-loop-runs/<loop-run-id>/
+              implementation-loop-status.json # reopen generation, schema 3.0
+              work-items/<item-id>/iterations/
             work_items.json
             work-items/<item-id>/iterations/
               0000/coder/

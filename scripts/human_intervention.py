@@ -64,6 +64,7 @@ class HumanIntervention:
     prompt: str | None
     prompt_ref: str | None
     response_ref: str
+    loop_from_item: str | None = None
 
 
 def normalize_action(value: str) -> str:
@@ -172,8 +173,9 @@ def build_response_payload(
     request_sha256: str,
     actor: str,
     created_at: str,
+    loop_from_item: str | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "response_id": response_id,
         "request_id": request_id,
@@ -186,6 +188,9 @@ def build_response_payload(
         "actor": actor,
         "created_at": created_at,
     }
+    if loop_from_item is not None:
+        payload["loop_from_item"] = loop_from_item
+    return payload
 
 
 def validate_request_payload(raw: Mapping[str, object]) -> dict[str, object]:

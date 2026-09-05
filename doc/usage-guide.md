@@ -252,6 +252,7 @@ python3 scripts/run_issue_workflow.py \
 | --run-dir PATH | 既存の run artifact directory。--resume と併用し、run-manifest.json から文脈を補完 |
 | --resume-action ACTION | 人間介入 action。--intervention-action も同じ意味 |
 | --resume-phase PHASE | reopen 時に再開する phase。--intervention-phase も同じ意味 |
+| --resume-loop-from ITEM_ID | legacy implementation loop を reopen するときの開始 item。`--resume --legacy-workflow --resume-action reopen --resume-phase implementation` と併用 |
 | --resume-prompt TEXT | 短い人間指示。--intervention-prompt も同じ意味 |
 | --resume-prompt-file PATH | 人間指示を UTF-8 ファイルから読む。--intervention-prompt-file も同じ意味 |
 | --resume-prompt-stdin | 人間指示を stdin から読む。--intervention-prompt-stdin も同じ意味 |
@@ -460,6 +461,25 @@ implementation-loop-status.json は schema 2.0 で、各 item の status、role�
 attempt ID、最後の reviewer scope、terminal reason を記録します。terminal reason は
 no_findings、fixed、execution_failed、invalid_review_output、safety_limit_reached、
 dry_run です。
+
+既存 loop を implementation phase から reopen する場合、旧 status と旧 scope は削除・上書きせず、
+新しい generation を次の配置に作ります。
+
+~~~~text
+<run-dir>/
+  implementation-loop-status.json
+  work-items/<item-id>/...                  # 初回 loop の監査証跡
+  implementation-loop-current.json
+  implementation-loop-runs/<loop-run-id>/
+    implementation-loop-status.json          # schema 3.0
+    work-items/<item-id>/...
+~~~~
+
+`--resume-loop-from ITEM_ID` を指定すると、その item と後続 item だけを新 generation で実行し、
+それより前の成功済み item は `carried_from` として参照します。省略時は parent status の最初の
+`failed` または `not_run` item が選ばれます。全 item が成功済みの場合、または
+`work_items.json` の source/item digest が変わった場合は、意図しない再利用を避けるため開始 item を
+明示してください。status、current pointer、parent digest を検証できない場合は実行前に停止します。
 
 #### implementation の MD が見つからない場合
 
@@ -733,14 +753,17 @@ python3 "$KELPIE_ROOT/scripts/run_issue_workflow.py" \
   --repo-root "$KELPIE_ROOT" \
   --workdir "$TARGET_REPO" \
   --run-dir .kelpie/artifacts/github/owner/repo/issue-12 \
+  --legacy-workflow \
   --resume \
   --resume-action reopen \
   --resume-phase implementation \
+  --resume-loop-from WB-04 \
   --resume-prompt-file feedback.md
 ~~~~
 
 --resume-phase は停止した phase またはそれ以前だけ指定できます。後ろの phase を
-reopen することはできません。再生成対象と残すべき成果物を feedback に明記してください。
+reopen することはできません。implementation loop の開始 item は自然言語 prompt から推測せず、
+必要なら `--resume-loop-from` で指定します。再生成対象と残すべき成果物を feedback に明記してください。
 
 ### 8.6 retry と abort
 
