@@ -868,6 +868,9 @@ MAX_IMPLEMENTATION_LOOP_SOURCE_BYTES = 1024 * 1024
 MAX_IMPLEMENTATION_LOOP_ITEMS = 100
 MAX_IMPLEMENTATION_LOOP_ITEM_BYTES = 64 * 1024
 IMPLEMENTATION_LOOP_STATUS_SCHEMA_VERSION = "2.0"
+IMPLEMENTATION_LOOP_RESUME_STATUS_SCHEMA_VERSION = "3.0"
+IMPLEMENTATION_LOOP_CURRENT_FILENAME = "implementation-loop-current.json"
+IMPLEMENTATION_LOOP_RUNS_DIRNAME = "implementation-loop-runs"
 IMPLEMENTATION_LOOP_ITEM_STATUSES = frozenset({
     "not_run",
     "running",
@@ -1094,6 +1097,7 @@ class StepSpec:
     lifecycle_role: str | None = None
     runner_step_name: str | None = None
     resolved_input_values: Mapping[str, str] | None = None
+    artifact_scope_prefix: str | None = None
 
     @property
     def lifecycle_kind(self) -> str | None:
@@ -1256,6 +1260,7 @@ class ImplementationStepFactory:
         iteration: int,
         inputs: list[str],
         outputs: list[str],
+        artifact_scope_prefix: str | None = None,
     ) -> StepSpec:
         self._validate_item(item)
         self._validate_iteration(iteration)
@@ -1270,42 +1275,68 @@ class ImplementationStepFactory:
             outputs=list(outputs),
             context_id="work-items",
             artifact_subdir=f"{item.id}/iterations/{iteration:04d}/{role}",
+            artifact_scope_prefix=artifact_scope_prefix,
         )
 
-    def coder(self, item: WorkItemSnapshot) -> StepSpec:
+    def coder(
+        self,
+        item: WorkItemSnapshot,
+        *,
+        artifact_scope_prefix: str | None = None,
+    ) -> StepSpec:
         return self._build(
             "implementation_coder",
             item,
             iteration=0,
             inputs=["$loop_item"],
             outputs=["06-implementation-notes.md"],
+            artifact_scope_prefix=artifact_scope_prefix,
         )
 
-    def reviewer(self, item: WorkItemSnapshot, iteration: int) -> StepSpec:
+    def reviewer(
+        self,
+        item: WorkItemSnapshot,
+        iteration: int,
+        *,
+        artifact_scope_prefix: str | None = None,
+    ) -> StepSpec:
         return self._build(
             "implementation_reviewer",
             item,
             iteration=iteration,
             inputs=["$loop_item"],
             outputs=[REVIEW_RESULT_FILENAME],
+            artifact_scope_prefix=artifact_scope_prefix,
         )
 
-    def fix(self, item: WorkItemSnapshot, iteration: int) -> StepSpec:
+    def fix(
+        self,
+        item: WorkItemSnapshot,
+        iteration: int,
+        *,
+        artifact_scope_prefix: str | None = None,
+    ) -> StepSpec:
         return self._build(
             "implementation_fix",
             item,
             iteration=iteration,
             inputs=["$loop_item", "$review_findings"],
             outputs=["06-implementation-notes.md"],
+            artifact_scope_prefix=artifact_scope_prefix,
         )
 
-    def potential_steps(self, item: WorkItemSnapshot) -> tuple[StepSpec, ...]:
+    def potential_steps(
+        self,
+        item: WorkItemSnapshot,
+        *,
+        artifact_scope_prefix: str | None = None,
+    ) -> tuple[StepSpec, ...]:
         """Return all four possible specs without resolving or executing them."""
         return (
-            self.coder(item),
-            self.reviewer(item, 0),
-            self.fix(item, 1),
-            self.reviewer(item, 1),
+            self.coder(item, artifact_scope_prefix=artifact_scope_prefix),
+            self.reviewer(item, 0, artifact_scope_prefix=artifact_scope_prefix),
+            self.fix(item, 1, artifact_scope_prefix=artifact_scope_prefix),
+            self.reviewer(item, 1, artifact_scope_prefix=artifact_scope_prefix),
         )
 
 
@@ -2848,6 +2879,8 @@ class WorkflowRunner:
         self.allow_plan_check_external_send = allow_plan_check_external_send
         self.plan_check_required = plan_check_required
         self.resume_intervention = resume_intervention
+        self._active_implementation_loop_status_path: Path | None = None
+        self._active_implementation_scope_prefix: str | None = None
         self.reuse_issue_cache = reuse_issue_cache
         # Configured execution takes one immutable snapshot of these inputs
         # during preflight.  The legacy prompt composer still asks its
@@ -3150,6 +3183,9 @@ class WorkflowRunner:
     def preflight_implementation_item_subpipelines(
         self,
         snapshot: WorkItemsSnapshot,
+        *,
+        artifact_scope_prefix: str | None = None,
+        reject_existing_scopes: bool = False,
     ) -> tuple[tuple[ResolvedStep, ...], ...]:
         """Resolve every potential role step without starting its lifecycle.
 
@@ -3161,12 +3197,32 @@ class WorkflowRunner:
         """
         if not isinstance(snapshot, WorkItemsSnapshot):
             raise TypeError("snapshot must be a WorkItemsSnapshot")
+        if artifact_scope_prefix is not None:
+            self._validate_relative_path_value(
+                artifact_scope_prefix,
+                "implementation artifact scope prefix",
+            )
+        if not isinstance(reject_existing_scopes, bool):
+            raise TypeError("reject_existing_scopes must be a boolean")
 
         resolved_items: list[tuple[ResolvedStep, ...]] = []
         seen_scopes: set[Path] = set()
         for item in snapshot.items:
+            if reject_existing_scopes:
+                item_scope = self.implementation_item_scope_path(
+                    item.id,
+                    artifact_scope_prefix=artifact_scope_prefix,
+                )
+                if item_scope.exists():
+                    raise RuntimeError(
+                        "Implementation work item artifact scope already exists: "
+                        f"{item_scope.relative_to(self.workdir)}"
+                    )
             resolved_steps: list[ResolvedStep] = []
-            for step in self.implementation_step_factory.potential_steps(item):
+            for step in self.implementation_step_factory.potential_steps(
+                item,
+                artifact_scope_prefix=artifact_scope_prefix,
+            ):
                 virtual_context: dict[str, str] = {
                     "$loop_item": item.canonical_json,
                 }
@@ -3303,7 +3359,11 @@ class WorkflowRunner:
         iteration: int,
     ) -> tuple[ReviewResult, str]:
         """Run a reviewer and load its dedicated result only after success."""
-        step = self.implementation_step_factory.reviewer(item, iteration)
+        step = self.implementation_step_factory.reviewer(
+            item,
+            iteration,
+            artifact_scope_prefix=self._active_implementation_scope_prefix,
+        )
         reviewer_scope = self.resolve_artifact_scope(step)
         reviewer_scope_ref = self._implementation_scope_reference(reviewer_scope)
         self._start_implementation_role(
@@ -3457,19 +3517,30 @@ class WorkflowRunner:
             empty_findings = EMPTY_CANONICAL_REVIEW_FINDINGS_JSON
             planned_steps = (
                 (
-                    self.implementation_step_factory.coder(item),
+                    self.implementation_step_factory.coder(
+                        item,
+                        artifact_scope_prefix=self._active_implementation_scope_prefix,
+                    ),
                     "coder",
                     0,
                     {"$loop_item": item.canonical_json},
                 ),
                 (
-                    self.implementation_step_factory.reviewer(item, 0),
+                    self.implementation_step_factory.reviewer(
+                        item,
+                        0,
+                        artifact_scope_prefix=self._active_implementation_scope_prefix,
+                    ),
                     "reviewer",
                     0,
                     {"$loop_item": item.canonical_json},
                 ),
                 (
-                    self.implementation_step_factory.fix(item, 1),
+                    self.implementation_step_factory.fix(
+                        item,
+                        1,
+                        artifact_scope_prefix=self._active_implementation_scope_prefix,
+                    ),
                     "fix",
                     1,
                     {
@@ -3478,7 +3549,11 @@ class WorkflowRunner:
                     },
                 ),
                 (
-                    self.implementation_step_factory.reviewer(item, 1),
+                    self.implementation_step_factory.reviewer(
+                        item,
+                        1,
+                        artifact_scope_prefix=self._active_implementation_scope_prefix,
+                    ),
                     "reviewer",
                     1,
                     {"$loop_item": item.canonical_json},
@@ -3514,7 +3589,10 @@ class WorkflowRunner:
             self.write_implementation_loop_status(status)
             return
 
-        coder_step = self.implementation_step_factory.coder(item)
+        coder_step = self.implementation_step_factory.coder(
+            item,
+            artifact_scope_prefix=self._active_implementation_scope_prefix,
+        )
         self._run_implementation_step(
             status,
             item,
@@ -3543,7 +3621,11 @@ class WorkflowRunner:
             )
             return
 
-        fix_step = self.implementation_step_factory.fix(item, MAX_IMPLEMENTATION_FIX_ATTEMPTS)
+        fix_step = self.implementation_step_factory.fix(
+            item,
+            MAX_IMPLEMENTATION_FIX_ATTEMPTS,
+            artifact_scope_prefix=self._active_implementation_scope_prefix,
+        )
         self._run_implementation_step(
             status,
             item,
@@ -3592,29 +3674,492 @@ class WorkflowRunner:
         )
         raise safety_limit
 
-    def run_implementation_items(self) -> None:
-        """Run the fixed subpipeline for each validated work item in order."""
-        with self.implementation_loop_lock():
-            snapshot = self.load_implementation_items_snapshot()
-            self.preflight_implementation_item_subpipelines(snapshot)
-            status = self.build_implementation_loop_status(snapshot)
-            self.write_implementation_loop_status(status)
-            run_id = status.get("run_id")
-            if not isinstance(run_id, str):
-                raise ValueError("Implementation loop status is missing a valid run_id")
+    def _implementation_reopen_requested(self) -> bool:
+        intervention = self.resume_intervention
+        return bool(
+            intervention is not None
+            and intervention.action == "reopen"
+            and intervention.phase == "implementation"
+        )
 
-            for item in snapshot.items:
-                self.run_implementation_item_subpipeline(item, status, run_id)
+    def implementation_loop_current_path(self) -> Path:
+        return self.artifact_dir / IMPLEMENTATION_LOOP_CURRENT_FILENAME
 
-            self.transition_implementation_loop_overall(
-                status,
-                "planned" if self.dry_run else "succeeded",
+    def implementation_item_scope_path(
+        self,
+        item_id: str,
+        *,
+        artifact_scope_prefix: str | None = None,
+    ) -> Path:
+        validated_item_id = self._validate_implementation_loop_item_id(item_id)
+        segments: list[str] = []
+        if artifact_scope_prefix is not None:
+            segments.extend(
+                self._validate_relative_path_value(
+                    artifact_scope_prefix,
+                    "implementation artifact scope prefix",
+                )
             )
-            status["current_item"] = None
-            self.write_implementation_loop_status(status)
+        segments.extend(("work-items", validated_item_id))
+        scope = self.artifact_dir.joinpath(*segments)
+        self._assert_artifact_path_contained(scope)
+        self._reject_symlink_components(self.artifact_dir, scope)
+        return scope
 
-    def load_implementation_items_snapshot(self) -> WorkItemsSnapshot:
+    @staticmethod
+    def _is_regular_file(path: Path) -> bool:
+        try:
+            return stat.S_ISREG(os.stat(path, follow_symlinks=False).st_mode)
+        except OSError:
+            return False
+
+    def _load_implementation_loop_status_file(
+        self,
+        path: Path,
+    ) -> tuple[bytes, dict[str, object]]:
+        self._assert_artifact_path_contained(path)
+        self._reject_symlink_components(self.artifact_dir, path)
+        if not self._is_regular_file(path):
+            raise ValueError(
+                "Implementation loop status must be a regular file: "
+                f"{path.relative_to(self.workdir)}"
+            )
+        raw = path.read_bytes()
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Invalid implementation loop status: {path.relative_to(self.workdir)}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Implementation loop status must be a JSON object")
+        schema_version = payload.get("schema_version")
+        if schema_version not in {
+            IMPLEMENTATION_LOOP_STATUS_SCHEMA_VERSION,
+            IMPLEMENTATION_LOOP_RESUME_STATUS_SCHEMA_VERSION,
+        }:
+            raise ValueError(
+                "Unsupported implementation loop status schema: "
+                f"{schema_version!r}"
+            )
+        self._validate_implementation_loop_run_id(payload.get("run_id"))
+        return raw, payload
+
+    def _validate_parent_implementation_loop_status(
+        self,
+        status: Mapping[str, object],
+    ) -> None:
+        source = status.get("source")
+        if not isinstance(source, Mapping):
+            raise ValueError("Implementation loop parent status has no valid source")
+        source_path = source.get("path")
+        source_sha256 = source.get("sha256")
+        source_item_count = source.get("item_count")
+        if not isinstance(source_path, str) or not source_path:
+            raise ValueError("Implementation loop parent source path is invalid")
+        self._validate_relative_path_value(source_path, "implementation loop source path")
+        if (
+            not isinstance(source_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
+        ):
+            raise ValueError("Implementation loop parent source digest is invalid")
+        if (
+            isinstance(source_item_count, bool)
+            or not isinstance(source_item_count, int)
+            or source_item_count < 1
+            or source_item_count > MAX_IMPLEMENTATION_LOOP_ITEMS
+        ):
+            raise ValueError("Implementation loop parent source item_count is invalid")
+
+        order = status.get("order")
+        items = status.get("items")
+        if not isinstance(order, list) or not isinstance(items, list):
+            raise ValueError("Implementation loop parent status has invalid item data")
+        if len(order) != len(items) or len(order) != source_item_count:
+            raise ValueError("Implementation loop parent status item count is inconsistent")
+
+        seen_ids: set[str] = set()
+        for position, (ordered_id, raw_item) in enumerate(zip(order, items)):
+            if not isinstance(ordered_id, str):
+                raise ValueError("Implementation loop parent order contains an invalid item id")
+            item_id = self._validate_implementation_loop_item_id(ordered_id)
+            if item_id in seen_ids:
+                raise ValueError("Implementation loop parent order contains duplicate item ids")
+            seen_ids.add(item_id)
+            if not isinstance(raw_item, Mapping):
+                raise ValueError("Implementation loop parent contains an invalid item record")
+            if raw_item.get("id") != item_id or raw_item.get("position") != position:
+                raise ValueError("Implementation loop parent item order is inconsistent")
+            item_status = raw_item.get("status")
+            if item_status not in IMPLEMENTATION_LOOP_ITEM_STATUSES:
+                raise ValueError(
+                    "Implementation loop parent contains an unsupported item status"
+                )
+            payload_sha256 = raw_item.get("payload_sha256")
+            if (
+                not isinstance(payload_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None
+            ):
+                raise ValueError("Implementation loop parent item payload digest is invalid")
+            artifact_scope = raw_item.get("artifact_scope")
+            if not isinstance(artifact_scope, str) or not artifact_scope:
+                raise ValueError("Implementation loop parent item artifact scope is invalid")
+            self._validate_relative_path_value(
+                artifact_scope,
+                "implementation loop parent artifact scope",
+            )
+            scope = safe_artifact_path(self.artifact_dir, artifact_scope)
+            self._reject_symlink_components(self.artifact_dir, scope)
+
+    def _load_current_implementation_loop_parent(
+        self,
+    ) -> tuple[Path, bytes, dict[str, object]] | None:
+        pointer_path = self.implementation_loop_current_path()
+        self._assert_artifact_path_contained(pointer_path)
+        self._reject_symlink_components(self.artifact_dir, pointer_path)
+        if pointer_path.exists():
+            if not self._is_regular_file(pointer_path):
+                raise ValueError("Implementation loop current pointer must be a regular file")
+            try:
+                pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("Invalid implementation loop current pointer") from exc
+            if not isinstance(pointer, dict):
+                raise ValueError("Implementation loop current pointer must be a JSON object")
+            status_ref = pointer.get("status_path")
+            pointer_run_id = pointer.get("run_id")
+            if not isinstance(status_ref, str) or not status_ref:
+                raise ValueError("Implementation loop current pointer has no status path")
+            self._validate_relative_path_value(
+                status_ref,
+                "implementation loop current status path",
+            )
+            if Path(status_ref).name != "implementation-loop-status.json":
+                raise ValueError("Implementation loop current pointer has an invalid status path")
+            self._validate_implementation_loop_run_id(pointer_run_id)
+            status_path = safe_artifact_path(self.artifact_dir, status_ref)
+        else:
+            status_path = self.artifact_dir / "implementation-loop-status.json"
+            self._assert_artifact_path_contained(status_path)
+            self._reject_symlink_components(self.artifact_dir, status_path)
+            pointer_run_id = None
+
+        if not status_path.exists():
+            return None
+        raw, status = self._load_implementation_loop_status_file(status_path)
+        self._validate_parent_implementation_loop_status(status)
+        self._validate_implementation_loop_lineage(status_path, status)
+        if pointer_run_id is not None and status.get("run_id") != pointer_run_id:
+            raise ValueError("Implementation loop current pointer run_id does not match status")
+        return status_path, raw, status
+
+    def _validate_implementation_loop_lineage(
+        self,
+        status_path: Path,
+        status: Mapping[str, object],
+        *,
+        seen: set[Path] | None = None,
+    ) -> None:
+        """Validate every parent digest before a generation can be resumed."""
+        if status.get("schema_version") != IMPLEMENTATION_LOOP_RESUME_STATUS_SCHEMA_VERSION:
+            return
+        visited = set() if seen is None else set(seen)
+        if status_path in visited:
+            raise ValueError("Implementation loop status lineage contains a cycle")
+        visited.add(status_path)
+        parent = status.get("parent")
+        if not isinstance(parent, Mapping):
+            raise ValueError("Resumed implementation loop status has no parent metadata")
+        parent_ref = parent.get("status_path")
+        parent_sha256 = parent.get("status_sha256")
+        parent_run_id = parent.get("run_id")
+        if not isinstance(parent_ref, str) or not parent_ref:
+            raise ValueError("Implementation loop parent status path is invalid")
+        self._validate_relative_path_value(
+            parent_ref,
+            "implementation loop parent status path",
+        )
+        if Path(parent_ref).name != "implementation-loop-status.json":
+            raise ValueError("Implementation loop parent status path is invalid")
+        if (
+            not isinstance(parent_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", parent_sha256) is None
+        ):
+            raise ValueError("Implementation loop parent status digest is invalid")
+        self._validate_implementation_loop_run_id(parent_run_id)
+        parent_path = safe_artifact_path(self.artifact_dir, parent_ref)
+        if parent_path == status_path:
+            raise ValueError("Implementation loop status cannot be its own parent")
+        parent_raw, parent_status = self._load_implementation_loop_status_file(parent_path)
+        if hashlib.sha256(parent_raw).hexdigest() != parent_sha256:
+            raise ValueError("Implementation loop parent status digest does not match")
+        if parent_status.get("run_id") != parent_run_id:
+            raise ValueError("Implementation loop parent status run_id does not match")
+        self._validate_parent_implementation_loop_status(parent_status)
+        self._validate_implementation_loop_lineage(
+            parent_path,
+            parent_status,
+            seen=visited,
+        )
+
+    def _implementation_resume_item_index(
+        self,
+        parent_status: Mapping[str, object],
+    ) -> tuple[int, bool]:
+        order = parent_status.get("order")
+        items = parent_status.get("items")
+        if not isinstance(order, list) or not isinstance(items, list):
+            raise ValueError("Implementation loop parent status has invalid resume data")
+        intervention = self.resume_intervention
+        requested_item = intervention.loop_from_item if intervention is not None else None
+        explicit = requested_item is not None
+        if requested_item is not None:
+            requested_item = self._validate_implementation_loop_item_id(requested_item)
+            try:
+                start_index = order.index(requested_item)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Implementation loop resume item does not exist: {requested_item}"
+                ) from exc
+        else:
+            start_index = -1
+            for index, raw_item in enumerate(items):
+                if isinstance(raw_item, Mapping) and raw_item.get("status") in {"failed", "not_run"}:
+                    start_index = index
+                    break
+            if start_index < 0:
+                raise ValueError(
+                    "Implementation loop has no failed or not_run item; "
+                    "specify --resume-loop-from with an item to rerun"
+                )
+
+        for raw_item in items[:start_index]:
+            if not isinstance(raw_item, Mapping) or raw_item.get("status") != "succeeded":
+                raise ValueError(
+                    "Implementation loop resume requires every earlier item to be succeeded"
+                )
+        return start_index, explicit
+
+    def _build_implementation_loop_resume_status(
+        self,
+        snapshot: WorkItemsSnapshot,
+        *,
+        parent_path: Path,
+        parent_raw: bytes,
+        parent_status: Mapping[str, object],
+        start_index: int,
+        carry_forward: bool,
+        run_id: str,
+        artifact_scope_prefix: str,
+    ) -> dict[str, object]:
+        status = self.build_implementation_loop_status(snapshot, run_id=run_id)
+        status["schema_version"] = IMPLEMENTATION_LOOP_RESUME_STATUS_SCHEMA_VERSION
+        status["parent"] = {
+            "status_path": str(parent_path.relative_to(self.artifact_dir)),
+            "status_sha256": hashlib.sha256(parent_raw).hexdigest(),
+            "run_id": parent_status["run_id"],
+        }
+        status["resume"] = {
+            "from_item": snapshot.items[start_index].id,
+            "mode": "carry_forward" if carry_forward else "rebuild",
+            "carried_forward_items": [
+                item.id for item in snapshot.items[:start_index]
+            ] if carry_forward else [],
+        }
+        items = status["items"]
+        parent_items = parent_status.get("items")
+        assert isinstance(items, list)
+        assert isinstance(parent_items, list)
+        for index, item in enumerate(items):
+            assert isinstance(item, dict)
+            if index < start_index and carry_forward:
+                parent_item = parent_items[index]
+                assert isinstance(parent_item, Mapping)
+                for field_name in (
+                    "status",
+                    "reason",
+                    "current_role",
+                    "current_iteration",
+                    "attempt_id",
+                    "last_review_scope",
+                    "error",
+                ):
+                    item[field_name] = parent_item.get(field_name)
+                item["artifact_scope"] = parent_item["artifact_scope"]
+                item["carried_from"] = {
+                    "run_id": parent_status["run_id"],
+                    "artifact_scope": parent_item["artifact_scope"],
+                    "attempt_id": parent_item.get("attempt_id"),
+                }
+            else:
+                item["artifact_scope"] = (
+                    f"{artifact_scope_prefix}/work-items/{item['id']}"
+                )
+                item["carried_from"] = None
+        return status
+
+    def _write_implementation_loop_current_pointer(
+        self,
+        status_path: Path,
+        run_id: str,
+    ) -> None:
+        self._assert_artifact_path_contained(status_path)
+        self._reject_symlink_components(self.artifact_dir, status_path)
+        self._validate_implementation_loop_run_id(run_id)
+        payload = {
+            "status_path": str(status_path.relative_to(self.artifact_dir)),
+            "run_id": run_id,
+        }
+        pointer_path = self.implementation_loop_current_path()
+        self._assert_artifact_path_contained(pointer_path)
+        self._reject_symlink_components(self.artifact_dir, pointer_path)
+        self.atomic_write_text(
+            pointer_path,
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        )
+
+    def run_implementation_items(self) -> None:
+        """Run the fixed subpipeline, versioning an explicitly reopened loop."""
+        with self.implementation_loop_lock():
+            self._active_implementation_loop_status_path = None
+            self._active_implementation_scope_prefix = None
+            try:
+                if self._implementation_reopen_requested():
+                    parent = self._load_current_implementation_loop_parent()
+                    if parent is None:
+                        raise RuntimeError(
+                            "Cannot reopen implementation loop: parent status artifact is missing"
+                        )
+                    parent_path, parent_raw, parent_status = parent
+                    snapshot = self.load_implementation_items_snapshot(
+                        allow_existing_artifacts=True,
+                    )
+                    self._validate_parent_implementation_loop_status(parent_status)
+                    start_index, explicit = self._implementation_resume_item_index(parent_status)
+                    parent_source = parent_status["source"]
+                    assert isinstance(parent_source, Mapping)
+                    current_source_path = str(
+                        snapshot.source_path.relative_to(self.artifact_dir)
+                    )
+                    source_matches = (
+                        parent_source.get("path") == current_source_path
+                        and parent_source.get("sha256") == snapshot.source_sha256
+                        and parent_status.get("order") == [item.id for item in snapshot.items]
+                        and all(
+                            isinstance(parent_item, Mapping)
+                            and parent_item.get("payload_sha256") == item.payload_sha256
+                            for parent_item, item in zip(
+                                parent_status["items"],
+                                snapshot.items,
+                            )
+                        )
+                    )
+                    if not source_matches:
+                        if not explicit or start_index != 0:
+                            raise ValueError(
+                                "Implementation loop source digest or item payload changed; "
+                                "resume explicitly from the first item to rebuild"
+                            )
+                    run_id = self._validate_implementation_loop_run_id(uuid.uuid4().hex)
+                    artifact_scope_prefix = (
+                        f"{IMPLEMENTATION_LOOP_RUNS_DIRNAME}/{run_id}"
+                    )
+                    generation_status_path = (
+                        self.artifact_dir
+                        / IMPLEMENTATION_LOOP_RUNS_DIRNAME
+                        / run_id
+                        / "implementation-loop-status.json"
+                    )
+                    generation_root = generation_status_path.parent
+                    self._assert_artifact_path_contained(generation_status_path)
+                    self._reject_symlink_components(
+                        self.artifact_dir,
+                        generation_status_path,
+                    )
+                    if generation_root.exists():
+                        raise RuntimeError(
+                            "Implementation loop generation already exists: "
+                            f"{generation_root.relative_to(self.workdir)}"
+                        )
+                    self._active_implementation_loop_status_path = generation_status_path
+                    self._active_implementation_scope_prefix = artifact_scope_prefix
+                    selected_snapshot = WorkItemsSnapshot(
+                        source_path=snapshot.source_path,
+                        source_sha256=snapshot.source_sha256,
+                        items=snapshot.items[start_index:],
+                    )
+                    self.preflight_implementation_item_subpipelines(
+                        selected_snapshot,
+                        artifact_scope_prefix=artifact_scope_prefix,
+                        reject_existing_scopes=True,
+                    )
+                    status = self._build_implementation_loop_resume_status(
+                        snapshot,
+                        parent_path=parent_path,
+                        parent_raw=parent_raw,
+                        parent_status=parent_status,
+                        start_index=start_index,
+                        carry_forward=source_matches,
+                        run_id=run_id,
+                        artifact_scope_prefix=artifact_scope_prefix,
+                    )
+                    self.write_implementation_loop_status(status)
+                    self._write_implementation_loop_current_pointer(
+                        generation_status_path,
+                        run_id,
+                    )
+                    self.update_workflow_state(
+                        self.artifact_dir,
+                        {
+                            "implementation_loop_status_path": str(
+                                generation_status_path.relative_to(self.artifact_dir)
+                            ),
+                            "implementation_loop_run_id": run_id,
+                            "implementation_loop_parent_status_path": str(
+                                parent_path.relative_to(self.artifact_dir)
+                            ),
+                            "implementation_loop_resume_from": snapshot.items[start_index].id,
+                        },
+                    )
+                    items_to_run = selected_snapshot.items
+                else:
+                    snapshot = self.load_implementation_items_snapshot()
+                    self.preflight_implementation_item_subpipelines(snapshot)
+                    status = self.build_implementation_loop_status(snapshot)
+                    self.write_implementation_loop_status(status)
+                    run_id = status.get("run_id")
+                    if not isinstance(run_id, str):
+                        raise ValueError("Implementation loop status is missing a valid run_id")
+                    self._write_implementation_loop_current_pointer(
+                        self.implementation_loop_status_path(),
+                        run_id,
+                    )
+                    items_to_run = snapshot.items
+
+                run_id = status.get("run_id")
+                if not isinstance(run_id, str):
+                    raise ValueError("Implementation loop status is missing a valid run_id")
+                for item in items_to_run:
+                    self.run_implementation_item_subpipeline(item, status, run_id)
+
+                self.transition_implementation_loop_overall(
+                    status,
+                    "planned" if self.dry_run else "succeeded",
+                )
+                status["current_item"] = None
+                self.write_implementation_loop_status(status)
+            finally:
+                self._active_implementation_loop_status_path = None
+                self._active_implementation_scope_prefix = None
+
+    def load_implementation_items_snapshot(
+        self,
+        *,
+        allow_existing_artifacts: bool = False,
+    ) -> WorkItemsSnapshot:
         """Read, validate, and freeze work_items.json without creating scopes."""
+        if not isinstance(allow_existing_artifacts, bool):
+            raise TypeError("allow_existing_artifacts must be a boolean")
         source_path = self.work_items_json_path()
         self._assert_artifact_path_contained(source_path)
         self._reject_symlink_components(self.artifact_dir, source_path)
@@ -3647,23 +4192,33 @@ class WorkflowRunner:
                 f"{MAX_IMPLEMENTATION_LOOP_ITEMS} tasks"
             )
 
-        status_path = self.implementation_loop_status_path()
-        self._assert_artifact_path_contained(status_path)
-        self._reject_symlink_components(self.artifact_dir, status_path)
-        if status_path.exists():
-            raise RuntimeError(
-                "Implementation loop already has a status artifact: "
-                f"{status_path.relative_to(self.workdir)}"
-            )
+        if not allow_existing_artifacts:
+            status_path = self.implementation_loop_status_path()
+            self._assert_artifact_path_contained(status_path)
+            self._reject_symlink_components(self.artifact_dir, status_path)
+            if status_path.exists():
+                raise RuntimeError(
+                    "Implementation loop already has a status artifact: "
+                    f"{status_path.relative_to(self.workdir)}"
+                )
 
-        work_items_root = self.artifact_dir / "work-items"
-        self._assert_artifact_path_contained(work_items_root)
-        self._reject_symlink_components(self.artifact_dir, work_items_root)
-        if work_items_root.exists() and not work_items_root.is_dir():
-            raise RuntimeError(
-                "Implementation work item artifact root is not a directory: "
-                f"{work_items_root.relative_to(self.workdir)}"
-            )
+            work_items_root = self.artifact_dir / "work-items"
+            self._assert_artifact_path_contained(work_items_root)
+            self._reject_symlink_components(self.artifact_dir, work_items_root)
+            if work_items_root.exists() and not work_items_root.is_dir():
+                raise RuntimeError(
+                    "Implementation work item artifact root is not a directory: "
+                    f"{work_items_root.relative_to(self.workdir)}"
+                )
+
+            current_path = self.implementation_loop_current_path()
+            self._assert_artifact_path_contained(current_path)
+            self._reject_symlink_components(self.artifact_dir, current_path)
+            if current_path.exists():
+                raise RuntimeError(
+                    "Implementation loop current pointer already exists: "
+                    f"{current_path.relative_to(self.workdir)}"
+                )
 
         seen_ids: set[str] = set()
         snapshots: list[WorkItemSnapshot] = []
@@ -3693,14 +4248,13 @@ class WorkflowRunner:
                     f"{MAX_IMPLEMENTATION_LOOP_ITEM_BYTES}-byte limit"
                 )
 
-            item_scope = self.artifact_dir / "work-items" / item_id
-            self._assert_artifact_path_contained(item_scope)
-            self._reject_symlink_components(self.artifact_dir, item_scope)
-            if item_scope.exists():
-                raise RuntimeError(
-                    "Implementation work item artifact scope already exists: "
-                    f"{item_scope.relative_to(self.workdir)}"
-                )
+            if not allow_existing_artifacts:
+                item_scope = self.implementation_item_scope_path(item_id)
+                if item_scope.exists():
+                    raise RuntimeError(
+                        "Implementation work item artifact scope already exists: "
+                        f"{item_scope.relative_to(self.workdir)}"
+                    )
 
             frozen_payload = freeze_json_value(task)
             assert isinstance(frozen_payload, Mapping)
@@ -3721,7 +4275,9 @@ class WorkflowRunner:
         )
 
     def implementation_loop_status_path(self) -> Path:
-        return self.artifact_dir / "implementation-loop-status.json"
+        return self._active_implementation_loop_status_path or (
+            self.artifact_dir / "implementation-loop-status.json"
+        )
 
     def implementation_loop_lock_path(self) -> Path:
         return self.artifact_dir / ".implementation-loop.lock"
@@ -4446,6 +5002,13 @@ class WorkflowRunner:
             "intervention_response_path": self.resume_intervention.response_ref,
             "intervention_prompt_path": self.resume_intervention.prompt_ref,
             "intervention_status": "consumed",
+            **(
+                {
+                    "implementation_loop_resume_from": self.resume_intervention.loop_from_item
+                }
+                if self.resume_intervention.loop_from_item is not None
+                else {}
+            ),
         }
 
     @staticmethod
@@ -4716,6 +5279,7 @@ class WorkflowRunner:
         action: str,
         prompt: str | None = None,
         target_phase: str | None = None,
+        loop_from_item: str | None = None,
     ) -> HumanIntervention | None:
         request_path, request = self._load_intervention_request(state)
         try:
@@ -4756,6 +5320,16 @@ class WorkflowRunner:
             raise SystemExit(
                 f"Cannot accept human intervention: unsupported target phase {requested_target_phase!r}"
             )
+        if loop_from_item is not None:
+            try:
+                loop_from_item = self._validate_implementation_loop_item_id(loop_from_item)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+            if normalized_action != "reopen" or requested_target_phase != "implementation":
+                raise SystemExit(
+                    "--resume-loop-from requires --resume-action reopen and "
+                    "--resume-phase implementation"
+                )
         if normalized_action == "reopen" and PHASES.index(requested_target_phase) > PHASES.index(request_phase):
             raise SystemExit(
                 "Cannot reopen a later phase; choose the paused phase or an earlier phase"
@@ -4771,6 +5345,7 @@ class WorkflowRunner:
             request_sha256=request_sha256,
             actor="local-user",
             created_at=datetime.now(timezone.utc).isoformat(),
+            loop_from_item=loop_from_item,
         )
         response_path = responses_dir / f"{index:04d}.json"
         self.atomic_write_text(response_path, dump_payload(response_payload))
@@ -4786,6 +5361,11 @@ class WorkflowRunner:
                 else "accepted",
                 "owner_phase": requested_target_phase,
                 "intervention_target_phase": requested_target_phase,
+                **(
+                    {"implementation_loop_resume_from": loop_from_item}
+                    if loop_from_item is not None
+                    else {}
+                ),
                 **(
                     {
                         "status": "aborted",
@@ -4810,6 +5390,7 @@ class WorkflowRunner:
             prompt=normalized_prompt,
             prompt_ref=prompt_ref,
             response_ref=response_ref,
+            loop_from_item=loop_from_item,
         )
         self.resume_intervention = intervention
         print(f"Accepted human intervention '{normalized_action}' for phase '{target_phase}'.")
@@ -5393,6 +5974,7 @@ class WorkflowRunner:
         self._validate_declared_outputs(step.outputs or [])
         self._validate_context_id(step.context_id)
         self._validate_artifact_subdir(step.artifact_subdir)
+        self._validate_artifact_scope_prefix(step.artifact_scope_prefix)
         post_actions = step.post_actions or []
         unsupported_actions = set(post_actions) - SUPPORTED_STEP_POST_ACTIONS
         if unsupported_actions:
@@ -5437,6 +6019,16 @@ class WorkflowRunner:
         if not isinstance(artifact_subdir, str):
             raise ValueError("artifact scope segment must be a string")
         self._validate_relative_path_value(artifact_subdir, "artifact scope segment")
+
+    def _validate_artifact_scope_prefix(self, artifact_scope_prefix: str | None) -> None:
+        if artifact_scope_prefix is None:
+            return
+        if not isinstance(artifact_scope_prefix, str):
+            raise ValueError("artifact scope prefix must be a string")
+        self._validate_relative_path_value(
+            artifact_scope_prefix,
+            "artifact scope prefix",
+        )
 
     @staticmethod
     def _validate_relative_path_value(
@@ -5690,6 +6282,13 @@ class WorkflowRunner:
         """Return a validated scope path without creating it."""
         self.validate_step_spec(step)
         segments: list[str] = []
+        if step.artifact_scope_prefix is not None:
+            segments.extend(
+                self._validate_relative_path_value(
+                    step.artifact_scope_prefix,
+                    "artifact scope prefix",
+                )
+            )
         if step.context_id is not None:
             segments.extend(self._validate_relative_path_value(
                 step.context_id,
@@ -6786,6 +7385,14 @@ def parse_args() -> argparse.Namespace:
         help="Earlier phase to reopen when --resume-action reopen is selected.",
     )
     parser.add_argument(
+        "--resume-loop-from",
+        dest="resume_loop_from",
+        help=(
+            "Implementation work-item ID to rerun when reopening the implementation loop. "
+            "Use with --resume-action reopen --resume-phase implementation."
+        ),
+    )
+    parser.add_argument(
         "--resume-prompt",
         "--intervention-prompt",
         dest="resume_prompt",
@@ -6851,6 +7458,14 @@ def main() -> None:
         raise SystemExit("--waive-plan-comprehension-check cannot be combined with --resume-action")
     if args.resume_phase and args.resume_action != "reopen":
         raise SystemExit("--resume-phase requires --resume-action reopen")
+    if args.resume_loop_from and not args.resume:
+        raise SystemExit("--resume-loop-from requires --resume")
+    if args.resume_loop_from and args.resume_action != "reopen":
+        raise SystemExit("--resume-loop-from requires --resume-action reopen")
+    if args.resume_loop_from and args.resume_phase != "implementation":
+        raise SystemExit("--resume-loop-from requires --resume-phase implementation")
+    if args.resume_loop_from and not args.legacy_workflow:
+        raise SystemExit("--resume-loop-from requires --legacy-workflow")
     resume_prompt = read_resume_prompt(args)
     if resume_prompt is not None and not args.resume_action:
         raise SystemExit("A resume prompt requires --resume-action")
@@ -6980,6 +7595,7 @@ def main() -> None:
                 args.resume_action,
                 resume_prompt,
                 target_phase=args.resume_phase,
+                loop_from_item=args.resume_loop_from,
             )
             if args.resume_action == "abort":
                 return

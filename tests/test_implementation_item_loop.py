@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import tempfile
 import unittest
@@ -20,6 +21,7 @@ from scripts.run_issue_workflow import (
     IMPLEMENTATION_STEP_TO_PROMPT,
     IMPLEMENTATION_STEP_TO_SKILL,
     InstructionStagingConfig,
+    HumanIntervention,
     ReviewFinding,
     REVIEW_RESULT_FILENAME,
     ReviewResultLoader,
@@ -347,6 +349,18 @@ class ImplementationItemLoopTests(unittest.TestCase):
         self.assertEqual(factory.runner_names["implementation_coder"], "coder-runner")
         with self.assertRaises(TypeError):
             factory.runner_names["implementation_coder"] = "mutated"  # type: ignore[index]
+
+    def test_generation_scope_prefix_rejects_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = self.make_runner(tmpdir)
+            self.write_work_items(runner, [self.task("wi-1")])
+            snapshot = runner.load_implementation_items_snapshot()
+
+            with self.assertRaisesRegex(ValueError, "implementation artifact scope prefix"):
+                runner.preflight_implementation_item_subpipelines(
+                    snapshot,
+                    artifact_scope_prefix="../outside",
+                )
 
     def test_role_preflight_failure_has_no_lifecycle_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1275,6 +1289,208 @@ class ImplementationItemLoopTests(unittest.TestCase):
 
             self.assertTrue(runner.implementation_loop_lock_path().exists())
             self.assertFalse(runner.implementation_loop_status_path().exists())
+
+    def test_reopen_resumes_from_failed_item_in_a_new_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = self.make_runner(tmpdir)
+            tasks = [self.task("wi-1"), self.task("wi-2"), self.task("wi-3")]
+            self.write_work_items(runner, tasks)
+            first_calls: list[str] = []
+            first_failure = RuntimeError("first generation failed")
+
+            def first_run_step(
+                step: StepSpec,
+                *,
+                virtual_context: dict[str, str] | None = None,
+            ) -> None:
+                assert virtual_context is not None
+                item_id = json.loads(virtual_context["$loop_item"])["id"]
+                first_calls.append(f"{item_id}:{step.name}")
+                if item_id == "wi-2":
+                    raise first_failure
+                if step.name == "implementation_reviewer":
+                    self.write_review_result(
+                        runner,
+                        step,
+                        {"schema_version": "1.0", "status": "no_findings", "findings": []},
+                    )
+
+            with patch.object(runner, "run_step", side_effect=first_run_step):
+                with self.assertRaisesRegex(RuntimeError, "first generation failed"):
+                    runner.implementation()
+
+            parent_path = runner.implementation_loop_status_path()
+            parent_bytes = parent_path.read_bytes()
+            parent_status = json.loads(parent_bytes)
+            self.assertEqual(
+                [item["status"] for item in parent_status["items"]],
+                ["succeeded", "failed", "not_run"],
+            )
+            # A legacy run predating the current pointer must still be resumable.
+            runner.implementation_loop_current_path().unlink()
+
+            runner.resume_intervention = HumanIntervention(
+                request_id="intervention-0001",
+                phase="implementation",
+                owner_phase="review_fix_loop",
+                action="reopen",
+                prompt="Continue from the failed item.",
+                prompt_ref=None,
+                response_ref="human-interventions/responses/0001.json",
+                loop_from_item="wi-2",
+            )
+            resumed_calls: list[tuple[str, str, str | None]] = []
+
+            def resumed_run_step(
+                step: StepSpec,
+                *,
+                virtual_context: dict[str, str] | None = None,
+            ) -> None:
+                assert virtual_context is not None
+                item_id = json.loads(virtual_context["$loop_item"])["id"]
+                resumed_calls.append((item_id, step.name, step.artifact_scope_prefix))
+                if step.name == "implementation_reviewer":
+                    self.write_review_result(
+                        runner,
+                        step,
+                        {"schema_version": "1.0", "status": "no_findings", "findings": []},
+                    )
+
+            with patch.object(runner, "run_step", side_effect=resumed_run_step):
+                runner.implementation()
+
+            self.assertEqual(parent_path.read_bytes(), parent_bytes)
+            pointer = json.loads(
+                runner.implementation_loop_current_path().read_text(encoding="utf-8")
+            )
+            child_path = runner.artifact_dir / pointer["status_path"]
+            child_status = json.loads(child_path.read_text(encoding="utf-8"))
+            self.assertEqual(child_status["schema_version"], "3.0")
+            self.assertEqual(child_status["parent"]["status_path"], "implementation-loop-status.json")
+            self.assertEqual(
+                child_status["parent"]["status_sha256"],
+                hashlib.sha256(parent_bytes).hexdigest(),
+            )
+            self.assertEqual(child_status["resume"]["from_item"], "wi-2")
+            self.assertEqual(child_status["resume"]["carried_forward_items"], ["wi-1"])
+            self.assertEqual(
+                [item["status"] for item in child_status["items"]],
+                ["succeeded", "succeeded", "succeeded"],
+            )
+            self.assertEqual(
+                child_status["items"][0]["artifact_scope"],
+                "work-items/wi-1",
+            )
+            self.assertTrue(
+                child_status["items"][1]["artifact_scope"].startswith(
+                    "implementation-loop-runs/"
+                )
+            )
+            self.assertEqual(
+                [item_id for item_id, _, _ in resumed_calls],
+                ["wi-2", "wi-2", "wi-3", "wi-3"],
+            )
+            self.assertTrue(
+                all(
+                    prefix == pointer["status_path"].rsplit("/implementation-loop-status.json", 1)[0]
+                    for _, _, prefix in resumed_calls
+                )
+            )
+
+    def test_reopen_after_failed_generation_creates_another_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = self.make_runner(tmpdir)
+            self.write_work_items(runner, [self.task("wi-1")])
+            calls, first_run_step = self.scripted_subpipeline(
+                runner,
+                [{"schema_version": "1.0", "status": "no_findings", "findings": []}],
+            )
+            with patch.object(runner, "run_step", side_effect=first_run_step):
+                runner.implementation()
+
+            first_pointer = json.loads(
+                runner.implementation_loop_current_path().read_text(encoding="utf-8")
+            )
+            first_generation_path = runner.artifact_dir / first_pointer["status_path"]
+            first_generation_bytes = first_generation_path.read_bytes()
+            runner.resume_intervention = HumanIntervention(
+                request_id="intervention-0002",
+                phase="implementation",
+                owner_phase="review_fix_loop",
+                action="reopen",
+                prompt=None,
+                prompt_ref=None,
+                response_ref="human-interventions/responses/0002.json",
+                loop_from_item="wi-1",
+            )
+
+            failure = RuntimeError("second generation failed")
+            with patch.object(runner, "run_step", side_effect=failure):
+                with self.assertRaisesRegex(RuntimeError, "second generation failed"):
+                    runner.implementation()
+
+            second_pointer = json.loads(
+                runner.implementation_loop_current_path().read_text(encoding="utf-8")
+            )
+            self.assertNotEqual(first_pointer["status_path"], second_pointer["status_path"])
+            self.assertEqual(first_generation_path.read_bytes(), first_generation_bytes)
+            second_status = json.loads(
+                (runner.artifact_dir / second_pointer["status_path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                second_status["parent"]["status_path"],
+                first_pointer["status_path"],
+            )
+            self.assertEqual(second_status["items"][0]["status"], "failed")
+            self.assertEqual(len(calls), 2)
+
+            first_generation_path.write_bytes(first_generation_bytes + b"\n")
+            runner.resume_intervention = HumanIntervention(
+                request_id="intervention-0004",
+                phase="implementation",
+                owner_phase="review_fix_loop",
+                action="reopen",
+                prompt=None,
+                prompt_ref=None,
+                response_ref="human-interventions/responses/0004.json",
+                loop_from_item="wi-1",
+            )
+            with patch.object(runner, "run_step") as run_step:
+                with self.assertRaisesRegex(ValueError, "parent status digest does not match"):
+                    runner.implementation()
+                run_step.assert_not_called()
+
+    def test_reopen_rejects_changed_source_without_reexecuting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = self.make_runner(tmpdir)
+            self.write_work_items(runner, [self.task("wi-1"), self.task("wi-2")])
+            calls, first_run_step = self.scripted_subpipeline(
+                runner,
+                [
+                    {"schema_version": "1.0", "status": "no_findings", "findings": []},
+                    {"schema_version": "1.0", "status": "no_findings", "findings": []},
+                ],
+            )
+            with patch.object(runner, "run_step", side_effect=first_run_step):
+                runner.implementation()
+            parent_path = runner.implementation_loop_status_path()
+            self.write_work_items(runner, [self.task("wi-1", "changed"), self.task("wi-2")])
+            runner.resume_intervention = HumanIntervention(
+                request_id="intervention-0003",
+                phase="implementation",
+                owner_phase="review_fix_loop",
+                action="reopen",
+                prompt=None,
+                prompt_ref=None,
+                response_ref="human-interventions/responses/0003.json",
+                loop_from_item="wi-2",
+            )
+            with patch.object(runner, "run_step") as run_step:
+                with self.assertRaisesRegex(ValueError, "source digest or item payload changed"):
+                    runner.implementation()
+                run_step.assert_not_called()
+            self.assertFalse((runner.artifact_dir / "implementation-loop-runs").exists())
+            self.assertTrue(parent_path.exists())
 
 
 class ReviewResultLoaderTests(unittest.TestCase):

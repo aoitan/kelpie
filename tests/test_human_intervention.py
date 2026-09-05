@@ -356,6 +356,8 @@ class RunDirectoryTests(unittest.TestCase):
                     "reopen",
                     "--resume-phase",
                     "implementation",
+                    "--resume-loop-from",
+                    "wi-2",
                     "--resume-prompt",
                     "Recreate the implementation artifact and rerun review.",
                 ]
@@ -374,6 +376,13 @@ class RunDirectoryTests(unittest.TestCase):
             self.assertEqual(state["intervention_action"], "reopen")
             self.assertEqual(state["intervention_target_phase"], "implementation")
             self.assertEqual(state["intervention_status"], "accepted")
+            self.assertEqual(state["implementation_loop_resume_from"], "wi-2")
+            response = json.loads(
+                (runner.artifact_dir / state["intervention_response_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(response["loop_from_item"], "wi-2")
 
 
 if __name__ == "__main__":
