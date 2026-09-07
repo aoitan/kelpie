@@ -1061,7 +1061,6 @@ def build_workflow_plan(
     for canonical_id in registration.index.declaration_order:
         local_id = canonical_id.split("/", 1)[1]
         info = top_infos[local_id]
-        path = f"/nodes/{info.index}"
         if isinstance(info.config, StepConfig):
             normalized_nodes.append(
                 StepPlan(

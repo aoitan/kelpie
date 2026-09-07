@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import ast
 import hashlib
-import os
 from pathlib import Path
 import platform
 import subprocess

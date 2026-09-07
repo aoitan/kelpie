@@ -14,9 +14,10 @@ class WorkflowImportCompatibilityTests(unittest.TestCase):
 
     def test_new_normalization_module_reuses_legacy_public_types(self) -> None:
         normalization = importlib.import_module("scripts.workflow_normalization")
-        self.assertIs(workflow_config.ArtifactKey, workflow_config.ArtifactKey)
-        self.assertIs(workflow_config.WorkflowPlan, workflow_config.WorkflowPlan)
-        self.assertIs(workflow_config.WorkflowConfigError, workflow_config.WorkflowConfigError)
+        deps = workflow_config._normalization_dependencies()
+        self.assertIs(deps.values["ArtifactKey"], workflow_config.ArtifactKey)
+        self.assertIs(deps.values["WorkflowPlan"], workflow_config.WorkflowPlan)
+        self.assertIs(deps.values["WorkflowConfigError"], workflow_config.WorkflowConfigError)
         self.assertTrue(callable(normalization.register_declarations))
         self.assertTrue(callable(normalization.resolve_references))
         self.assertTrue(callable(normalization.build_workflow_plan))

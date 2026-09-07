@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 
@@ -28,6 +29,7 @@ def rules(*, forbidden: list[dict[str, object]] | None = None) -> dict[str, obje
 class ArchitectureLintTests(unittest.TestCase):
     def project(self) -> tuple[Path, Path, Path, Path]:
         directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
         (directory / "pkg").mkdir()
         (directory / "pkg" / "__init__.py").write_text("", encoding="utf-8")
         rules_path = directory / "rules.json"

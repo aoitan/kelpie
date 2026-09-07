@@ -2971,7 +2971,11 @@ class WorkflowPlan:
         direct = self.artifact_graph.get(reference)
         if direct is not None:
             return direct
-        payload, _expected = _workflow_normalization._normalization_expected_cardinality(reference)
+        payload = reference
+        for suffix in ("[*]", "[collection]", "[scalar]"):
+            if payload.endswith(suffix):
+                payload = payload[: -len(suffix)]
+                break
         matches: list[ArtifactKey] = []
         for key in self.artifact_graph.values():
             parts = key.producer_node_id.split("/")
@@ -4505,7 +4509,7 @@ OutputExpectation = ArtifactOutputExpectation
 RequiredOutputValidator = ArtifactOutputValidator
 
 
-def _normalization_dependencies():
+def _normalization_dependencies() -> NormalizationDependencies:
     return NormalizationDependencies(
         values={
             "WorkflowConfig": WorkflowConfig,
