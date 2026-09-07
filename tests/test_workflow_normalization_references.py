@@ -66,6 +66,24 @@ class WorkflowNormalizationReferenceTests(unittest.TestCase):
         self.assertIsNone(resolution.loop_sources["nodes/implementation"].artifact)
         self.assertEqual(resolution.dependencies["nodes/implementation"], ())
 
+    def test_resolution_drops_unreachable_explicit_dependencies_from_boundary_outputs(self) -> None:
+        payload = json.loads(self.fixture.read_text(encoding="utf-8"))
+        first = payload["nodes"][0]  # type: ignore[index]
+        loop = payload["nodes"][1]  # type: ignore[index]
+        loop["source"]["from"] = "$issue"  # type: ignore[index]
+        first["depends_on"] = ["implementation"]  # type: ignore[index]
+        config = workflow_config.parse_workflow_config(payload)
+        deps = workflow_config._normalization_dependencies()  # type: ignore[attr-defined]
+        registration = register_declarations(config, deps=deps)
+        resolution = resolve_references(config, registration, deps=deps)
+
+        self.assertEqual(
+            [(item.code, item.path) for item in resolution.diagnostics],
+            [("unreachable_dependency", "/nodes/0/depends_on/0")],
+        )
+        self.assertEqual(resolution.dependencies["nodes/plan"], ())
+        self.assertEqual(resolution.explicit_dependencies["nodes/plan"], ())
+
     def test_plan_artifact_lookup_preserves_compatibility_aliases(self) -> None:
         plan = workflow_config.normalize_workflow_config(self.config())
 

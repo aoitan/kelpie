@@ -791,7 +791,6 @@ class _ReferenceResolutionWorkspace:
                         dependency_path,
                         "dependency must be declared before its consumer",
                     )
-                    resolved.append(target.canonical_id)
                     continue
             elif context.body_index is None or target.index >= context.body_index:
                 self.emit_reference_error(
@@ -799,7 +798,6 @@ class _ReferenceResolutionWorkspace:
                     dependency_path,
                     "dependency must be declared before its consumer in the loop body",
                 )
-                resolved.append(target.canonical_id)
                 continue
             resolved.append(target.canonical_id)
         return tuple(resolved)
