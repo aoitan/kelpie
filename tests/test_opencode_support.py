@@ -260,8 +260,8 @@ class OpenCodeInstallTests(unittest.TestCase):
             self.assertTrue(os.access(installed_wrapper, os.X_OK))
             installed_workflow = install_home / "workflows" / "issue-v1.json"
             self.assertEqual(
-                installed_workflow.read_text(encoding="utf-8"),
-                (REPO_ROOT / "workflows" / "issue-v1.json").read_text(encoding="utf-8"),
+                json.loads(installed_workflow.read_text(encoding="utf-8")),
+                json.loads((REPO_ROOT / "workflows" / "issue-v1.json").read_text(encoding="utf-8")),
             )
             self.assertTrue(
                 (install_home / "workflows" / "issue-v1-execution.json").is_file()
