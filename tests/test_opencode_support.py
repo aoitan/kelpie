@@ -258,6 +258,14 @@ class OpenCodeInstallTests(unittest.TestCase):
                 json.loads((REPO_ROOT / "examples" / "opencode.json").read_text(encoding="utf-8")),
             )
             self.assertTrue(os.access(installed_wrapper, os.X_OK))
+            installed_workflow = install_home / "workflows" / "issue-v1.json"
+            self.assertEqual(
+                json.loads(installed_workflow.read_text(encoding="utf-8")),
+                json.loads((REPO_ROOT / "workflows" / "issue-v1.json").read_text(encoding="utf-8")),
+            )
+            self.assertTrue(
+                (install_home / "workflows" / "issue-v1-execution.json").is_file()
+            )
 
             installed_config.write_text('{"user":"preserved"}\n', encoding="utf-8")
             second = subprocess.run(

@@ -32,6 +32,7 @@ copy_file "$SCRIPT_DIR/llm-entrypoint.sh" "$KELPIE_HOME/llm-entrypoint.sh"
 copy_dir "$SCRIPT_DIR/prompts" "$KELPIE_HOME/prompts"
 copy_dir "$SCRIPT_DIR/skills" "$KELPIE_HOME/skills"
 copy_dir "$SCRIPT_DIR/examples" "$KELPIE_HOME/examples"
+copy_dir "$SCRIPT_DIR/workflows" "$KELPIE_HOME/workflows"
 copy_dir "$SCRIPT_DIR/scripts" "$KELPIE_HOME/scripts"
 
 chmod +x \

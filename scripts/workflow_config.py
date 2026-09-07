@@ -4541,6 +4541,7 @@ def normalize_workflow_config(
         deps=_normalization_dependencies(),
     )
 
+
 class WorkflowNormalizer:
     """Object boundary for callers that prefer an explicit normalizer."""
 

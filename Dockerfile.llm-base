@@ -53,6 +53,7 @@ COPY AGENTS.md ${KELPIE_TEMPLATE_DIR}/AGENTS.md
 COPY prompts/ ${KELPIE_TEMPLATE_DIR}/prompts/
 COPY skills/ ${KELPIE_TEMPLATE_DIR}/skills/
 COPY examples/ ${KELPIE_TEMPLATE_DIR}/examples/
+COPY workflows/ ${KELPIE_TEMPLATE_DIR}/workflows/
 COPY scripts/ ${KELPIE_SCRIPT_DIR}/
 
 RUN apt-get update \
