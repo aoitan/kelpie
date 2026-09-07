@@ -526,7 +526,8 @@ class _ReferenceResolutionWorkspace:
                     return None
                 if not self.validate_cardinality(key, expected, path):
                     return None
-                self.check_reachability(key, context, path)
+                if not self.check_reachability(key, context, path):
+                    return None
                 return self.ArtifactReference(source=source, key=key, expected_cardinality=expected)
             if "." not in payload:
                 self.emit_reference_error(
@@ -553,7 +554,8 @@ class _ReferenceResolutionWorkspace:
                 return None
             if not self.validate_cardinality(key, expected, path):
                 return None
-            self.check_reachability(key, context, path)
+            if not self.check_reachability(key, context, path):
+                return None
             return self.ArtifactReference(source=source, key=key, expected_cardinality=expected)
 
         parsed = _normalization_reference_parts(payload)
@@ -652,7 +654,8 @@ class _ReferenceResolutionWorkspace:
         assert key is not None
         if not self.validate_cardinality(key, expected, path):
             return None
-        self.check_reachability(key, context, path)
+        if not self.check_reachability(key, context, path):
+            return None
         return self.ArtifactReference(source=source, key=key, expected_cardinality=expected)
 
     def resolve_body_export_source(
