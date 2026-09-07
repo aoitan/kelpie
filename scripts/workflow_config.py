@@ -4513,7 +4513,6 @@ class _NormalizationContext:
     top_index: int
     loop_id: str | None = None
     body_index: int | None = None
-    node_local_id: str | None = None
 
 
 def _normalization_expected_cardinality(source: str) -> tuple[str, str | None]:
@@ -5152,12 +5151,6 @@ def normalize_workflow_config(
                     dependency_path,
                     "dependency must be declared before its consumer in the loop body",
                 )
-                if (
-                    context.node_local_id is not None
-                    and isinstance(target.config, StepConfig)
-                    and context.node_local_id in target.config.depends_on
-                ):
-                    resolved.append(target.canonical_id)
                 continue
             resolved.append(target.canonical_id)
         return tuple(resolved)
@@ -5253,11 +5246,7 @@ def normalize_workflow_config(
     for info in top_order:
         path = f"/nodes/{info.index}"
         if isinstance(info.config, StepConfig):
-            context = _NormalizationContext(
-                kind="top",
-                top_index=info.index,
-                node_local_id=info.local_id,
-            )
+            context = _NormalizationContext(kind="top", top_index=info.index)
             plan = normalize_step(info, context=context, path=path)
             normalized_nodes.append(plan)
             continue
@@ -5293,7 +5282,6 @@ def normalize_workflow_config(
                     top_index=info.index,
                     loop_id=info.local_id,
                     body_index=body_info.index,
-                    node_local_id=body_info.local_id,
                 ),
                 path=f"{path}/body/{body_info.index}",
             )

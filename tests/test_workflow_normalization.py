@@ -266,6 +266,19 @@ class WorkflowNormalizationTests(unittest.TestCase):
         actual = {diagnostic.code for diagnostic in context.exception.diagnostics}
         self.assertEqual(actual, {"unreachable_dependency"})
 
+    def test_mutual_forward_body_dependencies_report_only_ordering_error(self) -> None:
+        payload = self.read_payload()
+        loop = payload["nodes"][1]  # type: ignore[index]
+        loop["source"]["from"] = "$issue"  # type: ignore[index]
+        loop["body"] = [  # type: ignore[index]
+            self.step("review", depends_on=["coder"]),
+            self.step("coder", depends_on=["review"]),
+        ]
+        with self.assertRaises(WorkflowConfigError) as context:
+            self.normalize(payload)
+        actual = {diagnostic.code for diagnostic in context.exception.diagnostics}
+        self.assertEqual(actual, {"unreachable_dependency"})
+
 
 if __name__ == "__main__":
     unittest.main()
