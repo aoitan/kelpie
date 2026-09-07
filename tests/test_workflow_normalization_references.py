@@ -70,10 +70,14 @@ class WorkflowNormalizationReferenceTests(unittest.TestCase):
         plan = workflow_config.normalize_workflow_config(self.config())
 
         artifact = plan.artifact_for("artifact:plan[scalar]")
+        item_artifact = plan.artifact_for("item-artifact:coder.notes[scalar]")
 
         self.assertIsNotNone(artifact)
         assert artifact is not None
         self.assertEqual(artifact.reference, "artifact:nodes/plan.plan")
+        self.assertIsNotNone(item_artifact)
+        assert item_artifact is not None
+        self.assertEqual(item_artifact.reference, "item-artifact:nodes/implementation/body/coder.notes")
 
     def test_resolution_uses_registration_index_instead_of_rerunning_registration(self) -> None:
         config = self.config()

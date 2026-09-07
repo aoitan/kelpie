@@ -2971,11 +2971,18 @@ class WorkflowPlan:
         direct = self.artifact_graph.get(reference)
         if direct is not None:
             return direct
+        prefix = ""
         payload = reference
+        for candidate in ("artifact:", "item-artifact:"):
+            if reference.startswith(candidate):
+                prefix = candidate
+                payload = reference[len(candidate) :]
+                break
         for suffix in ("[*]", "[collection]", "[scalar]"):
             if payload.endswith(suffix):
                 payload = payload[: -len(suffix)]
                 break
+        normalized_reference = f"{prefix}{payload}"
         matches: list[ArtifactKey] = []
         for key in self.artifact_graph.values():
             parts = key.producer_node_id.split("/")
@@ -2990,7 +2997,7 @@ class WorkflowPlan:
                     f"item-artifact:{local_producer}.{key.output_id}",
                     f"item-artifact:{key.producer_node_id}.{key.output_id}",
                 }
-            if payload in aliases:
+            if normalized_reference in aliases:
                 matches.append(key)
         unique = tuple(dict.fromkeys(matches))
         return unique[0] if len(unique) == 1 else None
