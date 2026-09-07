@@ -2968,21 +2968,9 @@ class WorkflowPlan:
         return tuple(result)
 
     def artifact_for(self, reference: str) -> ArtifactKey | None:
-        direct = self.artifact_graph.get(reference)
-        if direct is not None:
+        if direct := self.artifact_graph.get(reference):
             return direct
-        prefix = ""
-        payload = reference
-        for candidate in ("artifact:", "item-artifact:"):
-            if reference.startswith(candidate):
-                prefix = candidate
-                payload = reference[len(candidate) :]
-                break
-        for suffix in ("[*]", "[collection]", "[scalar]"):
-            if payload.endswith(suffix):
-                payload = payload[: -len(suffix)]
-                break
-        normalized_reference = f"{prefix}{payload}"
+        normalized_reference = re.sub(r"\[(?:\*|collection|scalar)\]$", "", reference)
         matches: list[ArtifactKey] = []
         for key in self.artifact_graph.values():
             parts = key.producer_node_id.split("/")

@@ -524,9 +524,7 @@ class _ReferenceResolutionWorkspace:
                         "item-artifact producer or output is not declared",
                     )
                     return None
-                if not self.validate_cardinality(key, expected, path):
-                    return None
-                if not self.check_reachability(key, context, path):
+                if not (self.validate_cardinality(key, expected, path) and self.check_reachability(key, context, path)):
                     return None
                 return self.ArtifactReference(source=source, key=key, expected_cardinality=expected)
             if "." not in payload:
@@ -552,9 +550,7 @@ class _ReferenceResolutionWorkspace:
                     "item-artifact producer or output is not declared",
                 )
                 return None
-            if not self.validate_cardinality(key, expected, path):
-                return None
-            if not self.check_reachability(key, context, path):
+            if not (self.validate_cardinality(key, expected, path) and self.check_reachability(key, context, path)):
                 return None
             return self.ArtifactReference(source=source, key=key, expected_cardinality=expected)
 
@@ -652,9 +648,7 @@ class _ReferenceResolutionWorkspace:
                 return None
 
         assert key is not None
-        if not self.validate_cardinality(key, expected, path):
-            return None
-        if not self.check_reachability(key, context, path):
+        if not (self.validate_cardinality(key, expected, path) and self.check_reachability(key, context, path)):
             return None
         return self.ArtifactReference(source=source, key=key, expected_cardinality=expected)
 

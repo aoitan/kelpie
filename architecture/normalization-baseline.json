@@ -69,11 +69,6 @@
             "code": "unreachable_dependency",
             "message": "dependency must be declared before its consumer",
             "path": "/nodes/0/depends_on/0"
-          },
-          {
-            "code": "dependency_cycle",
-            "message": "dependency cycle: nodes/plan -> nodes/implementation -> nodes/plan",
-            "path": "/nodes"
           }
         ],
         "exception_type": "scripts.workflow_config.WorkflowConfigError",

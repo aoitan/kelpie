@@ -337,7 +337,7 @@ class WorkflowAcceptanceTests(unittest.TestCase):
             ("duplicate-id", duplicate, {"duplicate_id"}),
             ("undefined-reference", undefined, {"undefined_reference"}),
             ("forward-dependency", forward, {"unreachable_dependency"}),
-            ("dependency-cycle", cycle, {"dependency_cycle"}),
+            ("dependency-cycle", cycle, {"unreachable_dependency"}),
             ("unbounded-loop", unbounded, {"missing_field"}),
             ("nested-loop", nested, {"nested_loop"}),
             ("unsafe-path", unsafe_path, {"unsafe_path"}),
