@@ -4888,11 +4888,13 @@ def normalize_workflow_config(
                     return None
                 if not validate_cardinality(key, expected, path):
                     return None
-                # Preserve a known edge after reporting an ordering/scope
-                # problem so the graph pass can also identify cycles formed
-                # through artifact references. No plan is returned while the
-                # reachability diagnostic remains present.
-                check_reachability(key, context, path)
+                # Preserve a known workflow-scoped edge after reporting an
+                # ordering/scope problem so the graph pass can also identify
+                # cycles formed through artifact references. Loop-item forward
+                # references stay out of the graph so loop-body ordering errors
+                # remain a plain reachability diagnostic.
+                if not check_reachability(key, context, path) and key.scope == "loop_item":
+                    return None
                 return ArtifactReference(source=source, key=key, expected_cardinality=expected)
             if "." not in payload:
                 emit_reference_error(
@@ -4922,7 +4924,8 @@ def normalize_workflow_config(
                 return None
             if not validate_cardinality(key, expected, path):
                 return None
-            check_reachability(key, context, path)
+            if not check_reachability(key, context, path) and key.scope == "loop_item":
+                return None
             return ArtifactReference(source=source, key=key, expected_cardinality=expected)
 
         parsed = _normalization_reference_parts(payload)
