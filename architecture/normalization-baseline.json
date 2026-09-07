@@ -1,0 +1,150 @@
+{
+  "base_fixture": "tests/fixtures/workflows/valid-v1.json",
+  "cases": [
+    {
+      "input_sha256": "f5ca9f82c2f530e44d98bb1b165d7bcf83cfbd00dc48229d0134ca510bc606d5",
+      "input_unchanged": true,
+      "name": "valid",
+      "result": {
+        "digest": "c45fe600c936aece8ad39f07830f5f4c5faf9cacf92d119f9a37d9fe2505f46f",
+        "kind": "plan",
+        "payload_sha256": "c45fe600c936aece8ad39f07830f5f4c5faf9cacf92d119f9a37d9fe2505f46f"
+      }
+    },
+    {
+      "input_sha256": "164dcb4f36aec794b5e4382ae3e19736fef1339bead61c52893a4bfe0239382e",
+      "input_unchanged": true,
+      "name": "duplicate-node",
+      "result": {
+        "diagnostics": [
+          {
+            "code": "duplicate_id",
+            "message": "duplicate node id 'plan'",
+            "path": "/nodes/2/id"
+          }
+        ],
+        "exception_type": "scripts.workflow_config.WorkflowConfigError",
+        "kind": "error"
+      }
+    },
+    {
+      "input_sha256": "120b0b6797611944e2eb6e9e4db7244e3a976c3ff21fc383f232bffd27f78bdc",
+      "input_unchanged": true,
+      "name": "undefined-reference",
+      "result": {
+        "diagnostics": [
+          {
+            "code": "undefined_reference",
+            "message": "artifact output is not declared",
+            "path": "/nodes/1/source/from"
+          }
+        ],
+        "exception_type": "scripts.workflow_config.WorkflowConfigError",
+        "kind": "error"
+      }
+    },
+    {
+      "input_sha256": "52ac67173d06c9594e181ef8ab21cad061fb350e207e850e9fd6b767089e8580",
+      "input_unchanged": true,
+      "name": "forward-dependency",
+      "result": {
+        "diagnostics": [
+          {
+            "code": "unreachable_dependency",
+            "message": "artifact producer must be declared before its consumer",
+            "path": "/nodes/0/source/from"
+          }
+        ],
+        "exception_type": "scripts.workflow_config.WorkflowConfigError",
+        "kind": "error"
+      }
+    },
+    {
+      "input_sha256": "ce639749110c0cab33d7778540d3fb689ef921a4978b97dde149a214274ec355",
+      "input_unchanged": true,
+      "name": "cycle",
+      "result": {
+        "diagnostics": [
+          {
+            "code": "unreachable_dependency",
+            "message": "dependency must be declared before its consumer",
+            "path": "/nodes/0/depends_on/0"
+          }
+        ],
+        "exception_type": "scripts.workflow_config.WorkflowConfigError",
+        "kind": "error"
+      }
+    },
+    {
+      "input_sha256": "a3689b432869b8d832d5f5c6b69906fc70a85aa7c979cd61b87ef4c0feee6954",
+      "input_unchanged": true,
+      "name": "cross-scope",
+      "result": {
+        "diagnostics": [
+          {
+            "code": "cross_scope_reference",
+            "message": "loop-body output must be referenced through an explicit collection export",
+            "path": "/nodes/0/inputs/1/from"
+          }
+        ],
+        "exception_type": "scripts.workflow_config.WorkflowConfigError",
+        "kind": "error"
+      }
+    },
+    {
+      "input_sha256": "b54ddd8d006a10be0c9d1ffc1a7af203b3ffb1d1c225fc7c6b6a10a8ea05f92c",
+      "input_unchanged": true,
+      "name": "cardinality",
+      "result": {
+        "diagnostics": [
+          {
+            "code": "cardinality_mismatch",
+            "message": "artifact has cardinality 'scalar', expected 'collection'",
+            "path": "/nodes/1/source/from"
+          }
+        ],
+        "exception_type": "scripts.workflow_config.WorkflowConfigError",
+        "kind": "error"
+      }
+    },
+    {
+      "input_sha256": "ddaa63e72d19b03bbb8015bbf29fe058407ad240a91bf5948a8f948d7eb0846e",
+      "input_unchanged": true,
+      "name": "nested-body",
+      "result": {
+        "digest": "b65ae063a37a8cf34b69cc310eb47d7b88286113d2eb95e3cc9578338349d0a4",
+        "kind": "plan",
+        "payload_sha256": "b65ae063a37a8cf34b69cc310eb47d7b88286113d2eb95e3cc9578338349d0a4"
+      }
+    },
+    {
+      "input_sha256": "bb108593d490a4572b8194d352eee30e4fc80922f6bf87ca6c6c0526ef0668d0",
+      "input_unchanged": true,
+      "name": "export",
+      "result": {
+        "digest": "19140d604a8661b552897c93e8dd16db45e01f72311d7b2eaffb15723a82fef5",
+        "kind": "plan",
+        "payload_sha256": "19140d604a8661b552897c93e8dd16db45e01f72311d7b2eaffb15723a82fef5"
+      }
+    },
+    {
+      "input_sha256": "f5ca9f82c2f530e44d98bb1b165d7bcf83cfbd00dc48229d0134ca510bc606d5",
+      "input_unchanged": true,
+      "name": "virtual-input",
+      "result": {
+        "digest": "c45fe600c936aece8ad39f07830f5f4c5faf9cacf92d119f9a37d9fe2505f46f",
+        "kind": "plan",
+        "payload_sha256": "c45fe600c936aece8ad39f07830f5f4c5faf9cacf92d119f9a37d9fe2505f46f"
+      }
+    },
+    {
+      "name": "hand-built-dto",
+      "result": {
+        "digest": "c45fe600c936aece8ad39f07830f5f4c5faf9cacf92d119f9a37d9fe2505f46f",
+        "kind": "plan",
+        "payload_sha256": "c45fe600c936aece8ad39f07830f5f4c5faf9cacf92d119f9a37d9fe2505f46f"
+      }
+    }
+  ],
+  "schema_version": "normalization-characterization.v1"
+}
