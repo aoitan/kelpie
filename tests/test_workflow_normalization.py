@@ -236,7 +236,7 @@ class WorkflowNormalizationTests(unittest.TestCase):
             self.normalize(payload)
         self.assert_codes(context.exception, "cardinality_mismatch")
 
-    def test_mutual_forward_edges_report_a_cycle_without_reordering(self) -> None:
+    def test_mutual_forward_edges_are_rejected_without_leaking_cycle_edges(self) -> None:
         payload = self.read_payload()
         first = payload["nodes"][0]  # type: ignore[index]
         loop = payload["nodes"][1]  # type: ignore[index]
@@ -251,7 +251,7 @@ class WorkflowNormalizationTests(unittest.TestCase):
         payload["nodes"] = [first, second, loop]
         with self.assertRaises(WorkflowConfigError) as context:
             self.normalize(payload)
-        self.assert_codes(context.exception, "dependency_cycle", "unreachable_dependency")
+        self.assert_codes(context.exception, "unreachable_dependency")
 
     def test_single_forward_body_dependency_reports_only_ordering_error(self) -> None:
         payload = self.read_payload()
