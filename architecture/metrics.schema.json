@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "architecture-metrics.v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "tool_version",
+    "commit_sha",
+    "dirty_diff_sha256",
+    "environment",
+    "target_patterns",
+    "excluded_patterns",
+    "files",
+    "import_edges",
+    "unresolved_imports",
+    "fan_in",
+    "fan_out",
+    "cycles"
+  ],
+  "properties": {
+    "schema_version": {"const": "architecture-metrics.v1"},
+    "tool_version": {"type": "string"},
+    "commit_sha": {"type": "string"},
+    "dirty_diff_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "environment": {
+      "type": "object",
+      "required": ["python", "os"],
+      "properties": {
+        "python": {"type": "string"},
+        "os": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "target_patterns": {"type": "array", "items": {"type": "string"}},
+    "excluded_patterns": {"type": "array", "items": {"type": "string"}},
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256", "physical_lines", "definitions", "max_nesting_depth"],
+        "properties": {
+          "path": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "physical_lines": {"type": "integer", "minimum": 0},
+          "definitions": {"type": "array"},
+          "max_nesting_depth": {"type": "integer", "minimum": 0},
+          "parse_error": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "import_edges": {"type": "array", "items": {"$ref": "#/$defs/importEdge"}},
+    "unresolved_imports": {"type": "array", "items": {"$ref": "#/$defs/importEdge"}},
+    "fan_in": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+    "fan_out": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+    "cycles": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}}
+  },
+  "$defs": {
+    "importEdge": {
+      "type": "object",
+      "required": ["source", "target", "kind", "resolved"],
+      "properties": {
+        "source": {"type": "string"},
+        "target": {"type": "string"},
+        "kind": {"type": "string"},
+        "resolved": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

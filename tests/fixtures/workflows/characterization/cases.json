@@ -1,0 +1,17 @@
+{
+  "schema_version": "normalization-characterization.v1",
+  "base_fixture": "../valid-v1.json",
+  "cases": [
+    {"name": "valid", "mutation": "none"},
+    {"name": "duplicate-node", "mutation": "duplicate-node"},
+    {"name": "undefined-reference", "mutation": "undefined-reference"},
+    {"name": "forward-dependency", "mutation": "forward-dependency"},
+    {"name": "cycle", "mutation": "cycle"},
+    {"name": "cross-scope", "mutation": "cross-scope"},
+    {"name": "cardinality", "mutation": "cardinality"},
+    {"name": "nested-body", "mutation": "nested-body"},
+    {"name": "export", "mutation": "export"},
+    {"name": "virtual-input", "mutation": "none"},
+    {"name": "hand-built-dto", "mutation": "hand-built-dto"}
+  ]
+}

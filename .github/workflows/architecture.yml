@@ -1,0 +1,26 @@
+name: architecture
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  architecture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Run architecture lint
+        run: |
+          mkdir -p .artifacts/architecture
+          python scripts/check_architecture.py --format json \
+            --metrics-output .artifacts/architecture/metrics.json \
+            --diff-output .artifacts/architecture/diff.txt
+      - name: Upload architecture report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: architecture-report
+          path: .artifacts/architecture/

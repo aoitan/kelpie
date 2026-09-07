@@ -1,0 +1,29 @@
+{
+  "schema_version": "architecture-baseline.v1",
+  "files": {
+    "scripts/convergence_policy.py": {"physical_lines": 3221},
+    "scripts/evaluation_loop.py": {"physical_lines": 2049},
+    "scripts/pipeline_executor.py": {"physical_lines": 1835},
+    "scripts/run_issue_workflow.py": {"physical_lines": 7613},
+    "scripts/single_change.py": {"physical_lines": 1780},
+    "scripts/workflow_config.py": {"physical_lines": 7020},
+    "scripts/workflow_normalization.py": {"physical_lines": 1221}
+  },
+  "definitions": {
+    "scripts/convergence_policy.py": {"ConvergenceStore": 704},
+    "scripts/evaluation_loop.py": {"EvaluationLoopOrchestrator": 787},
+    "scripts/pipeline_executor.py": {"PipelineExecutor": 804},
+    "scripts/run_issue_workflow.py": {"WorkflowRunner": 4312},
+    "scripts/workflow_config.py": {"normalize_workflow_config": 12},
+    "scripts/workflow_normalization.py": {
+      "_ReferenceResolutionWorkspace": 631,
+      "_ReferenceResolutionWorkspace.resolve_artifact_reference": 195,
+      "_ReferenceResolutionWorkspace.resolve_body_export_source": 91,
+      "_ReferenceResolutionWorkspace.resolve_step": 65,
+      "build_workflow_plan": 109,
+      "normalize_declaration": 15,
+      "validate_dependency_graph": 46
+    }
+  },
+  "cycles": []
+}

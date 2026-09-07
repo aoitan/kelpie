@@ -1,0 +1,30 @@
+{
+  "schema_version": "architecture-rules.v1",
+  "target_patterns": ["scripts/*.py"],
+  "fail_on_cycles": true,
+  "fail_on_parse_errors": true,
+  "fail_on_unresolved_imports": false,
+  "forbidden_imports": [
+    {
+      "source": "scripts.workflow_models",
+      "target_prefixes": [
+        "scripts.workflow_config",
+        "scripts.workflow_normalization",
+        "scripts.pipeline_executor",
+        "scripts.run_issue_workflow"
+      ]
+    },
+    {
+      "source": "scripts.workflow_normalization",
+      "target_prefixes": [
+        "scripts.workflow_config",
+        "scripts.pipeline_executor",
+        "scripts.run_issue_workflow"
+      ]
+    }
+  ],
+  "regression": {
+    "file_lines": true,
+    "definition_spans": true
+  }
+}
