@@ -149,6 +149,24 @@ class OptionalPlanCheckTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed_with_notes")
         self.assertEqual(json.loads((self.artifacts / "work_items.json").read_text()), updated)
 
+    def test_json_only_handoff_update_is_preserved_when_valid(self):
+        updated = {"tasks": [{**self.tasks["tasks"][0], "description": "Existing requirement, clarified"}]}
+
+        def invoke(*args):
+            (self.artifacts / "work_items.json").write_text(json.dumps(updated))
+            self.adjudicate(
+                [self.finding("clarify", "accepted")],
+                modified=["work_items.json"],
+            )
+
+        result, _, _ = self.run_check(invoke, ids=["clarify"])
+        self.assertEqual(result["status"], "completed_with_notes")
+        self.assertEqual(json.loads((self.artifacts / "work_items.json").read_text()), updated)
+        self.assertEqual(
+            json.loads((self.artifacts / "05-work-breakdown.md").read_text()),
+            self.tasks,
+        )
+
     def test_invalid_handoff_restores_all_plan_files_without_error_artifact_side_effects(self):
         error_path = self.runner.work_items_error_path()
         error_path.write_text("pre-existing diagnostic")
@@ -182,6 +200,25 @@ class OptionalPlanCheckTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "outside the planning artifact allowlist"):
                     self.run_check(invoke)
                 self.assert_restored()
+
+    def test_probe_scope_violation_fails_before_strong_model(self):
+        outside = self.root / "outside.py"
+
+        def fake_probe(*args, **kwargs):
+            _ = args, kwargs
+            outside.write_text("unexpected change")
+            return {"status": "completed_no_findings", "snapshot_id": "snapshot", "findings": []}
+
+        with (
+            patch("scripts.run_issue_workflow.run_plan_check", side_effect=fake_probe),
+            patch.object(self.runner, "invoke_cli") as strong,
+        ):
+            with self.assertRaisesRegex(SystemExit, "outside the advisory artifact scope"):
+                self.runner.run_plan_refinement_loop(
+                    artifact_dir=self.artifacts,
+                    probe_runner=self.runner.runner_config,
+                )
+        strong.assert_not_called()
 
     def test_unexpected_programming_error_is_restored_and_reraised(self):
         def invoke(*args):

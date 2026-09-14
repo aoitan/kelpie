@@ -1388,6 +1388,42 @@ class WorkflowHookExecutionTests(unittest.TestCase):
 
             self.assertEqual(list(outside.iterdir()), [])
 
+    def test_plan_check_artifact_symlink_is_rejected_before_probe_writes(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = (Path(tmpdir) / "target-repo").resolve()
+            workdir.mkdir()
+            outside = Path(tmpdir) / "outside"
+            outside.mkdir()
+            old_config_home = os.environ.get("KELPIE_CONFIG_HOME")
+            os.environ["KELPIE_CONFIG_HOME"] = str(Path(tmpdir) / "empty-config")
+            try:
+                runner = WorkflowRunner(
+                    repo_root=repo_root,
+                    workdir=workdir,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["true"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="plan-check-symlink",
+                    dry_run=True,
+                )
+            finally:
+                if old_config_home is None:
+                    os.environ.pop("KELPIE_CONFIG_HOME", None)
+                else:
+                    os.environ["KELPIE_CONFIG_HOME"] = old_config_home
+
+            (runner.artifact_dir / "plan-check").symlink_to(outside, target_is_directory=True)
+            resolved = runner.step_resolver.resolve(
+                runner.build_step_spec_for_phase("plan_comprehension_check")
+            )
+
+            with self.assertRaisesRegex(ValueError, "artifact root|Symlink"):
+                runner.prepare_resolved_step(resolved)
+
+            self.assertEqual(list(outside.iterdir()), [])
+
     def test_symlinked_kelpie_root_is_rejected_before_artifact_writes(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmpdir:

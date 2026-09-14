@@ -4787,7 +4787,7 @@ class WorkflowRunner:
         """Create and persist prepared artifacts after all read-only resolution."""
         self.prepare_artifact_scope(resolved.artifact_dir)
         self.validate_prompt_cache_path(resolved.prompt_path)
-        for child_name in (".generated-prompts", "intent-records", "checks"):
+        for child_name in (".generated-prompts", "intent-records", "checks", "plan-check"):
             child_path = resolved.artifact_dir / child_name
             self.prepare_artifact_scope(child_path)
         self.validate_prompt_cache_path(resolved.prompt_path)
@@ -5549,12 +5549,29 @@ class WorkflowRunner:
 
         refined_once = False
         for _ in range(max_iterations):
+            self.prepare_artifact_scope(artifact_dir / "plan-check")
+            before_probe_protected_artifacts = self.protected_artifact_digests(
+                artifact_dir,
+                {"05a-plan-comprehension-check.md"},
+            )
+            before_probe_workspace = self.workspace_file_digests()
             result = run_plan_check(
                 artifact_root=artifact_dir,
                 command_template=probe_runner.command_template,
                 dry_run=False,
                 prompt_text=probe_prompt,
             )
+            probe_workspace_changes, probe_artifact_changes = self.artifact_scope_changes(
+                artifact_dir,
+                allowed_names={"05a-plan-comprehension-check.md"},
+                before_protected_artifacts=before_probe_protected_artifacts,
+                before_workspace=before_probe_workspace,
+            )
+            if probe_workspace_changes or probe_artifact_changes:
+                raise SystemExit(
+                    "Plan comprehension probe changed files outside the advisory artifact scope: "
+                    + ", ".join(sorted(probe_workspace_changes | probe_artifact_changes))
+                )
             probe_status = str(result["status"])
             if probe_status not in {"completed_no_findings", "findings_recorded"}:
                 # Protocol failures are not semantic findings; never ask the strong model
@@ -5680,15 +5697,35 @@ class WorkflowRunner:
                         "Declared modified artifacts do not match actual changes: "
                         f"declared={sorted(adjudication.modified_artifacts)}, actual={sorted(actual_modified)}"
                     )
-                if {"05-work-breakdown.md", "work_items.json"} & actual_modified:
+                if "05-work-breakdown.md" in actual_modified:
                     # Validate before writing so a failed refinement does not
                     # create a work-items error artifact or delete the last good handoff.
                     payload = parse_work_items_from_text(
                         (artifact_dir / "05-work-breakdown.md").read_text(encoding="utf-8")
                     )
-                    (artifact_dir / "work_items.json").write_text(
-                        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+                    if "work_items.json" in actual_modified:
+                        refined_work_items = parse_json_payload(
+                            (artifact_dir / "work_items.json").read_text(encoding="utf-8")
+                        )
+                        validation_error = validate_work_items_payload(refined_work_items)
+                        if validation_error is not None:
+                            raise ValueError(f"Invalid refined work_items.json: {validation_error}")
+                        if refined_work_items != payload:
+                            raise ValueError(
+                                "Refined work_items.json does not match 05-work-breakdown.md JSON payload"
+                            )
+                    else:
+                        (artifact_dir / "work_items.json").write_text(
+                            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                            encoding="utf-8",
+                        )
+                elif "work_items.json" in actual_modified:
+                    refined_work_items = parse_json_payload(
+                        (artifact_dir / "work_items.json").read_text(encoding="utf-8")
                     )
+                    validation_error = validate_work_items_payload(refined_work_items)
+                    if validation_error is not None:
+                        raise ValueError(f"Invalid refined work_items.json: {validation_error}")
             except (OSError, UnicodeError, ValueError) as exc:
                 return record_result({"status": "invalid_output", "error": str(exc)}, rollback=True)
             except Exception:
@@ -5763,13 +5800,29 @@ class WorkflowRunner:
         before_workspace: Mapping[str, str],
     ) -> tuple[set[str], set[str]]:
         """Return workspace and protected-artifact changes made by refinement."""
-        after_protected_artifacts = self.protected_artifact_digests(
+        return self.artifact_scope_changes(
             artifact_dir,
-            {
+            allowed_names={
                 "04-solution-design.md",
                 "05-work-breakdown.md",
                 "work_items.json",
             },
+            before_protected_artifacts=before_protected_artifacts,
+            before_workspace=before_workspace,
+        )
+
+    def artifact_scope_changes(
+        self,
+        artifact_dir: Path,
+        *,
+        allowed_names: set[str],
+        before_protected_artifacts: Mapping[str, str],
+        before_workspace: Mapping[str, str],
+    ) -> tuple[set[str], set[str]]:
+        """Return workspace and protected-artifact changes outside allowed artifact names."""
+        after_protected_artifacts = self.protected_artifact_digests(
+            artifact_dir,
+            allowed_names,
         )
         after_workspace = self.workspace_file_digests()
         unexpected_workspace_changes = {

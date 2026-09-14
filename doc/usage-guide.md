@@ -1154,8 +1154,8 @@ diagnostic の recommended_action を確認し、必要なら環境を直して 
 | execution_error | checks/、terminal output | CLI / hook / permission / timeout を直して retry |
 | high_severity_unresolved | 07-review-fix-loop.md、review findings | request-changes または reopen。approve は不可 |
 | required_tests_unresolved | implementation artifact と test log | test の実行条件・結果を補い retry または修正要求 |
-| invalid_output | plan-check/iterations/ | probe の raw / validation を確認し retry。required の場合のみ明示 waive |
-| external_send_approval_required | workflow-state.json | 送信内容を確認して allow flag 付きで再実行、または abort |
+| invalid_output | plan-check/iterations/ | probe の raw / validation を確認し `--resume-action retry`。plan check は既定 workflow では走らないため、必要時だけ `workflows/issue-v1-plan-check.json` を選ぶ |
+| plan_comprehension_check を使いたい | 起動コマンド、workflow-state.json | `--workflow-config workflows/issue-v1-plan-check.json` を指定して再実行または再開する。追加の送信承認は不要 |
 | provider_capacity | checks/*runner-failure* | 待機・provider変更などを人間が判断し retry |
 | stale digest / request mismatch | workflow-state.json、request / outcome | artifact を直接編集せず、正しい run を選び新しい介入を作る |
 
