@@ -34,15 +34,12 @@ _REASON_ACTIONS = {
     "required_checks_unresolved": ("request-changes", "retry", "abort"),
     "required_tests_unresolved": ("request-changes", "retry", "abort"),
     "required_input_unavailable": ("provide-input", "abort"),
-    "unresolved_findings": ("request-changes", "provide-input", "reopen", "abort"),
-    "non_convergent": ("request-changes", "provide-input", "reopen", "abort"),
     "critical_risk_requires_decision": ("provide-input", "approve", "abort"),
     "architectural_decision_required": ("provide-input", "approve", "abort"),
     "destructive_change_approval_required": ("approve", "provide-input", "abort"),
     "dependency_approval_required": ("approve", "provide-input", "abort"),
     "permission_change_required": ("approve", "provide-input", "abort"),
     "authority_required": ("approve", "provide-input", "abort"),
-    "external_send_approval_required": ("approve", "abort"),
     "external_publish_approval_required": ("approve", "abort"),
     "material_plan_deviation": ("request-changes", "reopen", "abort"),
     "validation_information_missing": ("provide-input", "request-changes", "abort"),
@@ -106,8 +103,6 @@ def intervention_kind(reason_code: str) -> str:
         "max_iterations_reached",
         "required_checks_unresolved",
         "required_tests_unresolved",
-        "unresolved_findings",
-        "non_convergent",
         "material_plan_deviation",
     }:
         return "finding"
@@ -118,7 +113,6 @@ def intervention_kind(reason_code: str) -> str:
         "dependency_approval_required",
         "permission_change_required",
         "authority_required",
-        "external_send_approval_required",
         "external_publish_approval_required",
     }:
         return "authority"

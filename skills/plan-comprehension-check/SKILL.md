@@ -18,6 +18,8 @@ assumptions.
 - Distinguish `explicit`, `inferred`, and `missing`.
 - Attach source references to every asserted value.
 - Do not repair or rewrite the plan.
+- Record missing information without asking the user questions or requesting
+  approval. This optional check does not gate implementation.
 - Do not call a no-findings result safe or implementation-ready.
 - A schema-invalid response is not a finding and is not a no-findings result;
   leave its handling to the workflow runtime.

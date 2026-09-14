@@ -17,11 +17,14 @@ incomplete planning, then adjudicate them against source evidence.
 - Record an accepted, rejected, or unresolved verdict for every finding.
 - Reject hallucinated findings explicitly.
 - Apply only minimal, source-backed planning changes.
+- Clarify existing intent; do not add requirements or expand scope.
 - Do not change implementation files.
 - Do not invent missing human decisions.
+- Record unresolved findings with action `record_only`; do not ask the user
+  questions, request approval, or stop the workflow.
 
 ## Output
 
 - A schema-valid `adjudication.json`.
 - Updated planning artifacts only when an accepted finding requires them.
-- Explicit unresolved reasons and required human decisions.
+- Unresolved reasons as advisory notes, without a human handoff.
