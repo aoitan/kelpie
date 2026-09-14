@@ -26,7 +26,7 @@ KELPIE_ROOT はこのテンプレートの checkout、TARGET_REPO は実際に�
 
 ## 1. Kelpie の動作モデル
 
-Kelpie は Issue または手動タスクの文脈を読み、9つの phase を順番に runner CLI へ渡します。
+Kelpie は Issue または手動タスクの文脈を読み、計画・実装・レビューの各 phase を順番に runner CLI へ渡します。plan comprehension check は任意です。
 phase ごとに prompt、skill、過去成果物、入力コンテキストを合成し、runner が対象リポジトリを
 調査または編集します。
 
@@ -38,7 +38,7 @@ prototype_planning
   -> red_team_review
   -> solution_design
   -> work_breakdown
-  -> plan_comprehension_check
+  -> plan_comprehension_check（明示的に選んだ場合のみ）
   -> implementation
   -> review_fix_loop
   -> pull_request
@@ -265,14 +265,9 @@ artifact root 自体は指定できません。相対パスは --workdir 基準�
 
 ### 3.4 plan comprehension check
 
-| 引数 | 説明 |
-|---|---|
-| --allow-plan-check-external-send | external-safe と分類された計画成果物を外部 probe model に送ることを明示的に許可 |
-| --require-plan-comprehension-check | probe が schema-invalid または送信許可不足のとき、警告付き継続ではなく pause |
-| --waive-plan-comprehension-check | required policy で invalid_output pause したとき、人間が check を明示的に waive して再開。--resume と併用し、resume action とは併用不可 |
-
---allow-plan-check-external-send を付けない限り、live の外部 probe は送信されません。
-required policy で外部送信が許可されていない場合は external_send_approval_required で停止します。
+既定では実行しません。必要な場合だけ
+`--workflow-config workflows/issue-v1-plan-check.json` を選びます。
+送信許可・required・waive の専用引数はありません。旧引数と保存状態の扱いは第6節を参照してください。
 
 ## 4. 入力ソース
 
@@ -353,7 +348,7 @@ python3 scripts/run_issue_workflow.py \
 .kelpie/artifacts/manual/local/task-refactor-auth-flow/
 ~~~~
 
-## 5. 9つの phase と完了条件
+## 5. 対応する phase と完了条件
 
 通常の phase は prompt と skill に従い、現在の artifact directory に phase artifact と
 phase outcome を作ります。implementation は固定 item loop の role-scoped artifact と
@@ -366,7 +361,7 @@ loop status も使います。phase artifact が足りない場合、後続 phas
 | 3 | red_team_review | 試作・計画の危険点、権限、失敗条件を洗い出す | 03-red-team-review.md |
 | 4 | solution_design | 本実装の設計、インターフェース、トレードオフを決める | 04-solution-design.md |
 | 5 | work_breakdown | 設計を実装可能な work item に分解する | 05-work-breakdown.md, work_items.json |
-| 6 | plan_comprehension_check | 計画を source-backed に再構成し、解釈差分を確認する | 05a-plan-comprehension-check.md |
+| 任意 | plan_comprehension_check | 明示的に選んだ計画を再構成し、説明不足だけを補足する | 05a-plan-comprehension-check.md |
 | 7 | implementation | work item ごとに計画に従って実装する | 06-implementation-notes.md |
 | 8 | review_fix_loop | 実装をレビューし、重大度順に修正して収束させる | 07-review-fix-loop.md |
 | 9 | pull_request | 人間レビュー用の PR draft をまとめる | 08-pr-draft.md |
@@ -509,59 +504,40 @@ reopen し、人間指示で「phase-level note と role-scoped note の対応�
 
 ## 6. plan comprehension check
 
-plan comprehension check は二段階です。
-
-1. allowlist された external-safe 成果物だけで弱モデル probe を行う
-2. reconstruction と source reference を強モデル側で照合し、必要なら計画を refine する
-
-probe は advisory-only であり、probe の no-findings だけで「安全」「実装可能」とは判定しません。
-schema-invalid output と semantic finding は別物として保存されます。
-
-### 6.1 通常の advisory policy
-
-既定では、次の状態で workflow は警告付きで advance します。
-
-- probe output が schema-invalid で retry 後も不正
-- 外部送信の明示許可がなく probe を実行できない
-
-このとき reason code は advisory_check_unavailable です。probe が「問題なし」と答えたことを
-意味しません。
-
-### 6.2 required policy
-
---require-plan-comprehension-check を付けると、次の場合に pause します。
-
-- invalid_output
-- external_send_approval_required
-
-schema-invalid の場合は prompt / runner を直して retry します。どうしても check を通せない
-事情を人間が引き受ける場合だけ、次を使います。
-
-~~~~bash
-python3 scripts/run_issue_workflow.py \
-  --workdir "$TARGET_REPO" \
-  --run-dir .kelpie/artifacts/github/owner/repo/issue-12 \
-  --resume \
-  --waive-plan-comprehension-check
-~~~~
-
-この waive は required な invalid_output pause にだけ使えます。semantic な unresolved_findings
-や non_convergent を waive する機能ではありません。
-
-### 6.3 外部送信
-
-外部 probe を明示的に許可する場合は次のようにします。
+既定の計画 workflow は `work_breakdown` で終わり、チェックは呼び出しません。
+複雑な計画について再説明と補足を使う場合だけ、計画の開始時に次を指定します。
 
 ~~~~bash
 python3 scripts/run_issue_workflow.py \
   --workdir "$TARGET_REPO" \
   --issue 12 --issue-source github --github-repo owner/repo \
   --runner codex \
-  --allow-plan-check-external-send
+  --workflow-config workflows/issue-v1-plan-check.json
 ~~~~
 
-送信されるのは external-safe と分類された計画成果物だけですが、Issue の内容や設計情報が
-含まれ得ます。送信先、認証、保持ポリシーを確認してから opt-in してください。
+チェックは allowlist された計画成果物を設定済みモデルへ送り、弱モデルの再説明を
+強モデルが元の計画と照合して、根拠のある説明不足だけを補います。専用の送信承認は不要です。
+要件追加、人間への質問、承認要求は行いません。
+
+読み違いが残る場合や反復上限では残件を記録して続行します。モデル障害や不正出力は
+チェック未完了として記録し、no findings と区別します。失敗した補足試行の計画変更は復元します。
+対象外ファイルへの書き込みなどの保護違反は引き続きエラーです。
+no findings は計画の安全性や実装可能性を保証しません。
+
+### 旧設定からの移行
+
+`--allow-plan-check-external-send`、`--require-plan-comprehension-check`、
+`--waive-plan-comprehension-check` は削除しました。旧引数を渡すと CLI は拒否します。
+起動コマンドから取り除き、チェックを使う場合は上記の workflow を選んでください。
+
+保存済み run の履歴や workflow digest は書き換えません。更新前の標準 workflow と新しい
+標準 workflow は構造が異なるため、既存の設定駆動 run はそのまま resume できない場合があります。
+その場合は旧 run を残し、旧版でその run を完了するか、元の Issue 文脈を含む新しい
+Manual Task（`--issue-source none --task-label <新しい名前>`）として計画を開始してください。
+GitHub Issue の指定を残したまま task label を変えても別 run にはなりません。
+digest を手作業で書き換えないでください。
+legacy の plan check pause は通常の resume で再実行し、旧 required policy は復活させません。
+failed 状態には通常の `--resume-action retry` が必要です。
 
 ## 7. phase outcome と停止理由
 
@@ -621,7 +597,7 @@ workflow-state.json の status は次のように対応します。
 | red_team_review | risks_recorded | critical_risk_requires_decision, authority_required | artifact_invalid, execution_error |
 | solution_design | design_ready | architectural_decision_required, destructive_change_approval_required, dependency_approval_required, permission_change_required | artifact_invalid, execution_error |
 | work_breakdown | work_items_ready | unresolved_design_dependency | artifact_invalid, execution_error |
-| plan_comprehension_check | completed_no_change, completed_refined, advisory_check_unavailable, plan_check_waived | unresolved_findings, non_convergent, invalid_output, external_send_approval_required | execution_error |
+| plan_comprehension_check（任意） | completed_no_change, completed_refined, findings_recorded, completed_with_notes, advisory_check_unavailable | なし | 保護違反など |
 | implementation | implementation_ready_for_review | material_plan_deviation, required_permission_unavailable, required_tests_unresolved | artifact_invalid, execution_error |
 | review_fix_loop | review_converged | high_severity_unresolved, max_iterations_reached, required_checks_unresolved | artifact_invalid, execution_error |
 | pull_request | pr_draft_ready (complete) | validation_information_missing, external_publish_approval_required | external_operation_failed, artifact_invalid, execution_error |

@@ -106,12 +106,13 @@ class CharacterizationPort:
 
 class WorkflowCompatibilityTests(unittest.TestCase):
     repository_root = Path(__file__).resolve().parents[1]
-    planning_config_path = repository_root / "workflows" / "issue-v1.json"
+    planning_config_path = repository_root / "workflows" / "issue-v1-plan-check.json"
     execution_config_path = repository_root / "workflows" / "issue-v1-execution.json"
 
     def load_standard_config(self):
         """Build the old one-run shape only as a parity-test oracle.
 
+        Use the opt-in planning config to preserve the old nine-phase oracle.
         Production CLI execution is intentionally split into two configs.  The
         legacy characterization tests still need one in-memory plan so they
         can compare the combined lifecycle event stream with the fixed
@@ -202,7 +203,7 @@ class WorkflowCompatibilityTests(unittest.TestCase):
             )
             return result, port, legacy, configured
 
-    def test_standard_config_declares_nine_phases_and_implementation_roles(self) -> None:
+    def test_opt_in_config_declares_nine_phases_and_implementation_roles(self) -> None:
         config = self.load_standard_config()
         top_steps = [node for node in config.nodes if isinstance(node, StepConfig)]
         loops = [node for node in config.nodes if isinstance(node, LoopConfig)]
