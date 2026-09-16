@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "id": "kelpie-issue-v1",
+  "id": "kelpie-issue-v1-plan-check",
   "profile": "repository_issue",
   "limits": {
     "max_loop_items": 100,
@@ -87,6 +87,22 @@
         {"id": "work_items", "kind": "file", "path": "work_items.json"}
       ],
       "depends_on": ["solution_design"]
+    },
+    {
+      "type": "step",
+      "id": "plan_comprehension_check",
+      "lifecycle": "kelpie.phase.plan_comprehension_check.v1",
+      "runner": "codex",
+      "prompt": "prompts/05a_plan_comprehension_check.md",
+      "skill": "skills/plan-comprehension-check/SKILL.md",
+      "inputs": [
+        {"name": "issue", "from": "$issue"},
+        {"name": "instructions", "from": "$repo_instructions"}
+      ],
+      "outputs": [
+        {"id": "document", "kind": "file", "path": "05a-plan-comprehension-check.md"}
+      ],
+      "depends_on": ["work_breakdown"]
     }
   ]
 }

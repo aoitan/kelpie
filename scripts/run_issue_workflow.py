@@ -2857,8 +2857,6 @@ class WorkflowRunner:
         include_issue_comments: bool = False,
         task_label: str | None = None,
         dry_run: bool = False,
-        allow_plan_check_external_send: bool = False,
-        plan_check_required: bool = False,
         artifact_dir: Path | None = None,
         resume_intervention: HumanIntervention | None = None,
         reuse_issue_cache: bool = False,
@@ -2876,8 +2874,6 @@ class WorkflowRunner:
         self.include_issue_comments = include_issue_comments
         self.task_label = self.normalize_task_label(task_label)
         self.dry_run = dry_run
-        self.allow_plan_check_external_send = allow_plan_check_external_send
-        self.plan_check_required = plan_check_required
         self.resume_intervention = resume_intervention
         self._active_implementation_loop_status_path: Path | None = None
         self._active_implementation_scope_prefix: str | None = None
@@ -5479,84 +5475,43 @@ class WorkflowRunner:
         result: dict[str, object],
     ) -> PhaseOutcome:
         status = str(result["status"])
-        invalid_output_decision = "pause" if self.plan_check_required else "advance"
-        invalid_output_reason = (
-            "invalid_output" if self.plan_check_required else "advisory_check_unavailable"
-        )
-        invalid_output_resume = (
-            "Retry with --resume after correcting the prompt or runner, or use "
-            "--resume --waive-plan-comprehension-check."
-            if self.plan_check_required
-            else None
-        )
-        external_send_decision = "pause" if self.plan_check_required else "advance"
-        external_send_reason = (
-            "external_send_approval_required"
-            if self.plan_check_required
-            else "advisory_check_unavailable"
-        )
-        external_send_resume = (
-            "Allow the external-safe plan-check send."
-            if self.plan_check_required
-            else None
-        )
         mapping = {
             "completed_no_change": ("advance", "completed_no_change", None),
             "completed_refined": ("advance", "completed_refined", None),
-            "paused_unresolved": (
-                "pause",
-                "unresolved_findings",
-                "Resolve or approve the unresolved plan findings.",
-            ),
-            "paused_non_convergent": (
-                "pause",
-                "non_convergent",
-                "Revise the plan or approve a new refinement attempt.",
-            ),
-            "invalid_output": (invalid_output_decision, invalid_output_reason, invalid_output_resume),
-            "approval_required": (
-                external_send_decision,
-                external_send_reason,
-                external_send_resume,
-            ),
+            "findings_recorded": ("advance", "findings_recorded", None),
+            "completed_with_notes": ("advance", "completed_with_notes", None),
+            # Protocol and runner failures remain visible as unavailable
+            # advisory evidence.  They must not become a no-findings result.
+            "execution_error": ("advance", "advisory_check_unavailable", None),
+            "invalid_output": ("advance", "advisory_check_unavailable", None),
+            "spec_error": ("advance", "advisory_check_unavailable", None),
+            "blocked_sensitive_input": ("advance", "advisory_check_unavailable", None),
+            "stale_input": ("advance", "advisory_check_unavailable", None),
         }
         decision, reason_code, resume_condition = mapping.get(
             status,
             ("fail", "execution_error", None),
         )
-        summary = f"Plan refinement finished with status {status}."
-        if status == "invalid_output":
-            if self.plan_check_required:
-                summary = (
-                    "Plan comprehension stopped because probe output was schema-invalid; "
-                    "no semantic finding was adjudicated."
-                )
-            else:
-                summary = (
-                    "Plan comprehension advisory was unavailable after schema validation failures; "
-                    "the workflow advanced without treating the probe as a no-findings signal."
-                )
-                print(
-                    "Warning: advisory check unavailable; advancing without treating the probe "
-                    "as a no-findings signal."
-                )
-        elif status == "approval_required":
-            if self.plan_check_required:
-                summary = (
-                    "Plan comprehension stopped because external plan-check send was not "
-                    "permitted; allow external send or explicitly waive the required check "
-                    "before continuing."
-                )
-            else:
-                summary = (
-                    "Plan comprehension advisory was unavailable because external plan-check send "
-                    "was not permitted; the workflow advanced without treating the probe as a "
-                    "no-findings signal."
-                )
-                print(
-                    "Warning: plan comprehension external send was not permitted; advancing "
-                    "without treating the probe as a no-findings signal."
-                )
+        summary = f"Plan comprehension advisory finished with status {status}."
+        if reason_code == "advisory_check_unavailable":
+            summary = (
+                f"Plan comprehension advisory was unavailable ({status}); the workflow advanced "
+                "without treating the result as a no-findings signal."
+            )
+            print(
+                f"Warning: plan comprehension advisory unavailable ({status}); advancing "
+                "without treating the result as a no-findings signal."
+            )
+        elif reason_code == "findings_recorded":
+            summary = (
+                "Plan comprehension findings were recorded as advisory notes; the workflow "
+                "advanced without human intervention."
+            )
+        elif reason_code == "completed_with_notes":
+            summary = (
+                f"Plan comprehension completed with advisory notes ({status}); the workflow "
+                "advanced without human intervention."
+            )
         outcome = PhaseOutcome(
             schema_version="1.0",
             phase="plan_comprehension_check",
@@ -5567,36 +5522,9 @@ class WorkflowRunner:
             resume_condition=resume_condition,
             artifact_digests={},
         )
-        self._persist_outcome(
-            artifact_dir,
-            outcome,
-            state_metadata={
-                "plan_check_policy": "required" if self.plan_check_required else "advisory",
-            },
-        )
+        self._persist_outcome(artifact_dir, outcome)
         if decision in {"pause", "fail"}:
             raise PhaseOutcomeStop(f"Plan refinement cannot advance: {status}")
-        return outcome
-
-    def record_plan_check_waiver(self, artifact_dir: Path) -> PhaseOutcome:
-        """Record an explicit human waiver for a required invalid probe output."""
-        outcome = PhaseOutcome(
-            schema_version="1.0",
-            phase="plan_comprehension_check",
-            decision="advance",
-            reason_code="plan_check_waived",
-            summary=(
-                "A human explicitly waived the required plan comprehension check after invalid probe output."
-            ),
-            evidence_refs=("05a-plan-comprehension-check.md",),
-            resume_condition=None,
-            artifact_digests={},
-        )
-        persist_phase_outcome(
-            artifact_dir,
-            outcome,
-            state_metadata={"plan_check_policy": "required"},
-        )
         return outcome
 
     def run_plan_refinement_loop(
@@ -5611,41 +5539,41 @@ class WorkflowRunner:
             + "\n\n"
             + (self.repo_root / PHASE_TO_SKILL["plan_comprehension_check"]).read_text(encoding="utf-8")
         )
-        if self.allow_plan_check_external_send and not self.dry_run:
-            from datetime import datetime, timezone
-
-            approval = {
-                "schema_version": "1.0",
-                "scope": "plan_comprehension_check_external_safe_artifacts",
-                "source": "--allow-plan-check-external-send",
-                "approved_at": datetime.now(timezone.utc).isoformat(),
-            }
-            (artifact_dir / "plan-check-external-send-approval.json").write_text(
-                json.dumps(approval, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
         if self.dry_run:
             return run_plan_check(
                 artifact_root=artifact_dir,
                 command_template=probe_runner.command_template,
                 dry_run=True,
-                allow_external_send=self.allow_plan_check_external_send,
-                advisory_only=not self.plan_check_required,
                 prompt_text=probe_prompt,
             )
 
         refined_once = False
         for _ in range(max_iterations):
+            self.prepare_artifact_scope(artifact_dir / "plan-check")
+            before_probe_protected_artifacts = self.protected_artifact_digests(
+                artifact_dir,
+                {"05a-plan-comprehension-check.md"},
+            )
+            before_probe_workspace = self.workspace_file_digests()
             result = run_plan_check(
                 artifact_root=artifact_dir,
                 command_template=probe_runner.command_template,
                 dry_run=False,
-                allow_external_send=self.allow_plan_check_external_send,
-                advisory_only=not self.plan_check_required,
                 prompt_text=probe_prompt,
             )
+            probe_workspace_changes, probe_artifact_changes = self.artifact_scope_changes(
+                artifact_dir,
+                allowed_names={"05a-plan-comprehension-check.md"},
+                before_protected_artifacts=before_probe_protected_artifacts,
+                before_workspace=before_probe_workspace,
+            )
+            if probe_workspace_changes or probe_artifact_changes:
+                raise SystemExit(
+                    "Plan comprehension probe changed files outside the advisory artifact scope: "
+                    + ", ".join(sorted(probe_workspace_changes | probe_artifact_changes))
+                )
             probe_status = str(result["status"])
-            if probe_status not in {"completed_no_findings", "needs_human_review"}:
+            if probe_status not in {"completed_no_findings", "findings_recorded"}:
                 # Protocol failures are not semantic findings; never ask the strong model
                 # to repair or reinterpret malformed probe output.
                 return result
@@ -5668,6 +5596,10 @@ class WorkflowRunner:
                 "05-work-breakdown.md",
                 "work_items.json",
             }
+            before_plan_bytes = self.capture_plan_artifact_bytes(
+                artifact_dir,
+                allowed_plan_artifacts,
+            )
             before_digests = self.plan_artifact_digests(artifact_dir, allowed_plan_artifacts)
             before_protected_artifacts = self.protected_artifact_digests(
                 artifact_dir,
@@ -5699,157 +5631,211 @@ class WorkflowRunner:
                 json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
+
+            def record_result(status: dict[str, object], *, rollback: bool = False) -> dict[str, object]:
+                if rollback:
+                    self.restore_plan_artifact_bytes(artifact_dir, before_plan_bytes)
+                refinement_intent.update(status)
+                refinement_intent["after_plan_digests"] = self.plan_artifact_digests(
+                    artifact_dir, allowed_plan_artifacts,
+                )
+                refinement_intent_path.write_text(
+                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                status = {"snapshot_id": snapshot_id, **status}
+                (artifact_dir / "plan-refinement-status.json").write_text(
+                    json.dumps(status, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+                )
+                return status
+
+            runner_error: BaseException | None = None
             try:
-                self.invoke_cli(
-                    "plan_refinement",
-                    refinement_prompt,
-                    prompt_file,
-                    refinement_runner,
+                self.invoke_cli("plan_refinement", refinement_prompt, prompt_file, refinement_runner)
+            except (SystemExit, Exception) as exc:
+                # Always inspect scope and restore failed edits before handling
+                # an operational failure or re-raising an unexpected bug.
+                runner_error = exc
+            workspace_changes, artifact_changes = self.plan_refinement_scope_changes(
+                artifact_dir, before_protected_artifacts, before_workspace,
+            )
+            if workspace_changes or artifact_changes:
+                record_result({
+                    "status": "scope_violation",
+                    "unexpected_workspace_changes": sorted(workspace_changes),
+                    "unexpected_artifact_changes": sorted(artifact_changes),
+                }, rollback=True)
+                raise SystemExit(
+                    "Plan refinement changed files outside the planning artifact allowlist: "
+                    + ", ".join(sorted(workspace_changes | artifact_changes))
                 )
-            except SystemExit as exc:
-                refinement_intent["status"] = "execution_error"
-                refinement_intent["error"] = str(exc)
-                refinement_intent_path.write_text(
-                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                raise
-            if not adjudication_path.exists():
-                refinement_intent["status"] = "invalid_output"
-                refinement_intent["error"] = "adjudication.json was not created"
-                refinement_intent_path.write_text(
-                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                raise SystemExit(f"Plan refinement did not create {adjudication_path.relative_to(self.workdir)}")
+            if runner_error is not None:
+                result = record_result({
+                    "status": "execution_error",
+                    "error": str(runner_error) or type(runner_error).__name__,
+                }, rollback=True)
+                if not isinstance(runner_error, (SystemExit, OSError, subprocess.SubprocessError)):
+                    raise runner_error
+                return result
+
+            # Verify the writable paths again before reading model-written files.
+            # A replaced symlink/non-file is a protection violation, not an advisory failure.
+            self.capture_plan_artifact_bytes(artifact_dir, allowed_plan_artifacts)
             try:
                 adjudication = AdjudicationResult.from_dict(
                     parse_json_payload(adjudication_path.read_text(encoding="utf-8")),
                     expected_snapshot_id=snapshot_id,
                     expected_finding_ids=expected_finding_ids,
                 )
-            except ValueError as exc:
-                refinement_intent["status"] = "invalid_output"
-                refinement_intent["error"] = str(exc)
-                refinement_intent_path.write_text(
-                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                raise SystemExit(f"Invalid plan refinement adjudication: {exc}") from exc
-            after_digests = self.plan_artifact_digests(artifact_dir, allowed_plan_artifacts)
-            after_protected_artifacts = self.protected_artifact_digests(
-                artifact_dir,
-                allowed_plan_artifacts,
-            )
-            after_workspace = self.workspace_file_digests()
-            unexpected_workspace_changes = {
-                name
-                for name in set(before_workspace) | set(after_workspace)
-                if before_workspace.get(name) != after_workspace.get(name)
-            }
-            if unexpected_workspace_changes:
-                refinement_intent["status"] = "scope_violation"
-                refinement_intent["unexpected_workspace_changes"] = sorted(
-                    unexpected_workspace_changes
-                )
-                refinement_intent_path.write_text(
-                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                raise SystemExit(
-                    "Plan refinement changed files outside the planning artifact allowlist: "
-                    + ", ".join(sorted(unexpected_workspace_changes))
-                )
-            unexpected_artifact_changes = {
-                name
-                for name in set(before_protected_artifacts) | set(after_protected_artifacts)
-                if before_protected_artifacts.get(name) != after_protected_artifacts.get(name)
-            }
-            if unexpected_artifact_changes:
-                refinement_intent["status"] = "scope_violation"
-                refinement_intent["unexpected_artifact_changes"] = sorted(
-                    unexpected_artifact_changes
-                )
-                refinement_intent_path.write_text(
-                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                raise SystemExit(
-                    "Plan refinement changed protected workflow artifacts: "
-                    + ", ".join(sorted(unexpected_artifact_changes))
-                )
-            actual_modified = {
-                name
-                for name in allowed_plan_artifacts
-                if before_digests.get(name) != after_digests.get(name)
-            }
-            if actual_modified != set(adjudication.modified_artifacts):
-                refinement_intent["status"] = "artifact_mismatch"
-                refinement_intent["declared_modified_artifacts"] = list(adjudication.modified_artifacts)
-                refinement_intent["actual_modified_artifacts"] = sorted(actual_modified)
-                refinement_intent_path.write_text(
-                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                raise SystemExit(
-                    "Plan refinement declared modified artifacts do not match actual changes: "
-                    f"declared={sorted(adjudication.modified_artifacts)}, actual={sorted(actual_modified)}"
-                )
+                after_digests = self.plan_artifact_digests(artifact_dir, allowed_plan_artifacts)
+                actual_modified = {
+                    name for name in allowed_plan_artifacts
+                    if before_digests.get(name) != after_digests.get(name)
+                }
+                if actual_modified != set(adjudication.modified_artifacts):
+                    raise ValueError(
+                        "Declared modified artifacts do not match actual changes: "
+                        f"declared={sorted(adjudication.modified_artifacts)}, actual={sorted(actual_modified)}"
+                    )
+                if "05-work-breakdown.md" in actual_modified:
+                    # Validate before writing so a failed refinement does not
+                    # create a work-items error artifact or delete the last good handoff.
+                    payload = parse_work_items_from_text(
+                        (artifact_dir / "05-work-breakdown.md").read_text(encoding="utf-8")
+                    )
+                    if "work_items.json" in actual_modified:
+                        refined_work_items = parse_json_payload(
+                            (artifact_dir / "work_items.json").read_text(encoding="utf-8")
+                        )
+                        validation_error = validate_work_items_payload(refined_work_items)
+                        if validation_error is not None:
+                            raise ValueError(f"Invalid refined work_items.json: {validation_error}")
+                        if refined_work_items != payload:
+                            raise ValueError(
+                                "Refined work_items.json does not match 05-work-breakdown.md JSON payload"
+                            )
+                    else:
+                        (artifact_dir / "work_items.json").write_text(
+                            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                            encoding="utf-8",
+                        )
+                elif "work_items.json" in actual_modified:
+                    refined_work_items = parse_json_payload(
+                        (artifact_dir / "work_items.json").read_text(encoding="utf-8")
+                    )
+                    validation_error = validate_work_items_payload(refined_work_items)
+                    if validation_error is not None:
+                        raise ValueError(f"Invalid refined work_items.json: {validation_error}")
+            except (OSError, UnicodeError, ValueError) as exc:
+                return record_result({"status": "invalid_output", "error": str(exc)}, rollback=True)
+            except Exception:
+                self.restore_plan_artifact_bytes(artifact_dir, before_plan_bytes)
+                raise
 
             if adjudication.unresolved_reasons or any(
                 item.verdict == "unresolved" for item in adjudication.findings
             ):
-                refinement_intent["status"] = "paused_unresolved"
-                refinement_intent["after_plan_digests"] = after_digests
-                refinement_intent_path.write_text(
-                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                status = {
-                    "status": "paused_unresolved",
-                    "snapshot_id": snapshot_id,
+                return record_result({
+                    "status": "completed_with_notes",
                     "unresolved_reasons": list(adjudication.unresolved_reasons),
-                }
-                (artifact_dir / "plan-refinement-status.json").write_text(
-                    json.dumps(status, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                return status
-
+                    "unresolved_finding_count": sum(
+                        item.verdict == "unresolved" for item in adjudication.findings
+                    ),
+                })
             if not adjudication.plan_modified:
-                refinement_intent["status"] = "completed"
-                refinement_intent["after_plan_digests"] = after_digests
-                refinement_intent_path.write_text(
-                    json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                status = {
+                return record_result({
                     "status": "completed_refined" if refined_once else "completed_no_change",
-                    "snapshot_id": snapshot_id,
                     "iterations": len(iteration_dirs),
-                }
-                (artifact_dir / "plan-refinement-status.json").write_text(
-                    json.dumps(status, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                return status
-
+                })
             refined_once = True
-            refinement_intent["status"] = "plan_modified"
-            refinement_intent["after_plan_digests"] = after_digests
-            refinement_intent_path.write_text(
-                json.dumps(refinement_intent, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-            if "05-work-breakdown.md" in adjudication.modified_artifacts:
-                self.write_work_items_artifact(artifact_dir=artifact_dir)
+            record_result({"status": "plan_modified"})
 
-        status = {"status": "paused_non_convergent", "iterations": max_iterations}
+        status = {"status": "completed_with_notes", "iterations": max_iterations}
         (artifact_dir / "plan-refinement-status.json").write_text(
             json.dumps(status, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
         return status
+
+    def capture_plan_artifact_bytes(
+        self,
+        artifact_dir: Path,
+        names: Iterable[str],
+    ) -> dict[str, bytes | None]:
+        """Capture the exact pre-refinement bytes for the writable plan files."""
+        snapshots: dict[str, bytes | None] = {}
+        for name in names:
+            path = artifact_dir / name
+            self._assert_artifact_path_contained(path)
+            self._reject_symlink_components(self.artifact_dir, path)
+            if path.exists() and not path.is_file():
+                raise ValueError(f"Plan artifact is not a regular file: {path}")
+            snapshots[name] = path.read_bytes() if path.exists() else None
+        return snapshots
+
+    def restore_plan_artifact_bytes(
+        self,
+        artifact_dir: Path,
+        snapshots: Mapping[str, bytes | None],
+    ) -> None:
+        """Restore writable plan files exactly as they were before refinement."""
+        for name, before in snapshots.items():
+            path = artifact_dir / name
+            self._assert_artifact_path_contained(path)
+            self._reject_symlink_components(self.artifact_dir, path)
+            if before is None:
+                if path.exists():
+                    if not path.is_file():
+                        raise ValueError(f"Cannot roll back non-file plan artifact: {path}")
+                    path.unlink()
+                continue
+            if path.exists() and not path.is_file():
+                raise ValueError(f"Cannot roll back non-file plan artifact: {path}")
+            path.write_bytes(before)
+
+    def plan_refinement_scope_changes(
+        self,
+        artifact_dir: Path,
+        before_protected_artifacts: Mapping[str, str],
+        before_workspace: Mapping[str, str],
+    ) -> tuple[set[str], set[str]]:
+        """Return workspace and protected-artifact changes made by refinement."""
+        return self.artifact_scope_changes(
+            artifact_dir,
+            allowed_names={
+                "04-solution-design.md",
+                "05-work-breakdown.md",
+                "work_items.json",
+            },
+            before_protected_artifacts=before_protected_artifacts,
+            before_workspace=before_workspace,
+        )
+
+    def artifact_scope_changes(
+        self,
+        artifact_dir: Path,
+        *,
+        allowed_names: set[str],
+        before_protected_artifacts: Mapping[str, str],
+        before_workspace: Mapping[str, str],
+    ) -> tuple[set[str], set[str]]:
+        """Return workspace and protected-artifact changes outside allowed artifact names."""
+        after_protected_artifacts = self.protected_artifact_digests(
+            artifact_dir,
+            allowed_names,
+        )
+        after_workspace = self.workspace_file_digests()
+        unexpected_workspace_changes = {
+            name
+            for name in set(before_workspace) | set(after_workspace)
+            if before_workspace.get(name) != after_workspace.get(name)
+        }
+        unexpected_artifact_changes = {
+            name
+            for name in set(before_protected_artifacts) | set(after_protected_artifacts)
+            if before_protected_artifacts.get(name) != after_protected_artifacts.get(name)
+        }
+        return unexpected_workspace_changes, unexpected_artifact_changes
 
     def plan_artifact_digests(
         self,
@@ -7411,21 +7397,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Read the local human instruction from stdin.",
     )
-    parser.add_argument(
-        "--allow-plan-check-external-send",
-        action="store_true",
-        help="Allow external-safe plan artifacts to be sent to the plan comprehension model.",
-    )
-    parser.add_argument(
-        "--require-plan-comprehension-check",
-        action="store_true",
-        help="Pause on invalid plan-check output instead of advancing with an advisory warning.",
-    )
-    parser.add_argument(
-        "--waive-plan-comprehension-check",
-        action="store_true",
-        help="Explicitly waive a required invalid plan check while resuming a paused workflow.",
-    )
     return parser.parse_args()
 
 
@@ -7439,12 +7410,6 @@ def slice_phases(start: str, end: str) -> list[str]:
 
 def main() -> None:
     args = parse_args()
-    if args.waive_plan_comprehension_check and not args.resume:
-        raise SystemExit("--waive-plan-comprehension-check requires --resume")
-    if args.waive_plan_comprehension_check and not args.legacy_workflow:
-        raise SystemExit(
-            "--waive-plan-comprehension-check is only supported with --legacy-workflow"
-        )
     if args.run_dir and not args.resume:
         raise SystemExit("--run-dir requires --resume")
     if args.resume_action and not args.resume:
@@ -7454,8 +7419,6 @@ def main() -> None:
         and not args.resume
     ):
         raise SystemExit("Resume prompt options require --resume")
-    if args.waive_plan_comprehension_check and args.resume_action:
-        raise SystemExit("--waive-plan-comprehension-check cannot be combined with --resume-action")
     if args.resume_phase and args.resume_action != "reopen":
         raise SystemExit("--resume-phase requires --resume-action reopen")
     if args.resume_loop_from and not args.resume:
@@ -7536,8 +7499,6 @@ def main() -> None:
         include_issue_comments=include_issue_comments,
         task_label=task_label,
         dry_run=args.dry_run,
-        allow_plan_check_external_send=args.allow_plan_check_external_send,
-        plan_check_required=args.require_plan_comprehension_check,
         runner_registry=configured_runner_registry,
         artifact_dir=run_dir,
         reuse_issue_cache=args.resume,
@@ -7571,25 +7532,9 @@ def main() -> None:
         if state.get("status") not in {"paused", "failed"} or state.get("phase") not in PHASES:
             raise SystemExit("Cannot resume: workflow is not in a valid paused or failed phase")
         paused_phase = str(state["phase"])
-        if state.get("status") == "failed" and not args.resume_action and not args.waive_plan_comprehension_check:
+        if state.get("status") == "failed" and not args.resume_action:
             raise SystemExit("Cannot resume a failed workflow without --resume-action retry or reopen")
-        if state.get("plan_check_policy") == "required":
-            runner.plan_check_required = True
-        if args.waive_plan_comprehension_check:
-            if (
-                paused_phase != "plan_comprehension_check"
-                or state.get("reason_code") != "invalid_output"
-                or state.get("plan_check_policy") != "required"
-            ):
-                raise SystemExit(
-                    "Cannot waive plan comprehension check: the paused outcome is not required invalid_output"
-                )
-            runner.record_plan_check_waiver(runner.artifact_dir)
-            next_phase_index = PHASES.index(paused_phase) + 1
-            if next_phase_index > PHASES.index(args.to_phase):
-                return
-            start_phase = PHASES[next_phase_index]
-        elif args.resume_action:
+        if args.resume_action:
             intervention = runner.record_human_intervention(
                 state,
                 args.resume_action,
@@ -7606,7 +7551,15 @@ def main() -> None:
             start_phase = paused_phase
     elif args.resume_action:
         raise SystemExit("--resume-action requires --resume")
-    runner.run(slice_phases(start_phase, args.to_phase))
+    selected_phases = slice_phases(start_phase, args.to_phase)
+    if (
+        "plan_comprehension_check" in selected_phases
+        and start_phase != "plan_comprehension_check"
+        and args.from_phase != "plan_comprehension_check"
+        and args.to_phase != "plan_comprehension_check"
+    ):
+        selected_phases.remove("plan_comprehension_check")
+    runner.run(selected_phases)
 
 
 if __name__ == "__main__":

@@ -213,8 +213,7 @@
 `plan_comprehension_check` の弱モデルprobeで外部モデルへ渡せるのは、入力specで
 `external-safe` と明示された成果物だけとする。弱モデルprobeは advisory-only であり、
 それ単独で実装可否を決めない。後段の強モデルがfindingを裁定し、必要なら計画を修正する。
-live実行ではさらに
-`--allow-plan-check-external-send` による明示opt-inを必須とする。
+チェックを明示的に選んだ場合は設定済みモデルを使い、追加の送信承認は要求しない。
 
 ---
 

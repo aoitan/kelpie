@@ -457,7 +457,7 @@ class ProbeAndFindingTests(unittest.TestCase):
         }
         findings = build_findings(payload, {"valid": True})
         self.assertEqual(findings[0]["verification"], "unverified")
-        self.assertTrue(findings[0]["requires_human_approval"])
+        self.assertNotIn("requires_human_approval", findings[0])
 
     def test_semantic_findings_remain_unverified_even_when_reconstruction_evidence_is_valid(self) -> None:
         payload = {
@@ -574,25 +574,25 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
         self.assertEqual(result["status"], "prepared")
         self.assertEqual(len(status_files), 1)
 
-    def test_dry_run_records_required_policy_in_spec(self) -> None:
+    def test_dry_run_records_advisory_policy_in_spec(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
-            run_plan_check(root, dry_run=True, advisory_only=False)
+            run_plan_check(root, dry_run=True)
             spec = json.loads(
                 (root / "plan-check" / "iterations" / "0001" / "spec.json").read_text(
                     encoding="utf-8"
                 )
             )
 
-        self.assertFalse(spec["advisory_only"])
+        self.assertTrue(spec["advisory_only"])
 
     def test_operational_failure_has_no_findings(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
             (root / "05-work-breakdown.md").write_text("# Work Breakdown\n", encoding="utf-8")
-            result = run_plan_check(root, command_template=["false"], allow_external_send=True)
+            result = run_plan_check(root, command_template=["false"])
             intent_path = next((root / "plan-check" / "iterations").glob("*/intent-record.json"))
             intent = json.loads(intent_path.read_text(encoding="utf-8"))
             summary = (root / "05a-plan-comprehension-check.md").read_text(encoding="utf-8")
@@ -601,23 +601,24 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
         self.assertEqual(intent["attempts"], 2)
         self.assertIn("execution_error", summary)
 
-    def test_live_check_requires_explicit_external_send_opt_in(self) -> None:
+    def test_live_check_is_explicitly_invokable_without_send_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
+            (root / "05-work-breakdown.md").write_text("# Work Breakdown\n", encoding="utf-8")
             result = run_plan_check(root, command_template=["false"])
-        self.assertEqual(result["status"], "approval_required")
+        self.assertEqual(result["status"], "execution_error")
         self.assertEqual(result["findings"], [])
 
     def test_live_check_requires_design_and_work_breakdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
-            result = run_plan_check(root, command_template=["false"], allow_external_send=True)
+            result = run_plan_check(root, command_template=["false"])
         self.assertEqual(result["status"], "spec_error")
         self.assertIn("05-work-breakdown.md", result["error"])
 
-    def test_invalid_evidence_requires_human_review_instead_of_no_findings(self) -> None:
+    def test_invalid_evidence_is_recorded_instead_of_no_findings(self) -> None:
         probe_payload = {
             "schema_version": "1.0",
             "tasks": [
@@ -649,8 +650,8 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
             (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
             (root / "05-work-breakdown.md").write_text("# Work Breakdown\n", encoding="utf-8")
             with patch("scripts.plan_comprehension.run_probe", return_value=probe_result):
-                result = run_plan_check(root, allow_external_send=True)
-        self.assertEqual(result["status"], "needs_human_review")
+                result = run_plan_check(root)
+        self.assertEqual(result["status"], "findings_recorded")
         self.assertEqual(result["findings"], [])
 
     def test_schema_invalid_probe_is_retried_with_correction_prompt(self) -> None:
@@ -703,9 +704,9 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
             (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
             (root / "05-work-breakdown.md").write_text("# Work Breakdown\n", encoding="utf-8")
             with patch("scripts.plan_comprehension.run_probe", side_effect=probe_results) as probe:
-                result = run_plan_check(root, allow_external_send=True)
+                result = run_plan_check(root)
 
-        self.assertEqual(result["status"], "needs_human_review")
+        self.assertEqual(result["status"], "findings_recorded")
         self.assertEqual(probe.call_count, 2)
         self.assertIn("previous response was rejected", probe.call_args_list[1].args[1])
         self.assertIn("required reconstruction schema", probe.call_args_list[1].args[1])
@@ -753,7 +754,7 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
             (root / "04-solution-design.md").write_text("# Design\n", encoding="utf-8")
             (root / "05-work-breakdown.md").write_text("# Work Breakdown\n", encoding="utf-8")
             with patch("scripts.plan_comprehension.run_probe", side_effect=probe_results) as probe:
-                result = run_plan_check(root, allow_external_send=True)
+                result = run_plan_check(root)
             first_attempt = json.loads(
                 (
                     root
@@ -776,7 +777,7 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
             ).exists()
             correction_prompt = probe.call_args_list[1].args[1]
 
-        self.assertEqual(result["status"], "needs_human_review")
+        self.assertEqual(result["status"], "findings_recorded")
         self.assertEqual(first_attempt["status"], "invalid_output")
         self.assertIn("line 1, column", first_attempt["validation_error"])
         self.assertTrue(second_attempt_exists)
@@ -796,7 +797,7 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
                 command=("copilot",),
             )
             with patch("scripts.plan_comprehension.run_probe", return_value=probe_result):
-                result = run_plan_check(root, allow_external_send=True)
+                result = run_plan_check(root)
             iteration = root / "plan-check" / "iterations" / "0001"
             status = json.loads((iteration / "status.json").read_text(encoding="utf-8"))
             raw_output = (iteration / "raw-output.txt").read_text(encoding="utf-8")
@@ -843,7 +844,7 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
                 )
 
             with patch("scripts.plan_comprehension.run_probe", side_effect=mutate_input):
-                result = run_plan_check(root, allow_external_send=True)
+                result = run_plan_check(root)
         self.assertEqual(result["status"], "stale_input")
 
     def test_timeout_result_is_persisted_as_execution_error(self) -> None:
@@ -859,7 +860,7 @@ class PersistenceAndEvaluationTests(unittest.TestCase):
                 command=("codex",),
             )
             with patch("scripts.plan_comprehension.run_probe", return_value=timed_out):
-                result = run_plan_check(root, allow_external_send=True)
+                result = run_plan_check(root)
             status = json.loads(
                 (root / "plan-check" / "iterations" / "0001" / "status.json").read_text(encoding="utf-8")
             )

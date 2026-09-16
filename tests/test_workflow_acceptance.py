@@ -15,10 +15,14 @@ acceptance criteria visible at the integration boundary:
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import redirect_stdout
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scripts.pipeline_executor import (
     PipelineExecutor,
@@ -28,10 +32,12 @@ from scripts.pipeline_executor import (
 )
 from scripts.run_issue_workflow import (
     ImplementationReviewController,
+    InstructionStagingConfig,
     ReviewResult,
     RunnerConfig,
     RunnerResolver,
     RunnerResolverCapabilityAdapter,
+    WorkflowRunner,
     assert_workflow_parity,
     characterize_configured_requests,
     characterize_legacy_workflow,
@@ -44,6 +50,7 @@ from scripts.workflow_config import (
     load_workflow_config,
     parse_workflow_config,
 )
+from scripts.workflow_outcomes import PHASE_REQUIRED_ARTIFACTS
 
 
 class RecordingAcceptancePort:
@@ -93,11 +100,12 @@ class WorkflowAcceptanceTests(unittest.TestCase):
     repository_root = Path(__file__).resolve().parents[1]
     valid_fixture = repository_root / "tests" / "fixtures" / "workflows" / "valid-v1.json"
     standard_config_path = repository_root / "workflows" / "issue-v1.json"
+    plan_check_config_path = repository_root / "workflows" / "issue-v1-plan-check.json"
     execution_config_path = repository_root / "workflows" / "issue-v1-execution.json"
 
     def load_combined_compatibility_config(self):
         """Compose the two production stages for the legacy parity oracle."""
-        planning = json.loads(self.standard_config_path.read_text(encoding="utf-8"))
+        planning = json.loads(self.plan_check_config_path.read_text(encoding="utf-8"))
         execution = json.loads(self.execution_config_path.read_text(encoding="utf-8"))
         combined = dict(planning)
         combined_nodes = list(planning["nodes"]) + list(execution["nodes"])
@@ -366,7 +374,7 @@ class WorkflowAcceptanceTests(unittest.TestCase):
                 self.assertEqual(port.requests, [])
                 self.assertFalse(artifact_root.exists())
 
-    def test_standard_config_matches_fixed_workflow_order_and_contract(self) -> None:
+    def test_opt_in_config_matches_fixed_workflow_order_and_contract(self) -> None:
         """AC-6: bundled v1 config is an executable compatibility oracle."""
 
         config = self.load_combined_compatibility_config()
@@ -457,7 +465,11 @@ class WorkflowAcceptanceTests(unittest.TestCase):
 
     def test_standard_workflow_is_split_at_work_items_handoff(self) -> None:
         planning = load_workflow_config(self.standard_config_path)
+        optional = load_workflow_config(self.plan_check_config_path)
         execution = load_workflow_config(self.execution_config_path)
+
+        self.assertEqual(optional.nodes[:-1], planning.nodes)
+        self.assertEqual(optional.nodes[-1].id, "plan_comprehension_check")
 
         self.assertEqual(
             [node.id for node in planning.nodes],
@@ -467,7 +479,6 @@ class WorkflowAcceptanceTests(unittest.TestCase):
                 "red_team_review",
                 "solution_design",
                 "work_breakdown",
-                "plan_comprehension_check",
             ],
         )
         self.assertEqual(
@@ -476,6 +487,62 @@ class WorkflowAcceptanceTests(unittest.TestCase):
         )
         self.assertIsInstance(execution.nodes[0], LoopConfig)
         self.assertEqual(execution.nodes[0].source.source, "$work_items")  # type: ignore[union-attr]
+
+    def test_default_planning_produces_handoff_without_plan_check_or_intervention(self) -> None:
+        """Run the real lifecycle with only the LLM calls replaced by outputs."""
+        reasons = {
+            "prototype_planning": "plan_ready",
+            "prototyping": "evidence_collected",
+            "red_team_review": "risks_recorded",
+            "solution_design": "design_ready",
+            "work_breakdown": "work_items_ready",
+        }
+        tasks = {"tasks": [{"id": "fix", "title": "Small fix", "description": "Correct the existing behavior."}]}
+        calls: list[str] = []
+        with tempfile.TemporaryDirectory() as tmpdir, redirect_stdout(io.StringIO()) as output:
+            root = Path(tmpdir)
+            with patch.dict(os.environ, {"KELPIE_CONFIG_HOME": str(root / "config")}):
+                runner = WorkflowRunner(
+                    repo_root=self.repository_root,
+                    workdir=root,
+                    issue_number=None,
+                    runner_config=RunnerConfig(name="codex", command_template=["unused"]),
+                    instruction_staging_config=InstructionStagingConfig(),
+                    issue_source="none",
+                    task_label="default-planning",
+                )
+
+            def write_llm_outputs(phase, _prompt, _path, _config):
+                calls.append(phase)
+                document = PHASE_REQUIRED_ARTIFACTS[phase][0]
+                (runner.artifact_dir / document).write_text(
+                    json.dumps(tasks) if phase == "work_breakdown" else "Planning evidence.\n",
+                    encoding="utf-8",
+                )
+                runner.phase_outcome_path(phase, runner.artifact_dir).write_text(
+                    json.dumps({
+                        "schema_version": "1.0", "phase": phase, "decision": "advance",
+                        "reason_code": reasons[phase], "summary": "Ready for the next phase.",
+                        "evidence_refs": [document], "resume_condition": None, "artifact_digests": {},
+                    }),
+                    encoding="utf-8",
+                )
+
+            with patch.object(runner, "invoke_cli", side_effect=write_llm_outputs), patch(
+                "scripts.run_issue_workflow.run_plan_check"
+            ) as probe:
+                result = runner.run_configured_workflow(
+                    load_workflow_config(self.standard_config_path),
+                    config_path=self.standard_config_path,
+                )
+            self.assertTrue(result.succeeded, result.error)
+            self.assertEqual(calls, list(reasons))
+            probe.assert_not_called()
+            self.assertEqual(json.loads(runner.work_items_json_path().read_text()), tasks)
+            self.assertFalse((runner.artifact_dir / "human-interventions").exists())
+            self.assertFalse((runner.artifact_dir / "plan-check").exists())
+            self.assertFalse((runner.artifact_dir / "05a-plan-comprehension-check.md").exists())
+            self.assertNotIn("Warning:", output.getvalue())
 
     def test_declarative_workflow_does_not_contain_runner_commands(self) -> None:
         """AC-8: workflow structure and runner command resolution stay separate."""

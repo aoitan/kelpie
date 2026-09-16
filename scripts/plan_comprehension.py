@@ -23,16 +23,15 @@ FINDING_CLASSIFICATIONS = {
 }
 TERMINAL_STATUSES = {
     "spec_error",
-    "approval_required",
     "blocked_sensitive_input",
     "execution_error",
     "invalid_output",
     "completed_no_findings",
-    "needs_human_review",
+    "findings_recorded",
     "stale_input",
 }
 ADJUDICATION_VERDICTS = {"accepted", "rejected", "unresolved"}
-ADJUDICATION_ACTIONS = {"plan_modified", "no_change", "requires_human_decision"}
+ADJUDICATION_ACTIONS = {"plan_modified", "no_change", "record_only"}
 DEFAULT_NON_GUARANTEES = [
     "technical correctness",
     "security",
@@ -134,7 +133,7 @@ class AdjudicatedFinding:
         expected_actions = {
             "accepted": {"plan_modified"},
             "rejected": {"no_change"},
-            "unresolved": {"requires_human_decision"},
+            "unresolved": {"record_only"},
         }
         if action not in expected_actions[str(verdict)]:
             raise ValueError(f"action {action} is inconsistent with verdict {verdict}")
@@ -261,6 +260,8 @@ class PlanCheckSpec:
         )
         if raw["schema_version"] != SCHEMA_VERSION:
             raise ValueError(f"Unsupported plan check schema version: {raw['schema_version']}")
+        if raw["advisory_only"] is not True:
+            raise ValueError("plan check must be advisory-only")
         entries = raw["input_artifacts"]
         if not isinstance(entries, list):
             raise ValueError("input_artifacts must be a list")
@@ -272,7 +273,7 @@ class PlanCheckSpec:
             input_artifacts=tuple(ArtifactInput.from_dict(item) for item in entries),
             capability_profile=str(raw["capability_profile"]),
             input_mode=str(raw["input_mode"]),
-            advisory_only=bool(raw["advisory_only"]),
+            advisory_only=True,
         )
 
 
@@ -758,9 +759,7 @@ def build_findings(payload: dict[str, object], evidence: dict[str, object]) -> l
             "observed": str(raw.get("observed", "")),
             "source_refs": list(raw.get("source_refs", [])),
             "likely_cause": str(raw.get("likely_cause", "unknown")),
-            "recommended_return_phase": raw.get("recommended_return_phase"),
             "recommended_change": str(raw.get("recommended_change", "")),
-            "requires_human_approval": True,
         }
         result["fingerprint"] = finding_fingerprint(result)
         results.append(result)
@@ -811,9 +810,7 @@ def build_structural_findings(
             "observed": observed,
             "source_refs": [source_ref],
             "likely_cause": "plan_issue",
-            "recommended_return_phase": "work_breakdown",
             "recommended_change": "Align the reconstruction and work breakdown task structure.",
-            "requires_human_approval": True,
         }
         finding["fingerprint"] = finding_fingerprint(finding)
         findings.append(finding)
@@ -859,7 +856,13 @@ def render_advisory_report(status: str, findings: list[dict[str, object]], snaps
         "",
     ]
     if not findings:
-        lines.append("No source-backed interpretation differences were reported under this profile.")
+        if status == "completed_no_findings":
+            lines.append("No source-backed interpretation differences were reported under this profile.")
+        else:
+            lines.append(
+                "The advisory check did not complete with source-backed findings; this result "
+                "must not be treated as a no-findings signal."
+            )
     for index, finding in enumerate(findings, start=1):
         lines.extend(
             [
@@ -868,7 +871,6 @@ def render_advisory_report(status: str, findings: list[dict[str, object]], snaps
                 f"- Verification: `{finding['verification']}`",
                 f"- Severity: `{finding['severity']}`",
                 f"- Observed: {finding['observed']}",
-                f"- Recommended return phase: `{finding.get('recommended_return_phase') or 'human-review'}`",
                 "",
             ]
         )
@@ -964,6 +966,11 @@ def run_probe(
             timed_out=True,
             command=tuple(command),
         )
+    except OSError as exc:
+        return ProbeResult(
+            returncode=127, stdout="", stderr=str(exc),
+            timed_out=False, command=tuple(command),
+        )
 
 
 def next_iteration_dir(plan_check_dir: Path) -> Path:
@@ -1018,7 +1025,7 @@ def write_summary(artifact_root: Path, status: str, findings: list[dict[str, obj
     )
 
 
-def default_spec(artifact_root: Path, *, advisory_only: bool = True) -> PlanCheckSpec:
+def default_spec(artifact_root: Path) -> PlanCheckSpec:
     entries = []
     for relative_path in DEFAULT_INPUT_ARTIFACTS:
         if (artifact_root / relative_path).is_file():
@@ -1036,7 +1043,7 @@ def default_spec(artifact_root: Path, *, advisory_only: bool = True) -> PlanChec
         input_artifacts=tuple(entries),
         capability_profile="weak-plan-reader-v1",
         input_mode="copy_assisted" if (artifact_root / "work_items.json").exists() else "prose_only",
-        advisory_only=advisory_only,
+        advisory_only=True,
     )
 
 
@@ -1044,16 +1051,13 @@ def run_plan_check(
     artifact_root: Path,
     command_template: list[str] | None = None,
     dry_run: bool = False,
-    allow_external_send: bool = False,
     profile: CapabilityProfile | None = None,
     prompt_text: str | None = None,
-    *,
-    advisory_only: bool = True,
 ) -> dict[str, object]:
     profile = profile or capability_profile_from_command(command_template)
     plan_check_dir = artifact_root / "plan-check"
     iteration = next_iteration_dir(plan_check_dir)
-    spec = default_spec(artifact_root, advisory_only=advisory_only)
+    spec = default_spec(artifact_root)
     spec_payload = {
         "schema_version": spec.schema_version,
         "step_name": spec.step_name,
@@ -1065,15 +1069,6 @@ def run_plan_check(
     write_json(iteration / "spec.json", spec_payload)
     prompt = prompt_text or default_prompt()
     (iteration / "prompt.md").write_text(prompt + "\n", encoding="utf-8")
-    if not dry_run and not allow_external_send:
-        status = {
-            "status": "approval_required",
-            "error": "External plan-check send requires explicit opt-in.",
-            "findings": [],
-        }
-        write_json(iteration / "status.json", status)
-        write_summary(artifact_root, status["status"], [], "unavailable")
-        return status
     required_live_inputs = {"04-solution-design.md", "05-work-breakdown.md"}
     available_inputs = {item.relative_path for item in spec.input_artifacts}
     if not dry_run and not required_live_inputs <= available_inputs:
@@ -1206,7 +1201,7 @@ def run_plan_check(
     if current_manifest is None or current_manifest.snapshot_id != manifest.snapshot_id:
         status_name = "stale_input"
     elif findings or not evidence["valid"]:
-        status_name = "needs_human_review"
+        status_name = "findings_recorded"
     else:
         status_name = "completed_no_findings"
     write_summary(artifact_root, status_name, findings, manifest.snapshot_id)

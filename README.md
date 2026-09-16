@@ -1,6 +1,6 @@
 # kelpie
 
-GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工程で順番に実行するためのテンプレートです。
+GitHub Issue または手動タスクを起点に、複数の LLM CLI で計画・実装・レビューを順番に実行するためのテンプレートです。
 このリポジトリ自体をコンテナ内にマウントして使う前提で、ワークフロー実行スクリプトと各工程のプロンプト/スキルをまとめています。
 
 全引数、入力ソース、設定、成果物、停止・再開、人間介入、コンテナ運用は [完全利用ガイド](doc/usage-guide.md) を参照してください。
@@ -8,7 +8,7 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 ## 何があるか
 
 - `AGENTS.md`
-  9 工程の責務、成果物、入力、失敗時の扱いを定義します。
+  各工程の責務、成果物、入力、失敗時の扱いを定義します。
 - `prompts/*.md`
   各工程で CLI に渡すプロンプト雛形です。
 - `skills/*/SKILL.md`
@@ -73,6 +73,7 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 │   └── workflow_config.py
 ├── workflows/
 │   ├── issue-v1.json
+│   ├── issue-v1-plan-check.json
 │   └── issue-v1-execution.json
 └── skills/
     ├── implementation/
@@ -98,38 +99,34 @@ GitHub Issue または手動タスクを起点に、複数の LLM CLI を 9 工�
 4. `.kelpie/artifacts/.../issue-xx/` または `.kelpie/artifacts/.../task-xxxx/` 配下に prompt キャッシュ、intent record、check ファイルを作る
 5. 指定した CLI を工程順に呼び出す
 
-工程は次の 9 つですが、`work_items.json` を handoff 境界にして二つの設定へ分かれています。
+対応する工程は次の 9 つ（plan check は任意）で、`work_items.json` を handoff 境界にして二つの設定へ分かれています。
 
 1. `prototype_planning`
 2. `prototyping`
 3. `red_team_review`
 4. `solution_design`
 5. `work_breakdown`
-6. `plan_comprehension_check`
+6. `plan_comprehension_check`（明示的に選んだ場合のみ）
 7. `implementation`
 8. `review_fix_loop`
 9. `pull_request`
 
-既定の `workflows/issue-v1.json` は `plan_comprehension_check` までを実行する計画
-workflow です。`work_breakdown` が生成した `work_items.json` を確認した後、同じ
-artifact directory に対して `--workflow-config workflows/issue-v1-execution.json` を
-明示して implementation、review/fix、pull request を実行します。実行側は既存の
-`work_items.json` を必須の handoff input とし、ない場合は runner を起動せずに停止します。
+既定の `workflows/issue-v1.json` は `work_breakdown` までを実行する計画 workflow です。
+`work_items.json` を確認した後、同じ artifact directory に対して
+`--workflow-config workflows/issue-v1-execution.json` を指定して実装・レビューを実行します。
+実行側は既存の `work_items.json` を必須とし、ない場合は runner を起動せずに停止します。
 
-`plan_comprehension_check` は、実装計画を軽量モデルへ再構成させ、
-source-backedな解釈差分を得た後、通常runnerの強モデルが各findingを
-`accepted` / `rejected` / `unresolved` に裁定する工程です。弱モデルprobe自体は
-advisory-onlyかつread-onlyです。有効なfindingは強モデルが計画へ必要最小限反映し、
-`work_items.json`を再生成した後に再probeします。unresolvedまたは規定回数で
-収束しない場合は、人間レビュー待ちとして停止します。probeの応答がschema-invalid
-だった場合は、既定では`advisory_check_unavailable`として警告付きでadvanceし、
-`--require-plan-comprehension-check`を明示した場合だけ`invalid_output`でpauseします。
+複雑な計画の伝わりにくさを確認したい場合だけ、計画の開始時に
+`--workflow-config workflows/issue-v1-plan-check.json` を選びます。
+軽量モデルが計画を再説明し、強モデルが根拠を確認して必要な説明だけを補います。
+有効化したチェックは設定済みモデルを使い、専用の送信許可は求めません。
+既定の計画ではチェックの呼び出し・警告・介入要求は発生しません。
 
-probe inputには有効な `artifact_id`、hash、`section_id` のcatalogを含めるため、
-source referenceを推測させません。JSONまたはschemaが不正な応答は、位置を含む
-validation errorだけを渡す上限付きretryを行い、各試行のraw outputとvalidation
-resultを `plan-check/iterations/NNNN/attempts/` に保存します。retry後も不正な場合は
-従来どおり `invalid_output` として停止します。
+チェックの読み違いが残った場合や、上限回数に達した場合は記録して先へ進みます。
+モデル障害や不正出力はチェック未完了として記録し、「問題なし」とは扱いません。
+補足に失敗した試行の計画変更は復元します。チェックは要件追加、人間への質問、
+承認要求を担当しません。対象外のファイル変更などの保護違反は引き続き停止します。
+詳細と旧設定からの移行は [利用ガイド](doc/usage-guide.md#6-plan-comprehension-check) を参照してください。
 
 各工程は`advance` / `pause` / `fail` / `complete`の構造化outcomeを出力します。
 hookやCLIの非0終了は運用障害、`pause`は工程固有の判断・入力待ちとして区別されます。
@@ -799,18 +796,6 @@ python3 scripts/run_issue_workflow.py \
   と `--resume-phase implementation` と併用します。
 - `--resume-prompt` / `--resume-prompt-file` / `--resume-prompt-stdin`
   選択したactionに渡す人間の指示です。同時には1つだけ指定できます。
-- `--allow-plan-check-external-send`
-  `external-safe` と分類された計画成果物を
-  `plan_comprehension_check` の外部モデルへ送ることを明示的に許可します。
-  未指定時、advisory の live check は送信せず、警告を記録して workflow を継続します。
-  `--require-plan-comprehension-check` 指定時は `external_send_approval_required` で停止します。
-- `--require-plan-comprehension-check`
-  schema-invalidなplan checkを必須ゲートとして扱い、`invalid_output`で停止します。
-  未指定時は、probe unavailableの警告を記録してworkflowを継続します。
-- `--waive-plan-comprehension-check`
-  requiredな`invalid_output`でpauseしたworkflowを、明示的なwaiveとして再開します。
-  `--resume`との併用が必要です。
-
 ## runner 設定
 
 `examples/runner_config.json` には基本設定と、phase ごとに CLI 起動設定を切り替える例が入っています。

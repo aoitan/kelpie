@@ -10,7 +10,7 @@
 3. red team review
 4. solution design
 5. work breakdown
-6. plan comprehension check
+6. plan comprehension check（明示的に選んだ場合のみ）
 7. implementation
 8. review/fix loop
 9. pull request
@@ -137,7 +137,7 @@
 - 弱モデル代理が計画を根拠付きで再構成できるか確認する
 - 解釈差分を advisory finding として残す
 - 強モデルが advisory finding を元成果物と照合して裁定する
-- 有効な finding があれば計画を必要最小限修正し、弱モデルで再確認する
+- 有効な finding があれば既存計画の説明だけを補足し、上限内で弱モデルが再確認する
 
 出力:
 - `05a-plan-comprehension-check.md`
@@ -150,9 +150,10 @@
 - 弱モデルには計画を修正させない
 - 強モデルは finding を `accepted` / `rejected` / `unresolved` に裁定する
 - 修正後は `work_items.json` を再生成し、再probeする
-- 既定ではschema-invalidなprobeを`advisory_check_unavailable`として警告付きでadvanceする
-- `plan_comprehension_check`をrequired指定した場合だけinvalid outputでpauseし、明示的なretryまたはwaiveを要求する
-- 有効なfindingのunresolvedまたは非収束の場合は人間レビューへ渡す
+- 既定では工程自体を実行しない。必要な場合だけ `workflows/issue-v1-plan-check.json` を選ぶ
+- モデル障害・不正出力はチェック未完了として記録し、advanceする
+- unresolvedや非収束は残件を記録して終える。人間への質問・承認要求・要件追加を行わない
+- 対象外ファイルへの書き込みなどの保護違反は引き続き停止する
 
 ### 7) implementation
 目的:
@@ -215,8 +216,7 @@
 `plan_comprehension_check` の弱モデルprobeで外部モデルへ渡せるのは、入力specで
 `external-safe` と明示された成果物だけとする。弱モデルprobeは advisory-only であり、
 それ単独で実装可否を決めない。後段の強モデルがfindingを裁定し、必要なら計画を修正する。
-live実行ではさらに
-`--allow-plan-check-external-send` による明示opt-inを必須とする。
+チェックを明示的に選んだ場合は設定済みモデルを使い、追加の送信承認は要求しない。
 
 ---
 
